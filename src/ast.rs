@@ -94,21 +94,27 @@ impl Type {
     }
 }
 
+#[derive(PartialEq, Debug)]
+struct VariableInfo {
+    ty: Type,
+    mutable: bool,
+}
+
 #[derive(Debug, Default, PartialEq)]
 struct TypeContext {
-    variable_types: HashMap<String, Type>,
+    variables: HashMap<String, VariableInfo>,
     next_type_var: u32,
 }
 impl TypeContext {
     fn new() -> Self {
         Self::default()
     }
-    fn get_variable_type(&self, variable: &str) -> Option<&Type> {
-        self.variable_types.get(variable)
+    fn variable_info(&self, variable: &str) -> Option<&VariableInfo> {
+        self.variables.get(variable)
     }
     fn substitute(&mut self, subs: &Substitutions) {
-        for ty in self.variable_types.values_mut() {
-            ty.substitute(subs);
+        for var in self.variables.values_mut() {
+            var.ty.substitute(subs);
         }
     }
     // Variables should be inserted via the returned shadow, which
@@ -134,21 +140,22 @@ impl TypeContext {
 #[derive(Debug)]
 struct ShadowTypeContext<'a> {
     type_context: &'a mut TypeContext,
-    shadowed: HashMap<String, Option<Type>>,
+    shadowed: HashMap<String, Option<VariableInfo>>,
     finished: bool,
 }
 impl<'a> ShadowTypeContext<'a> {
-    fn insert(&mut self, name: String, ty: Type) {
+    fn insert(&mut self, name: String, ty: Type, mutable: bool) {
+        let info =  VariableInfo { ty, mutable };
         if self.shadowed.contains_key(&name) {
             // Original already saved.
-            self.type_context.variable_types.insert(name, ty);
+            self.type_context.variables.insert(name, info);
         } else {
-            let original = self.type_context.variable_types.insert(name.clone(), ty);
+            let original = self.type_context.variables.insert(name.clone(), info);
             self.shadowed.insert(name, original);
         }
     }
     fn context_contains(&mut self, name: &str) -> bool {
-        self.type_context.variable_types.contains_key(name)
+        self.type_context.variables.contains_key(name)
     }
 
     fn context(&mut self) -> &mut TypeContext {
@@ -161,10 +168,10 @@ impl<'a> Drop for ShadowTypeContext<'a> {
         for (var_name, original_type) in self.shadowed.drain() {
             match original_type {
                 Some(ty) => {
-                    self.type_context.variable_types.insert(var_name, ty);
+                    self.type_context.variables.insert(var_name, ty);
                 }
                 None => {
-                    self.type_context.variable_types.remove(&var_name);
+                    self.type_context.variables.remove(&var_name);
                 }
             }
         }
@@ -199,11 +206,13 @@ enum Error {
     InfiniteTypeError(TypeVar, Type),
     DuplicateArgNames(Expression),
     DuplicateTopLevelName(String),
+    AssignToImmutableBinding(String),
 }
 
 fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
     match (left, right) {
-        (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) => {
+        (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) 
+        | (Type::Unit, Type::Unit) => {
             Ok(Substitutions::new())
         }
         (Type::Var(tv), ty) | (ty, Type::Var(tv)) => {
@@ -235,8 +244,8 @@ fn infer(
 ) -> Result<(Type, Substitutions), Error> {
     match expression {
         Expression::L(LValue::Variable(name)) => {
-            if let Some(ty) = context.get_variable_type(name) {
-                Ok((ty.clone(), Substitutions::new()))
+            if let Some(info) = context.variable_info(name) {
+                Ok((info.ty.clone(), Substitutions::new()))
             } else {
                 Err(Error::UnknownName(name.to_string()))
             }
@@ -296,7 +305,8 @@ fn infer(
             let mut shadow = context.shadow();
             for name in arg_names.iter() {
                 let var_type = shadow.context().new_type_var();
-                shadow.insert(name.clone(), var_type);
+                // TODO: args need to declare mutability.
+                shadow.insert(name.clone(), var_type, false);
             }
             let res = infer(shadow.context(), body);
             shadow.finish();
@@ -319,7 +329,6 @@ fn infer(
                         ty: declared_type,
                         value,
                     } => {
-                        assert!(!mutable); // TODO.
                         let context = shadow.context();
                         let (mut value_type, value_subs) = infer(context, value)?;
                         subs.and_then(&value_subs);
@@ -328,10 +337,28 @@ fn infer(
                             subs.and_then(&unify(ty, &value_type)?);
                         }
                         context.substitute(&subs);
-                        shadow.insert(variable.clone(), value_type);
+                        shadow.insert(variable.clone(), value_type, *mutable);
                         last_statement_type = Type::Unit;
                     }
-                    Statement::Assign(_name, _expr) => todo!(),
+                    Statement::Assign(LValue::Variable(name), expr) => {
+                        let context = shadow.context();
+                        let (mut expr_ty, e_subs) = infer(context, &expr)?;
+                        subs.and_then(&e_subs);
+                        expr_ty.substitute(&subs);
+
+                        // Check whether the expession can be assigned to the variable.
+                        let variable_info = context.variable_info(name);
+                        if variable_info.is_none() {
+                            return Err(Error::UnknownName(name.to_string()));
+                        }
+                        let variable_info = variable_info.unwrap();
+                        if !variable_info.mutable {
+                            return Err(Error::AssignToImmutableBinding(name.to_string()));
+                        }
+                        subs.and_then(&unify(&expr_ty, &variable_info.ty)?);
+                        context.substitute(&subs);
+                        last_statement_type = Type::Unit;
+                    },
                     Statement::Return(_expr) => todo!(),
                 }
             }
@@ -358,7 +385,7 @@ fn typecheck_program(program: &Program) -> Result<(), Error> {
                 }
                 let arg_types = args.iter().map(|(_, ty)| ty.clone()).collect();
                 let fn_type = Type::Fn(arg_types, Box::new(ret.clone()));
-                shadow.insert(name.clone(), fn_type);
+                shadow.insert(name.clone(), fn_type, false);  // TODO: args need to declare mutability.
             }
         }
     }
@@ -379,7 +406,7 @@ fn typecheck_program(program: &Program) -> Result<(), Error> {
                 // Declare a new shadow to insert fn variables.
                 let mut shadow = shadow.context().shadow();
                 for (arg_name, arg_ty) in args.iter() {
-                    shadow.insert(arg_name.to_string(), arg_ty.clone());
+                    shadow.insert(arg_name.to_string(), arg_ty.clone(), false);  // TODO: variables need to declare mutaiblity.
                 }
                 let (mut ty, subs) = infer(shadow.context(), body)?;
                 ty.substitute(&subs);
@@ -396,7 +423,7 @@ fn typecheck_program(program: &Program) -> Result<(), Error> {
 mod tests {
     use super::*;
     #[test]
-    fn test_two_plus_two() {
+    fn two_plus_two() {
         let program = &Program(vec![
             Declaration::Fn(FnDecl {
                 name: "plus".to_string(),
@@ -430,7 +457,7 @@ mod tests {
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
-    fn test_shadow_earlier_variables() {
+    fn shadow_earlier_variables() {
         let program = &Program(vec![
             Declaration::Fn(FnDecl {
                 name: "main".to_string(),
@@ -446,8 +473,54 @@ mod tests {
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
+
     #[test]
-    fn test_if_expression_unifies() {
+    fn assign_to_mutable_binding() {
+        let program = &Program(vec![
+            Declaration::Fn(FnDecl {
+                name: "main".to_string(),
+                args: vec![],
+                ret: Type::Unit,
+                body: Some(Expression::Block(vec![
+                    Statement::Let { variable: "a".to_string(), mutable: true, ty: None, value: Expression::LiteralInt(2) },
+                    Statement::Assign(LValue::Variable("a".to_string()), Box::new(Expression::LiteralInt(3))),
+                ])),
+            })
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn error_assign_wrong_type_to_mutable_binding() {
+        let program = &Program(vec![
+            Declaration::Fn(FnDecl {
+                name: "main".to_string(),
+                args: vec![],
+                ret: Type::Unit,
+                body: Some(Expression::Block(vec![
+                    Statement::Let { variable: "a".to_string(), mutable: true, ty: None, value: Expression::LiteralInt(2) },
+                    Statement::Assign(LValue::Variable("a".to_string()), Box::new(Expression::LiteralUnit)),
+                ])),
+            })
+        ]);
+        assert_eq!(typecheck_program(program), Err(Error::NotUnifiable(Type::Unit, Type::Int)));
+    }
+    #[test]
+    fn error_assign_to_immutable_binding() {
+        let program = &Program(vec![
+            Declaration::Fn(FnDecl {
+                name: "main".to_string(),
+                args: vec![],
+                ret: Type::Unit,
+                body: Some(Expression::Block(vec![
+                    Statement::Let { variable: "a".to_string(), mutable: false, ty: None, value: Expression::LiteralInt(2) },
+                    Statement::Assign(LValue::Variable("a".to_string()), Box::new(Expression::LiteralInt(3))),
+                ])),
+            })
+        ]);
+        assert_eq!(typecheck_program(program), Err(Error::AssignToImmutableBinding("a".to_string())));
+    }
+    #[test]
+    fn if_expression_unifies() {
         let program = &Program(vec![
             Declaration::Fn(FnDecl {
                 name: "round".to_string(),
