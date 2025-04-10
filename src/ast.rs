@@ -94,23 +94,10 @@ impl Type {
     }
 }
 
-// Generates a new unknown type with a preivously unused type variable.
-#[derive(Default, Debug)]
-struct NewType(u32);
-impl NewType {
-    fn new() -> Self {
-        Default::default()
-    }
-    fn next(&mut self) -> Type {
-        let v = self.0;
-        self.0 += 1;
-        Type::Var(TypeVar(v))
-    }
-}
-
 #[derive(Debug, Default, PartialEq)]
 struct TypeContext {
     variable_types: HashMap<String, Type>,
+    next_type_var: u32,
 }
 impl TypeContext {
     fn new() -> Self {
@@ -135,6 +122,12 @@ impl TypeContext {
             shadowed: HashMap::new(),
             finished: false,
         }
+    }
+    // Returns a new unknown type.
+    fn new_type_var(&mut self) -> Type {
+        let v = self.next_type_var;
+        self.next_type_var += 1;
+        Type::Var(TypeVar(v))
     }
 }
 
@@ -237,7 +230,6 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
 }
 
 fn infer(
-    new_type: &mut NewType,
     context: &mut TypeContext,
     expression: &Expression,
 ) -> Result<(Type, Substitutions), Error> {
@@ -254,15 +246,15 @@ fn infer(
         Expression::LiteralBool(_) => Ok((Type::Bool, Substitutions::new())),
         Expression::LiteralFloat(_) => Ok((Type::Float, Substitutions::new())),
         Expression::If(cond, t_expr, f_expr) => {
-            let (mut cond_ty, mut subs) = infer(new_type, context, cond)?;
+            let (mut cond_ty, mut subs) = infer(context, cond)?;
             cond_ty.substitute(&subs);
             subs.and_then(&unify(&cond_ty, &Type::Bool)?);
 
-            let (mut t_ty, t_subs) = infer(new_type, context, &t_expr)?;
+            let (mut t_ty, t_subs) = infer(context, &t_expr)?;
             subs.and_then(&t_subs);
             t_ty.substitute(&subs);
 
-            let (mut f_ty, f_subs) = infer(new_type, context, &f_expr)?;
+            let (mut f_ty, f_subs) = infer(context, &f_expr)?;
             subs.and_then(&f_subs);
             f_ty.substitute(&subs);
 
@@ -274,18 +266,18 @@ fn infer(
             let mut arg_types = vec![];
             let mut subs = Substitutions::new();
             for arg_expr in arg_exprs {
-                let (mut arg_type, arg_subs) = infer(new_type, context, arg_expr)?;
+                let (mut arg_type, arg_subs) = infer(context, arg_expr)?;
                 subs.and_then(&arg_subs);
                 arg_type.substitute(&subs);
                 context.substitute(&subs);
                 arg_types.push(arg_type);
             }
-            let (mut fn_ty, fn_subs) = infer(new_type, context, fn_expr)?;
+            let (mut fn_ty, fn_subs) = infer(context, fn_expr)?;
             subs.and_then(&fn_subs);
             fn_ty.substitute(&subs);
             context.substitute(&subs);
 
-            let mut return_type = new_type.next();
+            let mut return_type = context.new_type_var();
             subs.and_then(&unify(
                 &fn_ty,
                 &Type::Fn(arg_types, Box::new(return_type.clone())),
@@ -303,9 +295,10 @@ fn infer(
             }
             let mut shadow = context.shadow();
             for name in arg_names.iter() {
-                shadow.insert(name.clone(), new_type.next());
+                let var_type = shadow.context().new_type_var();
+                shadow.insert(name.clone(), var_type);
             }
-            let res = infer(new_type, shadow.context(), body);
+            let res = infer(shadow.context(), body);
             shadow.finish();
             res
         }
@@ -316,7 +309,7 @@ fn infer(
             for statement in statements {
                 match statement {
                     Statement::Expression(expr) => {
-                        let (e_ty, e_subs) = infer(new_type, shadow.context(), expr)?;
+                        let (e_ty, e_subs) = infer(shadow.context(), expr)?;
                         subs.and_then(&e_subs);
                         last_statement_type = e_ty;
                     }
@@ -328,7 +321,7 @@ fn infer(
                     } => {
                         assert!(!mutable); // TODO.
                         let context = shadow.context();
-                        let (mut value_type, value_subs) = infer(new_type, context, value)?;
+                        let (mut value_type, value_subs) = infer(context, value)?;
                         subs.and_then(&value_subs);
                         value_type.substitute(&subs);
                         if let Some(ty) = declared_type {
@@ -350,7 +343,6 @@ fn infer(
 
 fn typecheck_program(program: &Program) -> Result<(), Error> {
     // First, load declarations into typing context.
-    let new_type = &mut NewType::new();
     let mut context = TypeContext::new();
     let mut shadow = context.shadow();
     for declaration in program.0.iter() {
@@ -389,7 +381,7 @@ fn typecheck_program(program: &Program) -> Result<(), Error> {
                 for (arg_name, arg_ty) in args.iter() {
                     shadow.insert(arg_name.to_string(), arg_ty.clone());
                 }
-                let (mut ty, subs) = infer(new_type, shadow.context(), body)?;
+                let (mut ty, subs) = infer(shadow.context(), body)?;
                 ty.substitute(&subs);
                 unify(&ty, ret)?;
                 shadow.finish();
