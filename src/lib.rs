@@ -16,7 +16,4 @@ TODO:
 */
 
 mod ssa;
-
-fn main() {
-    println!("Hello, world!");
-}
+mod ast;
