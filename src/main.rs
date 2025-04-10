@@ -135,104 +135,9 @@ struct FnCode {
     return_type: Option<Type>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum InvalidTerminatorError {
-    MissingSsaVar,
-    MissingBlockId,
-}
-
-// TODO: This seems redundant with type checking.
-#[derive(Clone, Debug, PartialEq)]
-struct InvalidFnCodeErrors {
-    duplicate_block_ids: HashSet<BlockId>,
-    duplicate_assignments: HashSet<SsaVar>,
-    invalid_terminators: Vec<(BlockId, InvalidTerminatorError)>,
-}
-
 impl FnCode {
-    fn find_duplicate_block_ids(&self) -> HashSet<BlockId> {
-        let mut seen = HashSet::new();
-        let mut duplicates = HashSet::new();
-        for block in self.blocks.iter() {
-            if !seen.insert(block.id) {
-                duplicates.insert(block.id);
-            }
-        }
-        duplicates
-    }
-    fn find_duplicate_assignments(&self) -> HashSet<SsaVar> {
-        let mut seen = HashSet::new();
-        let mut duplicates = HashSet::new();
-        for block in self.blocks.iter() {
-            for instruction in block.instructions.iter() {
-                if !seen.insert(instruction.assigned_ssa_var()) {
-                    duplicates.insert(instruction.assigned_ssa_var());
-                }
-            }
-        }
-        duplicates
-    }
     fn has_block(&self, id: BlockId) -> bool {
         self.blocks.iter().any(|block| block.id == id)
-    }
-    fn has_assigned_var(&self, v: SsaVar) -> bool {
-        for block in self.blocks.iter() {
-            for instruction in block.instructions.iter() {
-                if instruction.assigned_ssa_var() == v {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-    fn find_invalid_terminators(&self) -> Vec<(BlockId, InvalidTerminatorError)> {
-        let mut errors = Vec::new();
-        for block in self.blocks.iter() {
-            match block.terminator {
-                Terminator::Goto(target) => {
-                    if !self.has_block(target) {
-                        errors.push((block.id, InvalidTerminatorError::MissingBlockId));
-                    }
-                }
-                Terminator::CondBranch {
-                    on,
-                    true_target,
-                    false_target,
-                } => {
-                    if !self.has_block(true_target) {
-                        errors.push((block.id, InvalidTerminatorError::MissingBlockId));
-                    }
-                    if !self.has_block(false_target) {
-                        errors.push((block.id, InvalidTerminatorError::MissingBlockId));
-                    }
-                    if !self.has_assigned_var(on) {
-                        errors.push((block.id, InvalidTerminatorError::MissingSsaVar));
-                    }
-                }
-                Terminator::Return(var) => {
-                    if !self.has_assigned_var(var) {
-                        errors.push((block.id, InvalidTerminatorError::MissingSsaVar));
-                    }
-                }
-            }
-        }
-        errors
-    }
-
-    fn check_errors(&self) -> Result<(), InvalidFnCodeErrors> {
-        let errors = InvalidFnCodeErrors {
-            duplicate_assignments: self.find_duplicate_assignments(),
-            duplicate_block_ids: self.find_duplicate_block_ids(),
-            invalid_terminators: self.find_invalid_terminators(),
-        };
-        if errors.duplicate_assignments.is_empty()
-            && errors.duplicate_block_ids.is_empty()
-            && errors.invalid_terminators.is_empty()
-        {
-            Ok(())
-        } else {
-            Err(errors)
-        }
     }
 }
 
@@ -244,7 +149,7 @@ enum SsaError {
     FnTypeMismatch(SsaVar),
     FnArgLenMismatch(SsaVar),
     NonBooleanBranch(BlockId),
-    UnknownBlock(BlockId),
+    GoToUnknownBlock(BlockId, BlockId), // terminator id, invalid id
     ReturnTypeError(BlockId),
     DuplicateBlockId(BlockId),
 }
@@ -351,15 +256,15 @@ fn typecheck_terminator(
                 errors.insert(SsaError::NonBooleanBranch(block.id));
             }
             if !function.has_block(true_target) {
-                errors.insert(SsaError::UnknownBlock(true_target));
+                errors.insert(SsaError::GoToUnknownBlock(block.id, true_target));
             }
             if !function.has_block(false_target) {
-                errors.insert(SsaError::UnknownBlock(false_target));
+                errors.insert(SsaError::GoToUnknownBlock(block.id, false_target));
             }
         }
-        Terminator::Goto(block) => {
-            if !function.has_block(block) {
-                errors.insert(SsaError::UnknownBlock(block));
+        Terminator::Goto(next_block) => {
+            if !function.has_block(next_block) {
+                errors.insert(SsaError::GoToUnknownBlock(block.id, next_block));
             }
         }
         Terminator::Return(var) => {
@@ -421,17 +326,20 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     instructions: vec![Instruction::AssignBool(SsaVar(1), true)],
-                    terminator: Terminator::Return(SsaVar(0)),
+                    terminator: Terminator::Return(SsaVar(1)),
                 },
             ],
         };
-        assert!(!f.check_errors().unwrap_err().duplicate_block_ids.is_empty());
+        assert_eq!(
+            typecheck_ssa(&f, &Context::new()),
+            HashSet::from([SsaError::DuplicateBlockId(BlockId(1)),])
+        );
     }
     #[test]
     fn error_duplicate_ssa_assignments() {
         let f = FnCode {
             args: vec![],
-            return_type: Some(Type::Int),
+            return_type: Some(Type::Bool),
             blocks: vec![BasicBlock {
                 id: BlockId(1),
                 instructions: vec![
@@ -441,11 +349,10 @@ mod tests {
                 terminator: Terminator::Return(SsaVar(0)),
             }],
         };
-        assert!(!f
-            .check_errors()
-            .unwrap_err()
-            .duplicate_assignments
-            .is_empty());
+        assert_eq!(
+            typecheck_ssa(&f, &Context::new()),
+            HashSet::from([SsaError::RedefinedVar(SsaVar(0)),])
+        );
     }
     #[test]
     fn error_invalid_terminator() {
@@ -474,7 +381,14 @@ mod tests {
             ],
             return_type: Some(Type::Int),
         };
-        assert_eq!(f.check_errors().unwrap_err().invalid_terminators.len(), 3);
+        assert_eq!(
+            typecheck_ssa(&f, &Context::new()),
+            HashSet::from([
+                SsaError::GoToUnknownBlock(BlockId(0), BlockId(500)),
+                SsaError::GoToUnknownBlock(BlockId(1), BlockId(20)),
+                SsaError::UnsetVar(SsaVar(30)),
+            ])
+        );
     }
     #[test]
     fn test_2_plus_2() {
