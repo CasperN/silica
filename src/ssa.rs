@@ -1,20 +1,10 @@
-#![allow(dead_code)]
+// Silica SSA IR. 
+//
+// After typechecking an AST, we lower to this IR. 
+// It is an explicitly-typed, but polymorphic, and in SSA form. 
+// The simplified control-flow enables linear type checking
+// and lifetime analysis.
 use std::collections::{HashMap, HashSet, BTreeMap};
-
-/*
-TODO:
-- High priority
-    - Linear types
-    - Lifetimes and references
-    - Effects system
-
-- Low priority
-    - Custom Debug formatting to make things more succinct
-    - Remove `find_duplicate_assignments` and `check_errors` as these
-      are redundant with type checking and future error checking mechanisms.
-    - Method for "normalizing" SSA variables, such that they are monotonically increasing
-      adjacent integers.
-*/
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct SsaVar(u32);
@@ -348,10 +338,6 @@ fn typecheck_ssa(function: &FnCode, context: &Context) -> HashSet<SsaError> {
     errors
 }
 
-fn main() {
-    println!("Hello, world!");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,7 +421,7 @@ mod tests {
         );
     }
     #[test]
-    fn test_2_plus_2() {
+    fn two_plus_two() {
         // TODO: Add arithmetic to the fn def.
         let mut context = Context::new();
         let add_i32 = context.add_fn(FnDef {
@@ -460,7 +446,7 @@ mod tests {
         assert_eq!(typecheck_ssa(&code, &context).len(), 0);
     }
     #[test]
-    fn test_arg0_plus_arg1() {
+    fn arg0_plus_arg1() {
         // TODO: Add arithmetic to the fn def.
         let mut context = Context::new();
         let add_i32 = context.add_fn(FnDef {

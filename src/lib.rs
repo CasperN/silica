@@ -1,0 +1,22 @@
+#![allow(dead_code)]
+
+/*
+TODO:
+- High priority
+    - Linear types
+    - Lifetimes and references
+    - Effects system
+
+- Low priority
+    - Custom Debug formatting to make things more succinct
+    - Remove `find_duplicate_assignments` and `check_errors` as these
+      are redundant with type checking and future error checking mechanisms.
+    - Method for "normalizing" SSA variables, such that they are monotonically increasing
+      adjacent integers.
+*/
+
+mod ssa;
+
+fn main() {
+    println!("Hello, world!");
+}
