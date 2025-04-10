@@ -1,6 +1,20 @@
 #![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
 
+/*
+TODO:
+- High priority
+    - Lifetimes and references
+    - Effects system
+
+- Low priority
+    - Custom Debug formatting to make things more succinct
+    - Remove `find_duplicate_assignments` and `check_errors` as these
+      are redundant with type checking and future error checking mechanisms.
+    - Method for "normalizing" SSA variables, such that they are monotonically increasing
+      adjacent integers.
+*/
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SsaVar(u32);
 
@@ -117,6 +131,8 @@ impl Context {
 struct FnCode {
     args: Vec<(SsaVar, Type)>,
     blocks: Vec<BasicBlock>,
+    // return type is None if it never returns.
+    return_type: Option<Type>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -157,7 +173,7 @@ impl FnCode {
         duplicates
     }
     fn has_block(&self, id: BlockId) -> bool {
-        self.blocks.iter().find(|block| block.id == id).is_some()
+        self.blocks.iter().any(|block| block.id == id)
     }
     fn has_assigned_var(&self, v: SsaVar) -> bool {
         for block in self.blocks.iter() {
@@ -220,94 +236,165 @@ impl FnCode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TypeCheckError {
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SsaError {
     RedefinedVar(SsaVar),
     UnsetVar(SsaVar),
     UnknownFn(FnId),
     FnTypeMismatch(SsaVar),
+    FnArgLenMismatch(SsaVar),
+    NonBooleanBranch(BlockId),
+    UnknownBlock(BlockId),
+    ReturnTypeError(BlockId),
+    DuplicateBlockId(BlockId),
 }
 
-fn typecheck(function: &FnCode, context: &Context) -> Vec<TypeCheckError> {
+// Type checks the instruction, updating `var_types`, the types of SSA variables.
+// Adds any errors to `errors`.
+fn typecheck_instruction(
+    instruction: &Instruction,
+    context: &Context,
+    var_types: &mut HashMap<SsaVar, Type>,
+    errors: &mut HashSet<SsaError>,
+) {
+    match instruction {
+        Instruction::AssignBool(assigned, _) => {
+            if var_types.insert(*assigned, Type::Bool).is_some() {
+                errors.insert(SsaError::RedefinedVar(*assigned));
+            }
+        }
+        Instruction::AssignF64(assigned, _) => {
+            if var_types.insert(*assigned, Type::Float).is_some() {
+                errors.insert(SsaError::RedefinedVar(*assigned));
+            }
+        }
+        Instruction::AssignI64(assigned, _) => {
+            if var_types.insert(*assigned, Type::Int).is_some() {
+                errors.insert(SsaError::RedefinedVar(*assigned));
+            }
+        }
+        Instruction::AssignFn(assigned, f_id) => {
+            let f = context.fns.get(f_id);
+            if f.is_none() {
+                errors.insert(SsaError::UnknownFn(*f_id));
+                return;
+            }
+            if var_types.insert(*assigned, f.unwrap().as_type()).is_some() {
+                errors.insert(SsaError::RedefinedVar(*assigned));
+            }
+        }
+        Instruction::AssignVar(assigned, other) => {
+            let other_ty = var_types.get(other).cloned();
+            if other_ty.is_none() {
+                errors.insert(SsaError::UnsetVar(*other));
+                return;
+            }
+            if var_types.insert(*assigned, other_ty.unwrap()).is_some() {
+                errors.insert(SsaError::RedefinedVar(*assigned));
+            }
+        }
+        Instruction::Call(assigned, func, args) => {
+            let fn_ty = var_types.get(func).cloned();
+            if fn_ty.is_none() {
+                errors.insert(SsaError::UnsetVar(*func));
+                return;
+            }
+            let fn_ty = fn_ty.unwrap();
+            if !fn_ty.is_fn() {
+                errors.insert(SsaError::FnTypeMismatch(*func));
+                return;
+            }
+            // Insert the return type assuming the args typecheck_ssa
+            // so we don't emit errors for downstream uses of the assigned.
+            let return_type = fn_ty.unwrap_fn_return_type().clone();
+            if var_types.insert(*assigned, return_type).is_some() {
+                errors.insert(SsaError::RedefinedVar(*assigned));
+            }
+            let arg_types = fn_ty.unwrap_fn_arg_types();
+            if arg_types.len() != args.len() {
+                errors.insert(SsaError::FnArgLenMismatch(*func));
+                return;
+            }
+            for (expected_ty, var) in arg_types.iter().zip(args.iter()) {
+                let arg_ty = var_types.get(var).cloned();
+                if arg_ty.is_none() {
+                    errors.insert(SsaError::UnsetVar(*var));
+                    return;
+                }
+                if arg_ty.unwrap() != *expected_ty {
+                    errors.insert(SsaError::FnTypeMismatch(*func));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn typecheck_terminator(
+    block: &BasicBlock,
+    var_types: &HashMap<SsaVar, Type>,
+    function: &FnCode,
+    errors: &mut HashSet<SsaError>,
+) {
+    match block.terminator {
+        Terminator::CondBranch {
+            on,
+            true_target,
+            false_target,
+        } => {
+            let on_ty = var_types.get(&on);
+            if on_ty.is_none() {
+                errors.insert(SsaError::UnsetVar(on));
+                return;
+            }
+            if *on_ty.unwrap() != Type::Bool {
+                errors.insert(SsaError::NonBooleanBranch(block.id));
+            }
+            if !function.has_block(true_target) {
+                errors.insert(SsaError::UnknownBlock(true_target));
+            }
+            if !function.has_block(false_target) {
+                errors.insert(SsaError::UnknownBlock(false_target));
+            }
+        }
+        Terminator::Goto(block) => {
+            if !function.has_block(block) {
+                errors.insert(SsaError::UnknownBlock(block));
+            }
+        }
+        Terminator::Return(var) => {
+            if let Some(ty) = var_types.get(&var) {
+                if Some(ty) != function.return_type.as_ref() {
+                    errors.insert(SsaError::ReturnTypeError(block.id));
+                }
+            } else {
+                errors.insert(SsaError::UnsetVar(var));
+            }
+        }
+    }
+}
+
+// Runs each instruction in order to ensure all SsaVars are indeed assigned
+// once, before use, and are used with the correct types.
+fn typecheck_ssa(function: &FnCode, context: &Context) -> HashSet<SsaError> {
     let mut var_types = HashMap::new();
-    let mut errors = Vec::new();
+    let mut errors = HashSet::new();
+    let mut seen_block_ids = HashSet::new();
 
     for (var, ty) in function.args.iter() {
-        if var_types.insert(var, ty.clone()).is_some() {
-            errors.push(TypeCheckError::RedefinedVar(*var));
+        if var_types.insert(*var, ty.clone()).is_some() {
+            errors.insert(SsaError::RedefinedVar(*var));
         }
     }
 
-    'instructions: for instruction in function.blocks.iter().flat_map(|b| b.instructions.iter()) {
-        match instruction {
-            Instruction::AssignBool(assigned, _) => {
-                if var_types.insert(assigned, Type::Bool).is_some() {
-                    errors.push(TypeCheckError::RedefinedVar(*assigned))
-                }
-            }
-            Instruction::AssignF64(assigned, _) => {
-                if var_types.insert(assigned, Type::Float).is_some() {
-                    errors.push(TypeCheckError::RedefinedVar(*assigned))
-                }
-            }
-            Instruction::AssignI64(assigned, _) => {
-                if var_types.insert(assigned, Type::Int).is_some() {
-                    errors.push(TypeCheckError::RedefinedVar(*assigned))
-                }
-            }
-            Instruction::AssignFn(assigned, f_id) => {
-                let f = context.fns.get(&f_id);
-                if f.is_none() {
-                    errors.push(TypeCheckError::UnknownFn(*f_id));
-                    continue 'instructions;
-                }
-                if var_types.insert(assigned, f.unwrap().as_type()).is_some() {
-                    errors.push(TypeCheckError::RedefinedVar(*assigned));
-                }
-            }
-            Instruction::AssignVar(assigned, other) => {
-                let other_ty = var_types.get(&other).cloned();
-                if other_ty.is_none() {
-                    errors.push(TypeCheckError::UnsetVar(*other));
-                    continue 'instructions;
-                }
-                if var_types.insert(assigned, other_ty.unwrap()).is_some() {
-                    errors.push(TypeCheckError::RedefinedVar(*assigned));
-                }
-            }
-            Instruction::Call(assigned, func, args) => {
-                let fn_ty = var_types.get(&func).cloned();
-                if fn_ty.is_none() {
-                    errors.push(TypeCheckError::UnsetVar(*func));
-                    continue 'instructions;
-                }
-                let fn_ty = fn_ty.unwrap();
-                if !fn_ty.is_fn() {
-                    errors.push(TypeCheckError::FnTypeMismatch(*func));
-                    continue 'instructions;
-                }
-                let arg_types = fn_ty.unwrap_fn_arg_types();
-                if arg_types.len() != args.len() {
-                    errors.push(TypeCheckError::FnTypeMismatch(*func));
-                    continue 'instructions;
-                }
-                for (expected_ty, var) in arg_types.iter().zip(args.iter()) {
-                    let arg_ty = var_types.get(&var).cloned();
-                    if arg_ty.is_none() {
-                        errors.push(TypeCheckError::UnsetVar(*var));
-                        continue 'instructions;
-                    }
-                    if arg_ty.unwrap() != *expected_ty {
-                        errors.push(TypeCheckError::FnTypeMismatch(*func));
-                        continue 'instructions;
-                    }
-                }
-                let return_type = fn_ty.unwrap_fn_return_type().clone();
-                if var_types.insert(assigned, return_type).is_some() {
-                    errors.push(TypeCheckError::RedefinedVar(*assigned));
-                }
-            }
+    for block in function.blocks.iter() {
+        if !seen_block_ids.insert(block.id) {
+            errors.insert(SsaError::DuplicateBlockId(block.id));
         }
+        for instruction in block.instructions.iter() {
+            typecheck_instruction(instruction, context, &mut var_types, &mut errors);
+        }
+        typecheck_terminator(block, &var_types, function, &mut errors);
     }
     errors
 }
@@ -324,6 +411,7 @@ mod tests {
     fn error_duplicate_block_ids() {
         let f = FnCode {
             args: vec![],
+            return_type: Some(Type::Bool),
             blocks: vec![
                 BasicBlock {
                     id: BlockId(1),
@@ -343,6 +431,7 @@ mod tests {
     fn error_duplicate_ssa_assignments() {
         let f = FnCode {
             args: vec![],
+            return_type: Some(Type::Int),
             blocks: vec![BasicBlock {
                 id: BlockId(1),
                 instructions: vec![
@@ -383,11 +472,12 @@ mod tests {
                     terminator: Terminator::Return(SsaVar(30)), // Error!
                 },
             ],
+            return_type: Some(Type::Int),
         };
         assert_eq!(f.check_errors().unwrap_err().invalid_terminators.len(), 3);
     }
     #[test]
-    fn test_typechecks_addition() {
+    fn test_2_plus_2() {
         // TODO: Add arithmetic to the fn def.
         let mut context = Context::new();
         let add_i32 = context.add_fn(FnDef {
@@ -397,6 +487,7 @@ mod tests {
         });
         let code = FnCode {
             args: vec![],
+            return_type: Some(Type::Int),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
                 instructions: vec![
@@ -408,8 +499,108 @@ mod tests {
                 terminator: Terminator::Return(SsaVar(3)),
             }],
         };
-        assert_eq!(typecheck(&code, &context), vec![]);
-        // Write ssa code.
-        // Ensure it typechecks
+        assert_eq!(typecheck_ssa(&code, &context).len(), 0);
+    }
+    #[test]
+    fn test_arg0_plus_arg1() {
+        // TODO: Add arithmetic to the fn def.
+        let mut context = Context::new();
+        let add_i32 = context.add_fn(FnDef {
+            name: "add_i32".to_string(),
+            arg_types: vec![Type::Int, Type::Int],
+            return_type: Type::Int,
+        });
+        let code = FnCode {
+            args: vec![(SsaVar(0), Type::Int), (SsaVar(1), Type::Int)],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::AssignFn(SsaVar(2), add_i32),
+                    Instruction::Call(SsaVar(3), SsaVar(2), vec![SsaVar(0), SsaVar(1)]),
+                ],
+                terminator: Terminator::Return(SsaVar(3)),
+            }],
+            return_type: Some(Type::Int),
+        };
+        assert_eq!(typecheck_ssa(&code, &context), HashSet::new());
+    }
+
+    #[test]
+    fn test_add_relu_branch() {
+        // TODO: Add arithmetic to the fn def.
+        let mut context = Context::new();
+        let add_i32 = context.add_fn(FnDef {
+            name: "add_i32".to_string(),
+            arg_types: vec![Type::Int, Type::Int],
+            return_type: Type::Int,
+        });
+        let geq_i32 = context.add_fn(FnDef {
+            name: "geq_i32".to_string(),
+            arg_types: vec![Type::Int, Type::Int],
+            return_type: Type::Bool,
+        });
+        let code = FnCode {
+            args: vec![(SsaVar(0), Type::Int), (SsaVar(1), Type::Int)],
+            return_type: Some(Type::Int),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        // %3 = %0 + %1
+                        Instruction::AssignFn(SsaVar(2), add_i32),
+                        Instruction::Call(SsaVar(3), SsaVar(2), vec![SsaVar(0), SsaVar(1)]),
+                        // %6 = %3 >= 0
+                        Instruction::AssignFn(SsaVar(4), geq_i32),
+                        Instruction::AssignI64(SsaVar(5), 0),
+                        Instruction::Call(SsaVar(6), SsaVar(4), vec![SsaVar(3), SsaVar(5)]),
+                    ],
+                    terminator: Terminator::CondBranch {
+                        on: SsaVar(6),
+                        true_target: BlockId(1),
+                        false_target: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1), // return %3
+                    instructions: vec![],
+                    terminator: Terminator::Return(SsaVar(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    instructions: vec![], // return 0
+                    terminator: Terminator::Return(SsaVar(5)),
+                },
+            ],
+        };
+        assert_eq!(typecheck_ssa(&code, &context), HashSet::new());
+    }
+
+    #[test]
+    fn error_arg_and_instruction_share_ssa_var() {
+        // TODO: Add arithmetic to the fn def.
+        let mut context = Context::new();
+        let add_i32 = context.add_fn(FnDef {
+            name: "add_i32".to_string(),
+            arg_types: vec![Type::Int, Type::Int],
+            return_type: Type::Int,
+        });
+        let code = FnCode {
+            args: vec![(SsaVar(0), Type::Int), (SsaVar(1), Type::Int)],
+            return_type: Some(Type::Int),
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::AssignFn(SsaVar(0), add_i32), // Redefined 0!
+                    Instruction::Call(SsaVar(3), SsaVar(0), vec![SsaVar(1), SsaVar(1)]),
+                ],
+                terminator: Terminator::Return(SsaVar(3)),
+            }],
+        };
+        // Note that `Call` still "works" even with %0 redefined. We want
+        // succinct errors so we don't make everything else fail after the first error.
+        assert_eq!(
+            typecheck_ssa(&code, &context),
+            HashSet::from([SsaError::RedefinedVar(SsaVar(0)),])
+        );
     }
 }
