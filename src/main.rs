@@ -1,9 +1,10 @@
 #![allow(dead_code)]
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, BTreeMap};
 
 /*
 TODO:
 - High priority
+    - Linear types
     - Lifetimes and references
     - Effects system
 
@@ -15,13 +16,13 @@ TODO:
       adjacent integers.
 */
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct SsaVar(u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct BlockId(u32);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct FnId(u32);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,7 +61,8 @@ enum Instruction {
     AssignFn(SsaVar, FnId),
     // assignment, fn register, args...
     Call(SsaVar, SsaVar, Vec<SsaVar>),
-    // Phi(SsaVar, HashMap<BlockId, SsaVar>),
+    // BTreemap for consistent iteration order.
+    Phi(SsaVar, BTreeMap<BlockId, SsaVar>),
 }
 impl Instruction {
     fn assigned_ssa_var(&self) -> SsaVar {
@@ -70,7 +72,8 @@ impl Instruction {
             | Instruction::AssignF64(s, _)
             | Instruction::AssignFn(s, _)
             | Instruction::AssignVar(s, _)
-            | Instruction::Call(s, _, _) => *s,
+            | Instruction::Call(s, _, _)
+            | Instruction::Phi(s, _) => *s,
         }
     }
 }
@@ -143,15 +146,27 @@ impl FnCode {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum SsaError {
+    // Basic assignment and usage errors.
     RedefinedVar(SsaVar),
     UnsetVar(SsaVar),
+
+    // Function related errors.
     UnknownFn(FnId),
     FnTypeMismatch(SsaVar),
+    // Assigned var, index of mismatched arg.
+    FnArgTypeMismatch(SsaVar, usize),
     FnArgLenMismatch(SsaVar),
+
+    // Terminator errors.
     NonBooleanBranch(BlockId),
     GoToUnknownBlock(BlockId, BlockId), // terminator id, invalid id
     ReturnTypeError(BlockId),
     DuplicateBlockId(BlockId),
+
+    // Phi related errors.
+    EmptyPhi(SsaVar),
+    InconsistentPhiType(SsaVar), // Assigned var.
+    PhiFromUnknownBlock(SsaVar, BlockId), // Assigned var, invalid block
 }
 
 // Type checks the instruction, updating `var_types`, the types of SSA variables.
@@ -159,6 +174,7 @@ enum SsaError {
 fn typecheck_instruction(
     instruction: &Instruction,
     context: &Context,
+    function: &FnCode,
     var_types: &mut HashMap<SsaVar, Type>,
     errors: &mut HashSet<SsaError>,
 ) {
@@ -220,16 +236,44 @@ fn typecheck_instruction(
                 errors.insert(SsaError::FnArgLenMismatch(*func));
                 return;
             }
-            for (expected_ty, var) in arg_types.iter().zip(args.iter()) {
+            for (i, (expected_ty, var)) in arg_types.iter().zip(args.iter()).enumerate() {
                 let arg_ty = var_types.get(var).cloned();
                 if arg_ty.is_none() {
                     errors.insert(SsaError::UnsetVar(*var));
                     return;
                 }
                 if arg_ty.unwrap() != *expected_ty {
-                    errors.insert(SsaError::FnTypeMismatch(*func));
+                    errors.insert(SsaError::FnArgTypeMismatch(*assigned, i));
                     return;
                 }
+            }
+        }
+        Instruction::Phi(assigned, upstreams) => {
+            // Look at each of the upstream ssa vars and
+            // use them to determine the type of assigned.
+            let mut ty = None;
+            for (source_block, var) in upstreams.iter() {
+                let arg_ty = var_types.get(var);
+                if arg_ty.is_none() {
+                    errors.insert(SsaError::UnsetVar(*var));
+                    continue;
+                }
+                if ty.is_none() {
+                    ty = arg_ty.cloned();
+                }
+                if ty.as_ref() != arg_ty {
+                    errors.insert(SsaError::InconsistentPhiType(*assigned));
+                }
+                if !function.has_block(*source_block) {
+                    errors.insert(SsaError::PhiFromUnknownBlock(*assigned, *source_block));
+                }
+            }
+            if ty.is_none() {
+                errors.insert(SsaError::EmptyPhi(*assigned));
+                return;
+            }
+            if var_types.insert(*assigned, ty.unwrap()).is_some() {
+                errors.insert(SsaError::RedefinedVar(*assigned));
             }
         }
     }
@@ -297,7 +341,7 @@ fn typecheck_ssa(function: &FnCode, context: &Context) -> HashSet<SsaError> {
             errors.insert(SsaError::DuplicateBlockId(block.id));
         }
         for instruction in block.instructions.iter() {
-            typecheck_instruction(instruction, context, &mut var_types, &mut errors);
+            typecheck_instruction(instruction, context, function, &mut var_types, &mut errors);
         }
         typecheck_terminator(block, &var_types, function, &mut errors);
     }
@@ -440,7 +484,242 @@ mod tests {
     }
 
     #[test]
-    fn test_add_relu_branch() {
+    fn sign_fn_with_phi() {
+        let mut context = Context::new();
+        let geq_i32 = context.add_fn(FnDef {
+            name: "geq_i32".to_string(),
+            arg_types: vec![Type::Int, Type::Int],
+            return_type: Type::Bool,
+        });
+        let code = FnCode {
+            // Sign function.
+            args: vec![(SsaVar(0), Type::Int)],
+            return_type: Some(Type::Int),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        // %3 = %0 >= 0
+                        Instruction::AssignFn(SsaVar(1), geq_i32),
+                        Instruction::AssignI64(SsaVar(2), 0),
+                        Instruction::Call(SsaVar(3), SsaVar(1), vec![SsaVar(0), SsaVar(2)]),
+                    ],
+                    terminator: Terminator::CondBranch {
+                        on: SsaVar(3),
+                        true_target: BlockId(1),
+                        false_target: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    // True case: Set 1.
+                    instructions: vec![
+                        Instruction::AssignI64(SsaVar(4), 1),
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    // False case: Set -1.
+                    instructions: vec![
+                        Instruction::AssignI64(SsaVar(5), -1),
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![
+                        Instruction::Phi(SsaVar(6), BTreeMap::from([
+                            (BlockId(1), SsaVar(4)),
+                            (BlockId(2), SsaVar(5)),
+                        ]))
+                    ],
+                    terminator: Terminator::Return(SsaVar(6)),
+                },
+            ],
+        };
+        assert_eq!(typecheck_ssa(&code, &context), HashSet::new());
+    }
+
+
+    #[test]
+    fn error_phi_sign_fn_invalid_block() {
+        let mut context = Context::new();
+        let geq_i32 = context.add_fn(FnDef {
+            name: "geq_i32".to_string(),
+            arg_types: vec![Type::Int, Type::Int],
+            return_type: Type::Bool,
+        });
+        let code = FnCode {
+            // Sign function.
+            args: vec![(SsaVar(0), Type::Int)],
+            return_type: Some(Type::Int),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        // %3 = %0 >= 0
+                        Instruction::AssignFn(SsaVar(1), geq_i32),
+                        Instruction::AssignI64(SsaVar(2), 0),
+                        Instruction::Call(SsaVar(3), SsaVar(1), vec![SsaVar(0), SsaVar(2)]),
+                    ],
+                    terminator: Terminator::CondBranch {
+                        on: SsaVar(3),
+                        true_target: BlockId(1),
+                        false_target: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    // True case: Set 1.
+                    instructions: vec![
+                        Instruction::AssignI64(SsaVar(4), 1),
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    // False case: Set -1.
+                    instructions: vec![
+                        Instruction::AssignI64(SsaVar(5), -1),
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![
+                        Instruction::Phi(SsaVar(6), BTreeMap::from([
+                            (BlockId(1000), SsaVar(4)),
+                            (BlockId(2), SsaVar(5)),
+                        ]))
+                    ],
+                    terminator: Terminator::Return(SsaVar(6)),
+                },
+            ],
+        };
+        assert_eq!(typecheck_ssa(&code, &context), HashSet::from([
+            SsaError::PhiFromUnknownBlock(SsaVar(6), BlockId(1000)),
+        ]));
+    }
+    #[test]
+    fn error_phi_sign_fn_empty_phi() {
+        let mut context = Context::new();
+        let geq_i32 = context.add_fn(FnDef {
+            name: "geq_i32".to_string(),
+            arg_types: vec![Type::Int, Type::Int],
+            return_type: Type::Bool,
+        });
+        let code = FnCode {
+            // Sign function.
+            args: vec![(SsaVar(0), Type::Int)],
+            return_type: Some(Type::Int),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        // %3 = %0 >= 0
+                        Instruction::AssignFn(SsaVar(1), geq_i32),
+                        Instruction::AssignI64(SsaVar(2), 0),
+                        Instruction::Call(SsaVar(3), SsaVar(1), vec![SsaVar(0), SsaVar(2)]),
+                    ],
+                    terminator: Terminator::CondBranch {
+                        on: SsaVar(3),
+                        true_target: BlockId(1),
+                        false_target: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    // True case: Set 1.
+                    instructions: vec![
+                        Instruction::AssignI64(SsaVar(4), 1),
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    // False case: Set -1.
+                    instructions: vec![
+                        Instruction::AssignI64(SsaVar(5), -1),
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![
+                        Instruction::Phi(SsaVar(6), BTreeMap::new())
+                    ],
+                    terminator: Terminator::Return(SsaVar(6)),
+                },
+            ],
+        };
+        assert_eq!(typecheck_ssa(&code, &context), HashSet::from([
+            SsaError::EmptyPhi(SsaVar(6)),
+            SsaError::UnsetVar(SsaVar(6)),
+        ]));
+    }
+    #[test]
+    fn error_phi_sign_fn_inconsistent_types() {
+        let mut context = Context::new();
+        let geq_i32 = context.add_fn(FnDef {
+            name: "geq_i32".to_string(),
+            arg_types: vec![Type::Int, Type::Int],
+            return_type: Type::Bool,
+        });
+        let code = FnCode {
+            // Sign function.
+            args: vec![(SsaVar(0), Type::Int)],
+            return_type: Some(Type::Int),
+            blocks: vec![
+                BasicBlock {
+                    id: BlockId(0),
+                    instructions: vec![
+                        // %3 = %0 >= 0
+                        Instruction::AssignFn(SsaVar(1), geq_i32),
+                        Instruction::AssignI64(SsaVar(2), 0),
+                        Instruction::Call(SsaVar(3), SsaVar(1), vec![SsaVar(0), SsaVar(2)]),
+                    ],
+                    terminator: Terminator::CondBranch {
+                        on: SsaVar(3),
+                        true_target: BlockId(1),
+                        false_target: BlockId(2),
+                    },
+                },
+                BasicBlock {
+                    id: BlockId(1),
+                    // True case: Set 1.
+                    instructions: vec![
+                        Instruction::AssignI64(SsaVar(4), 1),
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(2),
+                    // False case: Set -1.
+                    instructions: vec![
+                        Instruction::AssignF64(SsaVar(5), -1.0),  // Oops float.
+                    ],
+                    terminator: Terminator::Goto(BlockId(3)),
+                },
+                BasicBlock {
+                    id: BlockId(3),
+                    instructions: vec![
+                        Instruction::Phi(SsaVar(6), BTreeMap::from([
+                            (BlockId(1), SsaVar(4)),
+                            (BlockId(2), SsaVar(5)),
+                        ]))
+                    ],
+                    terminator: Terminator::Return(SsaVar(6)),
+                },
+            ],
+        };
+        assert_eq!(typecheck_ssa(&code, &context), HashSet::from([
+            SsaError::InconsistentPhiType(SsaVar(6)),
+        ]));
+    }
+
+    #[test]
+    fn error_wrong_arg_type() {
         // TODO: Add arithmetic to the fn def.
         let mut context = Context::new();
         let add_i32 = context.add_fn(FnDef {
@@ -448,45 +727,23 @@ mod tests {
             arg_types: vec![Type::Int, Type::Int],
             return_type: Type::Int,
         });
-        let geq_i32 = context.add_fn(FnDef {
-            name: "geq_i32".to_string(),
-            arg_types: vec![Type::Int, Type::Int],
-            return_type: Type::Bool,
-        });
         let code = FnCode {
-            args: vec![(SsaVar(0), Type::Int), (SsaVar(1), Type::Int)],
+            args: vec![],
             return_type: Some(Type::Int),
-            blocks: vec![
-                BasicBlock {
-                    id: BlockId(0),
-                    instructions: vec![
-                        // %3 = %0 + %1
-                        Instruction::AssignFn(SsaVar(2), add_i32),
-                        Instruction::Call(SsaVar(3), SsaVar(2), vec![SsaVar(0), SsaVar(1)]),
-                        // %6 = %3 >= 0
-                        Instruction::AssignFn(SsaVar(4), geq_i32),
-                        Instruction::AssignI64(SsaVar(5), 0),
-                        Instruction::Call(SsaVar(6), SsaVar(4), vec![SsaVar(3), SsaVar(5)]),
-                    ],
-                    terminator: Terminator::CondBranch {
-                        on: SsaVar(6),
-                        true_target: BlockId(1),
-                        false_target: BlockId(2),
-                    },
-                },
-                BasicBlock {
-                    id: BlockId(1), // return %3
-                    instructions: vec![],
-                    terminator: Terminator::Return(SsaVar(3)),
-                },
-                BasicBlock {
-                    id: BlockId(2),
-                    instructions: vec![], // return 0
-                    terminator: Terminator::Return(SsaVar(5)),
-                },
-            ],
+            blocks: vec![BasicBlock {
+                id: BlockId(0),
+                instructions: vec![
+                    Instruction::AssignI64(SsaVar(0), 2),
+                    Instruction::AssignF64(SsaVar(1), 2.0),  // Oops, float.
+                    Instruction::AssignFn(SsaVar(2), add_i32),
+                    Instruction::Call(SsaVar(3), SsaVar(2), vec![SsaVar(0), SsaVar(1)]),
+                ],
+                terminator: Terminator::Return(SsaVar(3)),
+            }],
         };
-        assert_eq!(typecheck_ssa(&code, &context), HashSet::new());
+        assert_eq!(typecheck_ssa(&code, &context), HashSet::from([
+            SsaError::FnArgTypeMismatch(SsaVar(3), 1),
+        ]));   
     }
 
     #[test]
