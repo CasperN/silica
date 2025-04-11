@@ -1,5 +1,6 @@
 // Abstract syntax tree and type checking.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -176,12 +177,13 @@ struct ShadowTypeContext<'a> {
 impl<'a> ShadowTypeContext<'a> {
     fn insert(&mut self, name: String, ty: Type, mutable: bool) {
         let info = VariableInfo { ty, mutable };
-        if self.shadowed.contains_key(&name) {
-            // Original already saved.
-            self.type_context.variables.insert(name, info);
+         if let Entry::Vacant(entry) = self.shadowed.entry(name.clone()) {
+            let original = self.type_context.variables.insert(name, info);
+            entry.insert(original);
         } else {
-            let original = self.type_context.variables.insert(name.clone(), info);
-            self.shadowed.insert(name, original);
+            // The original was already saved in `shadowed`,
+            // no need to touch that.
+            self.type_context.variables.insert(name, info);
         }
     }
     fn insert_binding(&mut self, binding: TypedBinding) {
@@ -242,7 +244,7 @@ impl Substitutions {
 enum Error {
     UnknownName(String),
     NotUnifiable(Type, Type),
-    InfiniteTypeError(TypeVar, Type),
+    InfiniteType(TypeVar, Type),
     DuplicateArgNames(Expression),
     DuplicateTopLevelName(String),
     AssignToImmutableBinding(String),
@@ -257,7 +259,7 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
         | (Type::Unit, Type::Unit) => Ok(Substitutions::new()),
         (Type::Var(tv), ty) | (ty, Type::Var(tv)) => {
             if ty.contains_type_var(*tv) {
-                return Err(Error::InfiniteTypeError(*tv, ty.clone()));
+                return Err(Error::InfiniteType(*tv, ty.clone()));
             }
             let mut subs = Substitutions::new();
             subs.insert(*tv, ty.clone());
@@ -269,9 +271,9 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
             }
             let mut subs = Substitutions::new();
             for (left_arg_ty, right_arg_ty) in left_arg_types.iter().zip(right_arg_types.iter()) {
-                subs.and_then(&unify(&left_arg_ty, &right_arg_ty)?);
+                subs.and_then(&unify(left_arg_ty, right_arg_ty)?);
             }
-            subs.and_then(&unify(&left_ret_ty, &right_ret_ty)?);
+            subs.and_then(&unify(left_ret_ty, right_ret_ty)?);
             Ok(subs)
         }
         _ => Err(Error::NotUnifiable(left.clone(), right.clone())),
@@ -299,11 +301,11 @@ fn infer(
             cond_ty.substitute(&subs);
             subs.and_then(&unify(&cond_ty, &Type::Bool)?);
 
-            let (mut t_ty, t_subs) = infer(context, &t_expr)?;
+            let (mut t_ty, t_subs) = infer(context, t_expr)?;
             subs.and_then(&t_subs);
             t_ty.substitute(&subs);
 
-            let (mut f_ty, f_subs) = infer(context, &f_expr)?;
+            let (mut f_ty, f_subs) = infer(context, f_expr)?;
             subs.and_then(&f_subs);
             f_ty.substitute(&subs);
 
@@ -388,7 +390,7 @@ fn infer(
                     }
                     Statement::Assign(LValue::Variable(name), expr) => {
                         let context = shadow.context();
-                        let (mut expr_ty, e_subs) = infer(context, &expr)?;
+                        let (mut expr_ty, e_subs) = infer(context, expr)?;
                         subs.and_then(&e_subs);
                         expr_ty.substitute(&subs);
 

@@ -15,5 +15,5 @@ TODO:
       adjacent integers.
 */
 
-mod ssa;
 mod ast;
+mod ssa;

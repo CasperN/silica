@@ -1,10 +1,10 @@
-// Silica SSA IR. 
+// Silica SSA IR.
 //
-// After typechecking an AST, we lower to this IR. 
-// It is an explicitly-typed, but polymorphic, and in SSA form. 
+// After typechecking an AST, we lower to this IR.
+// It is an explicitly-typed, but polymorphic, and in SSA form.
 // The simplified control-flow enables linear type checking
 // and lifetime analysis.
-use std::collections::{HashMap, HashSet, BTreeMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct SsaVar(u32);
@@ -155,7 +155,7 @@ enum SsaError {
 
     // Phi related errors.
     EmptyPhi(SsaVar),
-    InconsistentPhiType(SsaVar), // Assigned var.
+    InconsistentPhiType(SsaVar),          // Assigned var.
     PhiFromUnknownBlock(SsaVar, BlockId), // Assigned var, invalid block
 }
 
@@ -499,34 +499,27 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     // True case: Set 1.
-                    instructions: vec![
-                        Instruction::AssignI64(SsaVar(4), 1),
-                    ],
+                    instructions: vec![Instruction::AssignI64(SsaVar(4), 1)],
                     terminator: Terminator::Goto(BlockId(3)),
                 },
                 BasicBlock {
                     id: BlockId(2),
                     // False case: Set -1.
-                    instructions: vec![
-                        Instruction::AssignI64(SsaVar(5), -1),
-                    ],
+                    instructions: vec![Instruction::AssignI64(SsaVar(5), -1)],
                     terminator: Terminator::Goto(BlockId(3)),
                 },
                 BasicBlock {
                     id: BlockId(3),
-                    instructions: vec![
-                        Instruction::Phi(SsaVar(6), BTreeMap::from([
-                            (BlockId(1), SsaVar(4)),
-                            (BlockId(2), SsaVar(5)),
-                        ]))
-                    ],
+                    instructions: vec![Instruction::Phi(
+                        SsaVar(6),
+                        BTreeMap::from([(BlockId(1), SsaVar(4)), (BlockId(2), SsaVar(5))]),
+                    )],
                     terminator: Terminator::Return(SsaVar(6)),
                 },
             ],
         };
         assert_eq!(typecheck_ssa(&code, &context), HashSet::new());
     }
-
 
     #[test]
     fn error_phi_sign_fn_invalid_block() {
@@ -558,34 +551,29 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     // True case: Set 1.
-                    instructions: vec![
-                        Instruction::AssignI64(SsaVar(4), 1),
-                    ],
+                    instructions: vec![Instruction::AssignI64(SsaVar(4), 1)],
                     terminator: Terminator::Goto(BlockId(3)),
                 },
                 BasicBlock {
                     id: BlockId(2),
                     // False case: Set -1.
-                    instructions: vec![
-                        Instruction::AssignI64(SsaVar(5), -1),
-                    ],
+                    instructions: vec![Instruction::AssignI64(SsaVar(5), -1)],
                     terminator: Terminator::Goto(BlockId(3)),
                 },
                 BasicBlock {
                     id: BlockId(3),
-                    instructions: vec![
-                        Instruction::Phi(SsaVar(6), BTreeMap::from([
-                            (BlockId(1000), SsaVar(4)),
-                            (BlockId(2), SsaVar(5)),
-                        ]))
-                    ],
+                    instructions: vec![Instruction::Phi(
+                        SsaVar(6),
+                        BTreeMap::from([(BlockId(1000), SsaVar(4)), (BlockId(2), SsaVar(5))]),
+                    )],
                     terminator: Terminator::Return(SsaVar(6)),
                 },
             ],
         };
-        assert_eq!(typecheck_ssa(&code, &context), HashSet::from([
-            SsaError::PhiFromUnknownBlock(SsaVar(6), BlockId(1000)),
-        ]));
+        assert_eq!(
+            typecheck_ssa(&code, &context),
+            HashSet::from([SsaError::PhiFromUnknownBlock(SsaVar(6), BlockId(1000)),])
+        );
     }
     #[test]
     fn error_phi_sign_fn_empty_phi() {
@@ -617,32 +605,26 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     // True case: Set 1.
-                    instructions: vec![
-                        Instruction::AssignI64(SsaVar(4), 1),
-                    ],
+                    instructions: vec![Instruction::AssignI64(SsaVar(4), 1)],
                     terminator: Terminator::Goto(BlockId(3)),
                 },
                 BasicBlock {
                     id: BlockId(2),
                     // False case: Set -1.
-                    instructions: vec![
-                        Instruction::AssignI64(SsaVar(5), -1),
-                    ],
+                    instructions: vec![Instruction::AssignI64(SsaVar(5), -1)],
                     terminator: Terminator::Goto(BlockId(3)),
                 },
                 BasicBlock {
                     id: BlockId(3),
-                    instructions: vec![
-                        Instruction::Phi(SsaVar(6), BTreeMap::new())
-                    ],
+                    instructions: vec![Instruction::Phi(SsaVar(6), BTreeMap::new())],
                     terminator: Terminator::Return(SsaVar(6)),
                 },
             ],
         };
-        assert_eq!(typecheck_ssa(&code, &context), HashSet::from([
-            SsaError::EmptyPhi(SsaVar(6)),
-            SsaError::UnsetVar(SsaVar(6)),
-        ]));
+        assert_eq!(
+            typecheck_ssa(&code, &context),
+            HashSet::from([SsaError::EmptyPhi(SsaVar(6)), SsaError::UnsetVar(SsaVar(6)),])
+        );
     }
     #[test]
     fn error_phi_sign_fn_inconsistent_types() {
@@ -674,34 +656,31 @@ mod tests {
                 BasicBlock {
                     id: BlockId(1),
                     // True case: Set 1.
-                    instructions: vec![
-                        Instruction::AssignI64(SsaVar(4), 1),
-                    ],
+                    instructions: vec![Instruction::AssignI64(SsaVar(4), 1)],
                     terminator: Terminator::Goto(BlockId(3)),
                 },
                 BasicBlock {
                     id: BlockId(2),
                     // False case: Set -1.
                     instructions: vec![
-                        Instruction::AssignF64(SsaVar(5), -1.0),  // Oops float.
+                        Instruction::AssignF64(SsaVar(5), -1.0), // Oops float.
                     ],
                     terminator: Terminator::Goto(BlockId(3)),
                 },
                 BasicBlock {
                     id: BlockId(3),
-                    instructions: vec![
-                        Instruction::Phi(SsaVar(6), BTreeMap::from([
-                            (BlockId(1), SsaVar(4)),
-                            (BlockId(2), SsaVar(5)),
-                        ]))
-                    ],
+                    instructions: vec![Instruction::Phi(
+                        SsaVar(6),
+                        BTreeMap::from([(BlockId(1), SsaVar(4)), (BlockId(2), SsaVar(5))]),
+                    )],
                     terminator: Terminator::Return(SsaVar(6)),
                 },
             ],
         };
-        assert_eq!(typecheck_ssa(&code, &context), HashSet::from([
-            SsaError::InconsistentPhiType(SsaVar(6)),
-        ]));
+        assert_eq!(
+            typecheck_ssa(&code, &context),
+            HashSet::from([SsaError::InconsistentPhiType(SsaVar(6)),])
+        );
     }
 
     #[test]
@@ -720,16 +699,17 @@ mod tests {
                 id: BlockId(0),
                 instructions: vec![
                     Instruction::AssignI64(SsaVar(0), 2),
-                    Instruction::AssignF64(SsaVar(1), 2.0),  // Oops, float.
+                    Instruction::AssignF64(SsaVar(1), 2.0), // Oops, float.
                     Instruction::AssignFn(SsaVar(2), add_i32),
                     Instruction::Call(SsaVar(3), SsaVar(2), vec![SsaVar(0), SsaVar(1)]),
                 ],
                 terminator: Terminator::Return(SsaVar(3)),
             }],
         };
-        assert_eq!(typecheck_ssa(&code, &context), HashSet::from([
-            SsaError::FnArgTypeMismatch(SsaVar(3), 1),
-        ]));   
+        assert_eq!(
+            typecheck_ssa(&code, &context),
+            HashSet::from([SsaError::FnArgTypeMismatch(SsaVar(3), 1),])
+        );
     }
 
     #[test]
