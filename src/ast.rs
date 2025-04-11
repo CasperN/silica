@@ -21,15 +21,13 @@ enum Expression {
     If(Box<Expression>, Box<Expression>, Box<Expression>),
     Call(Box<Expression>, Vec<Expression>),
     Block(Vec<Statement>),
-    Lambda(Vec<String>, Box<Expression>),
+    Lambda(Vec<SoftBinding>, Box<Expression>),
 }
 #[derive(Debug, Clone, PartialEq)]
 enum Statement {
     Assign(LValue, Box<Expression>),
     Let {
-        variable: String,
-        mutable: bool,
-        ty: Option<Type>,
+        binding: SoftBinding,
         value: Expression,
     },
     Expression(Expression),
@@ -39,9 +37,41 @@ enum Statement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+struct TypedBinding {
+    name: String,
+    ty: Type,
+    mutable: bool,
+}
+impl TypedBinding {
+    fn new(name: impl Into<String>, ty: impl Into<Type>, mutable: bool) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            mutable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct SoftBinding {
+    name: String,
+    ty: Option<Type>,
+    mutable: bool,
+}
+impl SoftBinding {
+    fn new(name: impl Into<String>, ty: impl Into<Option<Type>>, mutable: bool) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            mutable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct FnDecl {
     name: String,
-    args: Vec<(String, Type)>,
+    args: Vec<TypedBinding>,
     ret: Type,
     // If no body is provided, its assumed to be external.
     body: Option<Expression>,
@@ -145,7 +175,7 @@ struct ShadowTypeContext<'a> {
 }
 impl<'a> ShadowTypeContext<'a> {
     fn insert(&mut self, name: String, ty: Type, mutable: bool) {
-        let info =  VariableInfo { ty, mutable };
+        let info = VariableInfo { ty, mutable };
         if self.shadowed.contains_key(&name) {
             // Original already saved.
             self.type_context.variables.insert(name, info);
@@ -153,6 +183,15 @@ impl<'a> ShadowTypeContext<'a> {
             let original = self.type_context.variables.insert(name.clone(), info);
             self.shadowed.insert(name, original);
         }
+    }
+    fn insert_binding(&mut self, binding: TypedBinding) {
+        let TypedBinding { name, ty, mutable } = binding;
+        self.insert(name, ty, mutable);
+    }
+    fn insert_soft_binding(&mut self, binding: SoftBinding) {
+        let SoftBinding { name, ty, mutable } = binding;
+        let ty = ty.unwrap_or_else(|| self.context().new_type_var());
+        self.insert(name, ty, mutable);
     }
     fn context_contains(&mut self, name: &str) -> bool {
         self.type_context.variables.contains_key(name)
@@ -207,14 +246,15 @@ enum Error {
     DuplicateArgNames(Expression),
     DuplicateTopLevelName(String),
     AssignToImmutableBinding(String),
+    TopLevelFnArgsMustBeTyped(String),
 }
 
 fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
     match (left, right) {
-        (Type::Int, Type::Int) | (Type::Float, Type::Float) | (Type::Bool, Type::Bool) 
-        | (Type::Unit, Type::Unit) => {
-            Ok(Substitutions::new())
-        }
+        (Type::Int, Type::Int)
+        | (Type::Float, Type::Float)
+        | (Type::Bool, Type::Bool)
+        | (Type::Unit, Type::Unit) => Ok(Substitutions::new()),
         (Type::Var(tv), ty) | (ty, Type::Var(tv)) => {
             if ty.contains_type_var(*tv) {
                 return Err(Error::InfiniteTypeError(*tv, ty.clone()));
@@ -297,20 +337,31 @@ fn infer(
 
             Ok((return_type, subs))
         }
-        Expression::Lambda(arg_names, body) => {
-            let arg_name_set: HashSet<_> = arg_names.iter().collect();
-            if arg_name_set.len() != arg_names.len() {
+        Expression::Lambda(bindings, body) => {
+            let arg_name_set: HashSet<_> = bindings.iter().map(|b| b.name.as_str()).collect();
+            if arg_name_set.len() != bindings.len() {
                 return Err(Error::DuplicateArgNames(expression.clone()));
             }
             let mut shadow = context.shadow();
-            for name in arg_names.iter() {
-                let var_type = shadow.context().new_type_var();
-                // TODO: args need to declare mutability.
-                shadow.insert(name.clone(), var_type, false);
+            for binding in bindings.iter() {
+                shadow.insert_soft_binding(binding.clone());
             }
-            let res = infer(shadow.context(), body);
+            let (return_type, subs) = infer(shadow.context(), body)?;
+            shadow.context().substitute(&subs);
+
+            let mut arg_types = Vec::new();
+            for binding in bindings.iter() {
+                let arg_type = shadow
+                    .context()
+                    .variable_info(binding.name.as_str())
+                    .unwrap()
+                    .ty
+                    .clone();
+                arg_types.push(arg_type);
+            }
+            let fn_ty = Type::Fn(arg_types, Box::new(return_type));
             shadow.finish();
-            res
+            Ok((fn_ty, subs))
         }
         Expression::Block(statements) => {
             let mut subs = Substitutions::new();
@@ -323,21 +374,16 @@ fn infer(
                         subs.and_then(&e_subs);
                         last_statement_type = e_ty;
                     }
-                    Statement::Let {
-                        variable,
-                        mutable,
-                        ty: declared_type,
-                        value,
-                    } => {
+                    Statement::Let { binding, value } => {
                         let context = shadow.context();
                         let (mut value_type, value_subs) = infer(context, value)?;
                         subs.and_then(&value_subs);
                         value_type.substitute(&subs);
-                        if let Some(ty) = declared_type {
-                            subs.and_then(&unify(ty, &value_type)?);
+                        if let Some(binding_ty) = &binding.ty {
+                            subs.and_then(&(unify(binding_ty, &value_type))?);
                         }
                         context.substitute(&subs);
-                        shadow.insert(variable.clone(), value_type, *mutable);
+                        shadow.insert(binding.name.clone(), value_type, binding.mutable);
                         last_statement_type = Type::Unit;
                     }
                     Statement::Assign(LValue::Variable(name), expr) => {
@@ -358,7 +404,7 @@ fn infer(
                         subs.and_then(&unify(&expr_ty, &variable_info.ty)?);
                         context.substitute(&subs);
                         last_statement_type = Type::Unit;
-                    },
+                    }
                     Statement::Return(_expr) => todo!(),
                 }
             }
@@ -383,9 +429,12 @@ fn typecheck_program(program: &Program) -> Result<(), Error> {
                 if shadow.context_contains(name.as_str()) {
                     return Err(Error::DuplicateTopLevelName(name.clone()));
                 }
-                let arg_types = args.iter().map(|(_, ty)| ty.clone()).collect();
+                let mut arg_types = vec![];
+                for binding in args.iter() {
+                    arg_types.push(binding.ty.clone());
+                }
                 let fn_type = Type::Fn(arg_types, Box::new(ret.clone()));
-                shadow.insert(name.clone(), fn_type, false);  // TODO: args need to declare mutability.
+                shadow.insert(name.clone(), fn_type, false); // TODO: args need to declare mutability.
             }
         }
     }
@@ -405,8 +454,8 @@ fn typecheck_program(program: &Program) -> Result<(), Error> {
 
                 // Declare a new shadow to insert fn variables.
                 let mut shadow = shadow.context().shadow();
-                for (arg_name, arg_ty) in args.iter() {
-                    shadow.insert(arg_name.to_string(), arg_ty.clone(), false);  // TODO: variables need to declare mutaiblity.
+                for binding in args.iter() {
+                    shadow.insert_binding(binding.clone()); // TODO: variables need to declare mutaiblity.
                 }
                 let (mut ty, subs) = infer(shadow.context(), body)?;
                 ty.substitute(&subs);
@@ -419,15 +468,81 @@ fn typecheck_program(program: &Program) -> Result<(), Error> {
     Ok(())
 }
 
+impl From<i64> for Expression {
+    fn from(value: i64) -> Self {
+        Expression::LiteralInt(value)
+    }
+}
+impl From<f64> for Expression {
+    fn from(value: f64) -> Self {
+        Expression::LiteralFloat(value)
+    }
+}
+impl From<bool> for Expression {
+    fn from(value: bool) -> Self {
+        Expression::LiteralBool(value)
+    }
+}
+impl From<()> for Expression {
+    fn from(_: ()) -> Self {
+        Expression::LiteralUnit
+    }
+}
+impl From<&str> for Statement {
+    fn from(value: &str) -> Self {
+        Statement::Expression(Expression::L(LValue::Variable(value.to_string())))
+    }
+}
+impl From<i64> for Statement {
+    fn from(value: i64) -> Self {
+        Statement::Expression(Expression::LiteralInt(value))
+    }
+}
+impl From<&str> for Expression {
+    fn from(value: &str) -> Self {
+        Expression::L(LValue::Variable(value.to_string()))
+    }
+}
+impl From<&str> for LValue {
+    fn from(value: &str) -> Self {
+        LValue::Variable(value.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn let_stmt(
+        name: &str,
+        ty: impl Into<Option<Type>>,
+        mutable: bool,
+        value: impl Into<Expression>,
+    ) -> Statement {
+        Statement::Let {
+            binding: SoftBinding {
+                name: name.to_string(),
+                ty: ty.into(),
+                mutable,
+            },
+            value: value.into(),
+        }
+    }
+    fn call_expr(f: impl Into<Expression>, args: Vec<Expression>) -> Expression {
+        Expression::Call(Box::new(f.into()), args)
+    }
+    fn assign_stmt(left: impl Into<LValue>, right: impl Into<Expression>) -> Statement {
+        Statement::Assign(left.into(), Box::new(right.into()))
+    }
+
     #[test]
     fn two_plus_two() {
         let program = &Program(vec![
             Declaration::Fn(FnDecl {
                 name: "plus".to_string(),
-                args: vec![("a".to_string(), Type::Int), ("b".to_string(), Type::Int)],
+                args: vec![
+                    TypedBinding::new("a", Type::Int, false),
+                    TypedBinding::new("b", Type::Int, false),
+                ],
                 ret: Type::Int,
                 body: None,
             }),
@@ -436,95 +551,99 @@ mod tests {
                 args: vec![],
                 ret: Type::Int,
                 body: Some(Expression::Block(vec![
-                    Statement::Let { variable: "a".to_string(), mutable: false, ty: None, value: Expression::LiteralInt(2) },
-                    Statement::Let { variable: "b".to_string(), mutable: false, ty: None, value: Expression::LiteralInt(2) },
-                    Statement::Let {
-                        variable: "c".to_string(),
-                        mutable: false,
-                        ty: None, 
-                        value: Expression::Call(
+                    let_stmt("a", None, false, 2),
+                    let_stmt("b", None, false, 2),
+                    let_stmt(
+                        "c",
+                        None,
+                        false,
+                        Expression::Call(
                             Box::new(Expression::L(LValue::Variable("plus".to_string()))),
                             vec![
                                 Expression::L(LValue::Variable("a".to_string())),
                                 Expression::L(LValue::Variable("b".to_string())),
-                            ]
-                        )
-                    },
-                    Statement::Expression(Expression::L(LValue::Variable("c".to_string())))
+                            ],
+                        ),
+                    ),
+                    Statement::Expression(Expression::L(LValue::Variable("c".to_string()))),
                 ])),
-            })
+            }),
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn shadow_earlier_variables() {
-        let program = &Program(vec![
-            Declaration::Fn(FnDecl {
-                name: "main".to_string(),
-                args: vec![],
-                ret: Type::Bool,
-                body: Some(Expression::Block(vec![
-                    Statement::Let { variable: "a".to_string(), mutable: false, ty: None, value: Expression::LiteralInt(2) },
-                    Statement::Let { variable: "a".to_string(), mutable: false, ty: None, value: Expression::LiteralFloat(2.0) },
-                    Statement::Let { variable: "a".to_string(), mutable: false, ty: None, value: Expression::LiteralBool(true) },
-                    Statement::Expression(Expression::L(LValue::Variable("a".to_string())))
-                ])),
-            })
-        ]);
+        let program = &Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            args: vec![],
+            ret: Type::Bool,
+            body: Some(Expression::Block(vec![
+                let_stmt("a", None, false, 2),
+                let_stmt("a", None, false, 2.0),
+                let_stmt("a", None, false, true),
+                Statement::Expression(Expression::L(LValue::Variable("a".to_string()))),
+            ])),
+        })]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
 
     #[test]
     fn assign_to_mutable_binding() {
-        let program = &Program(vec![
-            Declaration::Fn(FnDecl {
-                name: "main".to_string(),
-                args: vec![],
-                ret: Type::Unit,
-                body: Some(Expression::Block(vec![
-                    Statement::Let { variable: "a".to_string(), mutable: true, ty: None, value: Expression::LiteralInt(2) },
-                    Statement::Assign(LValue::Variable("a".to_string()), Box::new(Expression::LiteralInt(3))),
-                ])),
-            })
-        ]);
+        let program = &Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            args: vec![TypedBinding::new("a", Type::Int, true)], // mutable.
+            ret: Type::Unit,
+            body: Some(Expression::Block(vec![Statement::Assign(
+                LValue::Variable("a".to_string()),
+                Box::new(Expression::LiteralInt(3)),
+            )])),
+        })]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn error_assign_wrong_type_to_mutable_binding() {
-        let program = &Program(vec![
-            Declaration::Fn(FnDecl {
-                name: "main".to_string(),
-                args: vec![],
-                ret: Type::Unit,
-                body: Some(Expression::Block(vec![
-                    Statement::Let { variable: "a".to_string(), mutable: true, ty: None, value: Expression::LiteralInt(2) },
-                    Statement::Assign(LValue::Variable("a".to_string()), Box::new(Expression::LiteralUnit)),
-                ])),
-            })
-        ]);
-        assert_eq!(typecheck_program(program), Err(Error::NotUnifiable(Type::Unit, Type::Int)));
+        let program = &Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            args: vec![],
+            ret: Type::Unit,
+            body: Some(Expression::Block(vec![
+                let_stmt("a", None, true, 2),
+                Statement::Assign(
+                    LValue::Variable("a".to_string()),
+                    Box::new(Expression::LiteralUnit),
+                ),
+            ])),
+        })]);
+        assert_eq!(
+            typecheck_program(program),
+            Err(Error::NotUnifiable(Type::Unit, Type::Int))
+        );
     }
     #[test]
     fn error_assign_to_immutable_binding() {
-        let program = &Program(vec![
-            Declaration::Fn(FnDecl {
-                name: "main".to_string(),
-                args: vec![],
-                ret: Type::Unit,
-                body: Some(Expression::Block(vec![
-                    Statement::Let { variable: "a".to_string(), mutable: false, ty: None, value: Expression::LiteralInt(2) },
-                    Statement::Assign(LValue::Variable("a".to_string()), Box::new(Expression::LiteralInt(3))),
-                ])),
-            })
-        ]);
-        assert_eq!(typecheck_program(program), Err(Error::AssignToImmutableBinding("a".to_string())));
+        let program = &Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            args: vec![],
+            ret: Type::Unit,
+            body: Some(Expression::Block(vec![
+                let_stmt("a", None, false, 2),
+                Statement::Assign(
+                    LValue::Variable("a".to_string()),
+                    Box::new(Expression::LiteralInt(3)),
+                ),
+            ])),
+        })]);
+        assert_eq!(
+            typecheck_program(program),
+            Err(Error::AssignToImmutableBinding("a".to_string()))
+        );
     }
     #[test]
     fn if_expression_unifies() {
         let program = &Program(vec![
             Declaration::Fn(FnDecl {
                 name: "round".to_string(),
-                args: vec![("a".to_string(), Type::Float)],
+                args: vec![TypedBinding::new("a", Type::Float, false)],
                 ret: Type::Int,
                 body: None,
             }),
@@ -533,22 +652,82 @@ mod tests {
                 args: vec![],
                 ret: Type::Int,
                 body: Some(Expression::Block(vec![
-                    Statement::Let { variable: "a".to_string(), mutable: false, ty: None, value: Expression::LiteralBool(true) },
-                    Statement::Let { variable: "b".to_string(), mutable: false, ty: None, value: Expression::LiteralInt(2) },
-                    Statement::Let { variable: "c".to_string(), mutable: false, ty: None, value: Expression::LiteralFloat(2.0) },
-                    
-                    Statement::Expression(
-                        Expression::If(
-                            Box::new(Expression::L(LValue::Variable("a".to_string()))),
-                            Box::new(Expression::L(LValue::Variable("b".to_string()))),
-                            Box::new(Expression::Call(
-                                Box::new(Expression::L(LValue::Variable("round".to_string()))),
-                                vec![Expression::L(LValue::Variable("c".to_string()))],
-                            )),
-                        )
-                    )
+                    let_stmt("a", None, false, true),
+                    let_stmt("b", None, false, 2),
+                    let_stmt("c", None, false, 2.0),
+                    Statement::Expression(Expression::If(
+                        Box::new("a".into()),
+                        Box::new("b".into()),
+                        Box::new(call_expr("round", vec!["c".into()])),
+                    )),
                 ])),
-            })
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn use_lambda() {
+        let program = &Program(vec![
+            Declaration::Fn(FnDecl {
+                name: "plus".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::Int, false),
+                    TypedBinding::new("b", Type::Int, false),
+                ],
+                ret: Type::Int,
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                name: "main".to_string(),
+                args: vec![],
+                ret: Type::Int,
+                body: Some(Expression::Block(vec![
+                    let_stmt(
+                        "plus_two",
+                        None,
+                        false,
+                        Expression::Lambda(
+                            vec![SoftBinding::new("x", None, false)],
+                            Box::new(call_expr("plus", vec![2.into(), "x".into()])),
+                        ),
+                    ),
+                    let_stmt("b", None, true, 2),
+                    assign_stmt("b", call_expr("plus_two", vec!["b".into()])),
+                    "b".into(),
+                ])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn return_lambda() {
+        let program = &Program(vec![
+            Declaration::Fn(FnDecl {
+                name: "plus".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::Int, false),
+                    TypedBinding::new("b", Type::Int, false),
+                ],
+                ret: Type::Int,
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                name: "main".to_string(),
+                args: vec![],
+                ret: Type::Fn(vec![Type::Int], Box::new(Type::Int)),
+                body: Some(Expression::Block(vec![
+                    let_stmt(
+                        "plus_two",
+                        None,
+                        false,
+                        Expression::Lambda(
+                            vec![SoftBinding::new("x", None, false)],
+                            Box::new(call_expr("plus", vec![2.into(), "x".into()])),
+                        ),
+                    ),
+                    "plus_two".into(),
+                ])),
+            }),
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
