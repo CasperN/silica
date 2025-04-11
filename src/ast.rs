@@ -19,10 +19,22 @@ enum Expression {
     LiteralBool(bool),
     LiteralFloat(f64),
     LiteralUnit,
-    If(Box<Expression>, Box<Expression>, Box<Expression>),
-    Call(Box<Expression>, Vec<Expression>),
-    Block(Vec<Statement>),
-    Lambda(Vec<SoftBinding>, Box<Expression>),
+    If {
+        condition: Box<Expression>,
+        true_expr: Box<Expression>,
+        false_expr: Box<Expression>,
+    },
+    Call {
+        fn_expr: Box<Expression>,
+        arg_exprs: Vec<Expression>,
+    },
+    Block {
+        statements: Vec<Statement>,
+    },
+    Lambda {
+        bindings: Vec<SoftBinding>,
+        body: Box<Expression>,
+    },
 }
 #[derive(Debug, Clone, PartialEq)]
 enum Statement {
@@ -296,16 +308,20 @@ fn infer(
         Expression::LiteralInt(_) => Ok((Type::Int, Substitutions::new())),
         Expression::LiteralBool(_) => Ok((Type::Bool, Substitutions::new())),
         Expression::LiteralFloat(_) => Ok((Type::Float, Substitutions::new())),
-        Expression::If(cond, t_expr, f_expr) => {
-            let (mut cond_ty, mut subs) = infer(context, cond)?;
+        Expression::If {
+            condition,
+            true_expr,
+            false_expr,
+        } => {
+            let (mut cond_ty, mut subs) = infer(context, condition)?;
             cond_ty.substitute(&subs);
             subs.and_then(&unify(&cond_ty, &Type::Bool)?);
 
-            let (mut t_ty, t_subs) = infer(context, t_expr)?;
+            let (mut t_ty, t_subs) = infer(context, true_expr)?;
             subs.and_then(&t_subs);
             t_ty.substitute(&subs);
 
-            let (mut f_ty, f_subs) = infer(context, f_expr)?;
+            let (mut f_ty, f_subs) = infer(context, false_expr)?;
             subs.and_then(&f_subs);
             f_ty.substitute(&subs);
 
@@ -313,7 +329,7 @@ fn infer(
 
             Ok((t_ty, subs))
         }
-        Expression::Call(fn_expr, arg_exprs) => {
+        Expression::Call { fn_expr, arg_exprs } => {
             let mut arg_types = vec![];
             let mut subs = Substitutions::new();
             for arg_expr in arg_exprs {
@@ -339,7 +355,7 @@ fn infer(
 
             Ok((return_type, subs))
         }
-        Expression::Lambda(bindings, body) => {
+        Expression::Lambda { bindings, body } => {
             let arg_name_set: HashSet<_> = bindings.iter().map(|b| b.name.as_str()).collect();
             if arg_name_set.len() != bindings.len() {
                 return Err(Error::DuplicateArgNames(expression.clone()));
@@ -365,7 +381,7 @@ fn infer(
             shadow.finish();
             Ok((fn_ty, subs))
         }
-        Expression::Block(statements) => {
+        Expression::Block { statements } => {
             let mut subs = Substitutions::new();
             let mut shadow = context.shadow();
             let mut last_statement_type = Type::Unit;
@@ -529,8 +545,11 @@ mod tests {
             value: value.into(),
         }
     }
-    fn call_expr(f: impl Into<Expression>, args: Vec<Expression>) -> Expression {
-        Expression::Call(Box::new(f.into()), args)
+    fn call_expr(f: impl Into<Expression>, arg_exprs: Vec<Expression>) -> Expression {
+        Expression::Call {
+            fn_expr: Box::new(f.into()),
+            arg_exprs,
+        }
     }
     fn assign_stmt(left: impl Into<LValue>, right: impl Into<Expression>) -> Statement {
         Statement::Assign(left.into(), right.into())
@@ -540,11 +559,20 @@ mod tests {
         true_expr: impl Into<Expression>,
         false_expr: impl Into<Expression>,
     ) -> Expression {
-        Expression::If(
-            Box::new(cond.into()),
-            Box::new(true_expr.into()),
-            Box::new(false_expr.into()),
-        )
+        Expression::If {
+            condition: Box::new(cond.into()),
+            true_expr: Box::new(true_expr.into()),
+            false_expr: Box::new(false_expr.into()),
+        }
+    }
+    fn block_expr(statements: Vec<Statement>) -> Expression {
+        Expression::Block { statements }
+    }
+    fn lambda_expr(bindings: Vec<SoftBinding>, body: impl Into<Expression>) -> Expression {
+        Expression::Lambda {
+            bindings,
+            body: Box::new(body.into()),
+        }
     }
 
     #[test]
@@ -563,17 +591,19 @@ mod tests {
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::Int,
-                body: Some(Expression::Block(vec![
-                    let_stmt("a", None, false, 2),
-                    let_stmt("b", None, false, 2),
-                    let_stmt(
-                        "c",
-                        None,
-                        false,
-                        call_expr("plus", vec!["a".into(), "b".into()]),
-                    ),
-                    "c".into(),
-                ])),
+                body: Some(Expression::Block {
+                    statements: vec![
+                        let_stmt("a", None, false, 2),
+                        let_stmt("b", None, false, 2),
+                        let_stmt(
+                            "c",
+                            None,
+                            false,
+                            call_expr("plus", vec!["a".into(), "b".into()]),
+                        ),
+                        "c".into(),
+                    ],
+                }),
             }),
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
@@ -584,12 +614,14 @@ mod tests {
             name: "main".to_string(),
             args: vec![],
             return_type: Type::Bool,
-            body: Some(Expression::Block(vec![
-                let_stmt("a", None, false, 2),
-                let_stmt("a", None, false, 2.0),
-                let_stmt("a", None, false, true),
-                "a".into(),
-            ])),
+            body: Some(Expression::Block {
+                statements: vec![
+                    let_stmt("a", None, false, 2),
+                    let_stmt("a", None, false, 2.0),
+                    let_stmt("a", None, false, true),
+                    "a".into(),
+                ],
+            }),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
@@ -600,7 +632,9 @@ mod tests {
             name: "main".to_string(),
             args: vec![TypedBinding::new("a", Type::Int, true)], // mutable.
             return_type: Type::Unit,
-            body: Some(Expression::Block(vec![assign_stmt("a", 3)])),
+            body: Some(Expression::Block {
+                statements: vec![assign_stmt("a", 3)],
+            }),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
@@ -610,10 +644,9 @@ mod tests {
             name: "main".to_string(),
             args: vec![],
             return_type: Type::Unit,
-            body: Some(Expression::Block(vec![
-                let_stmt("a", None, true, 2),
-                assign_stmt("a", ()),
-            ])),
+            body: Some(Expression::Block {
+                statements: vec![let_stmt("a", None, true, 2), assign_stmt("a", ())],
+            }),
         })]);
         assert_eq!(
             typecheck_program(program),
@@ -626,7 +659,7 @@ mod tests {
             name: "main".to_string(),
             args: vec![],
             return_type: Type::Unit,
-            body: Some(Expression::Block(vec![
+            body: Some(block_expr(vec![
                 let_stmt("a", None, false, 2),
                 assign_stmt("a", 3),
             ])),
@@ -649,7 +682,7 @@ mod tests {
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::Int,
-                body: Some(Expression::Block(vec![
+                body: Some(block_expr(vec![
                     let_stmt("a", None, false, true),
                     let_stmt("b", None, false, 2),
                     let_stmt("c", None, false, 2.0),
@@ -675,14 +708,14 @@ mod tests {
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::Int,
-                body: Some(Expression::Block(vec![
+                body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
                         None,
                         false,
-                        Expression::Lambda(
+                        lambda_expr(
                             vec![SoftBinding::new("x", None, false)],
-                            Box::new(call_expr("plus", vec![2.into(), "x".into()])),
+                            call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
                     let_stmt("b", None, true, 2),
@@ -709,14 +742,14 @@ mod tests {
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::Fn(vec![Type::Int], Box::new(Type::Int)),
-                body: Some(Expression::Block(vec![
+                body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
                         None,
                         false,
-                        Expression::Lambda(
+                        lambda_expr(
                             vec![SoftBinding::new("x", None, false)],
-                            Box::new(call_expr("plus", vec![2.into(), "x".into()])),
+                            call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
                     "plus_two".into(),
