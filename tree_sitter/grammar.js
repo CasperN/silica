@@ -1,0 +1,208 @@
+/**
+ * @file Parser for the Silica programming language
+ * @author Casper Neo <casperneo1712@gmail.com>
+ * @license MIT
+ */
+
+/// <reference types="tree-sitter-cli/dsl" />
+// @ts-check
+
+function sepBy1(sep, rule) {
+  return seq(rule, repeat(seq(sep, rule)));
+}
+
+function sepBy(sep, rule) {
+  return optional(sepBy1(sep, rule));
+}
+
+module.exports = grammar({
+  name: 'silica',
+
+  // Extras includes whitespace and comments, handled automatically between rules
+  extras: $ => [
+    /\s+/,      // Whitespace
+    $.comment,
+  ],
+
+  // Rules definition
+  rules: {
+    // Top-level rule: a source file contains zero or more declarations
+    source_file: $ => repeat($._declaration),
+
+    _declaration: $ => choice(
+      $.function_declaration
+      // Add rules for struct, enum, trait, effect declarations later
+    ),
+
+    // --- Function Declaration ---
+    function_declaration: $ => seq(
+      'fn',
+      field('name', $.identifier),
+      field('parameters', $.parameter_list),
+      optional(seq('->', field('return_type', $._type))),
+      field('body', choice($.block_expression, ';')) // Allow external decl ending in ';'
+    ),
+
+    parameter_list: $ => seq(
+      '(',
+      optional(sepBy(',', $.parameter)),
+      ')'
+    ),
+
+    parameter: $ => seq( // Corresponds to TypedBinding
+      optional('mut'),
+      field('name', $.identifier),
+      ':',
+      field('type', $._type)
+    ),
+
+    // --- Types (for annotations) ---
+    _type: $ => choice(
+      $.primitive_type,
+      $.function_type,
+      $.named_type // For future user-defined types
+    ),
+
+    primitive_type: $ => choice(
+      'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'i128', 'u128',
+      'isize', 'usize', 'f64', 'bool', 'unit'
+    ),
+
+    function_type: $ => seq(
+      'fn',
+      '(',
+      optional(sepBy(',', $._type)),
+      ')',
+      '->',
+      $._type
+    ),
+
+    named_type: $ => $.identifier, // Simple identifier for now
+
+    // --- Statements ---
+    _statement: $ => choice(
+      $.let_statement,
+      $.assignment_statement,
+      $.return_statement,
+      $.expression_statement
+      // Add perform, handle statements later
+    ),
+
+    let_statement: $ => seq(
+      'let',
+      field('binding', $.soft_binding), // Use soft_binding here
+      '=',
+      field('value', $._expression),
+      ';'
+    ),
+
+    soft_binding: $ => seq( // Corresponds to SoftBinding
+        optional('mut'),
+        field('name', $.identifier),
+        optional(seq(':', field('type', $._type)))
+    ),
+
+    assignment_statement: $ => seq(
+      field('left', $._l_value),
+      '=',
+      field('right', $._expression),
+      ';'
+    ),
+
+    return_statement: $ => seq(
+      'return',
+      field('value', $._expression),
+      ';'
+    ),
+
+    expression_statement: $ => seq(
+      $._expression,
+      ';'
+    ),
+
+    // --- Expressions ---
+    // Tree-sitter handles left-recursion, precedence defined via `prec` helpers
+    // Define basic expression categories
+    _expression: $ => choice(
+      $.call_expression, // Higher precedence
+      $.if_expression,
+      $.lambda_expression,
+      $.block_expression,
+      $._primary_expression
+      // Add binary/unary operators with precedence later
+    ),
+
+    _primary_expression: $ => choice(
+      $.literal,
+      $.variable,
+      $.parenthesized_expression
+    ),
+
+    parenthesized_expression: $ => seq('(', $._expression, ')'),
+
+    variable: $ => $._l_value, // Expressions can be variables
+
+    _l_value: $ => choice( // Currently only identifiers
+        $.identifier
+        // Add field access, deref later
+    ),
+
+    call_expression: $ => prec.left(1, seq( // Give calls precedence
+      field('function', $._expression), // Function can be any expression
+      field('arguments', $.argument_list)
+    )),
+
+    argument_list: $ => seq(
+        '(',
+        optional(sepBy(',', $._expression)),
+        ')'
+    ),
+
+    if_expression: $ => seq(
+      'if',
+      field('condition', $._expression),
+      field('consequence', $.block_expression),
+      optional(seq('else', field('alternative', $.block_expression))) // Else is optional
+    ),
+
+    lambda_expression: $ => seq(
+        'fn',
+        field('parameters', $.lambda_parameter_list),
+        field('body', $.block_expression)
+    ),
+
+    lambda_parameter_list: $ => seq(
+        '(',
+        optional(sepBy(',', $.soft_binding)), // Lambdas use soft bindings
+        ')'
+    ),
+
+    block_expression: $ => seq(
+      '{',
+      repeat($._statement),
+      optional($._expression), // Optional trailing expression
+      '}'
+    ),
+
+    // --- Literals ---
+    literal: $ => choice(
+      $.integer_literal,
+      $.float_literal,
+      $.boolean_literal,
+      $.unit_literal
+    ),
+
+    integer_literal: $ => token(/\d+/),
+    float_literal: $ => token(/\d+\.\d*|\.\d+/), // Simplified
+    boolean_literal: $ => choice('true', 'false'),
+    unit_literal: $ => '()',
+
+    // --- Identifier ---
+    // Tree-sitter automatically handles keywords vs identifiers if keywords are defined as strings
+    identifier: $ => /[a-zA-Z_][a-zA-Z0-9_]*/,
+
+    // --- Comment ---
+    comment: $ => token(seq('//', /.*/)),
+
+  }
+});

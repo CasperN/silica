@@ -7,13 +7,13 @@ use std::collections::{HashMap, HashSet};
 struct TypeVar(u32);
 
 #[derive(Debug, Clone, PartialEq)]
-enum LValue {
+pub enum LValue {
     Variable(String),
     // Deref, Field access, etc
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Expression {
+pub enum Expression {
     L(LValue),
     LiteralInt(i64),
     LiteralBool(bool),
@@ -37,7 +37,7 @@ enum Expression {
     },
 }
 #[derive(Debug, Clone, PartialEq)]
-enum Statement {
+pub enum Statement {
     Assign(LValue, Expression),
     Let {
         binding: SoftBinding,
@@ -50,13 +50,13 @@ enum Statement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct TypedBinding {
-    name: String,
-    ty: Type,
-    mutable: bool,
+pub struct TypedBinding {
+    pub name: String,
+    pub ty: Type,
+    pub mutable: bool,
 }
 impl TypedBinding {
-    fn new(name: impl Into<String>, ty: impl Into<Type>, mutable: bool) -> Self {
+    pub fn new(name: impl Into<String>, ty: impl Into<Type>, mutable: bool) -> Self {
         Self {
             name: name.into(),
             ty: ty.into(),
@@ -66,13 +66,13 @@ impl TypedBinding {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct SoftBinding {
-    name: String,
-    ty: Option<Type>,
-    mutable: bool,
+pub struct SoftBinding {
+    pub name: String,
+    pub ty: Option<Type>,
+    pub mutable: bool,
 }
 impl SoftBinding {
-    fn new(name: impl Into<String>, ty: impl Into<Option<Type>>, mutable: bool) -> Self {
+    pub fn new(name: impl Into<String>, ty: impl Into<Option<Type>>, mutable: bool) -> Self {
         Self {
             name: name.into(),
             ty: ty.into(),
@@ -82,25 +82,27 @@ impl SoftBinding {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct FnDecl {
-    name: String,
-    args: Vec<TypedBinding>,
-    return_type: Type,
+pub struct FnDecl {
+    pub name: String,
+    pub args: Vec<TypedBinding>,
+    pub return_type: Type,
     // If no body is provided, its assumed to be external.
-    body: Option<Expression>,
+    pub body: Option<Expression>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Declaration {
+pub enum Declaration {
     Fn(FnDecl),
     // Structs, unions, effects, traits, etc
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
-struct Program(Vec<Declaration>);
+pub struct Program(pub Vec<Declaration>);
 
+// Var(TypeVar) cannot be constructed outside of this file.
+#[allow(private_interfaces)]
 #[derive(Debug, Clone, PartialEq)]
-enum Type {
+pub(crate) enum Type {
     Var(TypeVar),
     Int,
     Bool,
@@ -526,11 +528,17 @@ impl From<&str> for LValue {
         LValue::Variable(value.to_string())
     }
 }
+impl From<Expression> for Statement {
+    fn from(expr: Expression) -> Self {
+        Statement::Expression(expr)
+    }
+}
 
 #[cfg(test)]
-mod tests {
+pub mod test_helpers {
     use super::*;
-    fn let_stmt(
+
+    pub fn let_stmt(
         name: &str,
         ty: impl Into<Option<Type>>,
         mutable: bool,
@@ -545,16 +553,16 @@ mod tests {
             value: value.into(),
         }
     }
-    fn call_expr(f: impl Into<Expression>, arg_exprs: Vec<Expression>) -> Expression {
+    pub fn call_expr(f: impl Into<Expression>, arg_exprs: Vec<Expression>) -> Expression {
         Expression::Call {
             fn_expr: Box::new(f.into()),
             arg_exprs,
         }
     }
-    fn assign_stmt(left: impl Into<LValue>, right: impl Into<Expression>) -> Statement {
+    pub fn assign_stmt(left: impl Into<LValue>, right: impl Into<Expression>) -> Statement {
         Statement::Assign(left.into(), right.into())
     }
-    fn if_expr(
+    pub fn if_expr(
         cond: impl Into<Expression>,
         true_expr: impl Into<Expression>,
         false_expr: impl Into<Expression>,
@@ -565,16 +573,21 @@ mod tests {
             false_expr: Box::new(false_expr.into()),
         }
     }
-    fn block_expr(statements: Vec<Statement>) -> Expression {
+    pub fn block_expr(statements: Vec<Statement>) -> Expression {
         Expression::Block { statements }
     }
-    fn lambda_expr(bindings: Vec<SoftBinding>, body: impl Into<Expression>) -> Expression {
+    pub fn lambda_expr(bindings: Vec<SoftBinding>, body: impl Into<Expression>) -> Expression {
         Expression::Lambda {
             bindings,
             body: Box::new(body.into()),
         }
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::test_helpers::*;
+    use super::*;
     #[test]
     fn two_plus_two() {
         let program = &Program(vec![

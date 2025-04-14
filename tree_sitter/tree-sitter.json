@@ -1,0 +1,39 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "silica",
+      "camelcase": "Silica",
+      "title": "Silica",
+      "scope": "source.silica",
+      "file-types": [
+        "silica"
+      ],
+      "injection-regex": "^silica$",
+      "class-name": "TreeSitterSilica"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Parser for the Silica programming language",
+    "authors": [
+      {
+        "name": "Casper Neo",
+        "email": "casperneo1712@gmail.com"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/tree-sitter/tree-sitter-silica"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "go": true,
+    "node": true,
+    "python": true,
+    "rust": true,
+    "swift": true,
+    "zig": false
+  }
+}
