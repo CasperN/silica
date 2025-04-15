@@ -264,10 +264,10 @@ fn build_let_statement(node: &Node, source: &str) -> BuildResult<Statement> {
                 child_index: None,
             })?;
 
-    dbg!(Ok(Statement::Let {
+    Ok(Statement::Let {
         binding: build_soft_binding(&binding_node, source)?,
         value: build_expression(&value_node, source)?,
-    }))
+    })
 }
 
 // --- Expression Parsing ---
@@ -515,7 +515,7 @@ fn build_lambda_expr(node: &Node, source: &str) -> BuildResult<Expression> {
 
     Ok(Expression::Lambda {
         bindings: build_lambda_parameter_list(&params_node, source)?,
-        body: Box::new(build_block_expr(&body_node, source)?), // AST expects Expression
+        body: Box::new(build_expression(&body_node, source)?),
     })
 }
 
@@ -613,7 +613,7 @@ mod tests {
             fn plus(a: i64, b: i64) -> i64;
 
             fn main() -> i64 {
-                let plus_two = fn(x) { plus(2, x) };
+                let plus_two = |x| plus(2, x);
                 let mut b = 2;
                 b = plus_two(b);
                 b
@@ -640,7 +640,7 @@ mod tests {
                         false,
                         lambda_expr(
                             vec![SoftBinding::new("x", None, false)],
-                            block_expr(vec![call_expr("plus", vec![2.into(), "x".into()]).into()]),
+                            call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
                     let_stmt("b", None, true, 2),
@@ -649,6 +649,46 @@ mod tests {
                 ])),
             }),
         ]);
-        assert_eq!(dbg!(build_ast_program(source)), dbg!(Ok(expected_program)));
+        assert_eq!(build_ast_program(source), Ok(expected_program));
+    }
+    #[test]
+    fn return_lambda() {
+        let source = r"
+            fn plus(a: i64, b: i64) -> i64;
+
+            fn main() -> fn(i64)->i64 {
+                let plus_two = |x| plus(2, x);
+                plus_two
+            }
+        ";
+        let program = Program(vec![
+            Declaration::Fn(FnDecl {
+                name: "plus".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::Int, false),
+                    TypedBinding::new("b", Type::Int, false),
+                ],
+                return_type: Type::Int,
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::Fn(vec![Type::Int], Box::new(Type::Int)),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "plus_two",
+                        None,
+                        false,
+                        lambda_expr(
+                            vec![SoftBinding::new("x", None, false)],
+                            call_expr("plus", vec![2.into(), "x".into()]),
+                        ),
+                    ),
+                    "plus_two".into(),
+                ])),
+            }),
+        ]);
+        assert_eq!(build_ast_program(source), Ok(program));
     }
 }

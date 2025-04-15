@@ -40,7 +40,7 @@ module.exports = grammar({
       field('name', $.identifier),
       field('parameters', $.parameter_list),
       optional(seq('->', field('return_type', $._type))),
-      field('body', choice($.block_expression, ';')) // Allow external decl ending in ';'
+      field('body', choice($.block_expression, ';'))
     ),
 
     parameter_list: $ => seq(
@@ -60,7 +60,7 @@ module.exports = grammar({
     _type: $ => choice(
       $.primitive_type,
       $.function_type,
-      $.named_type // For future user-defined types
+      $.named_type
     ),
 
     primitive_type: $ => choice(
@@ -90,13 +90,14 @@ module.exports = grammar({
 
     let_statement: $ => seq(
       'let',
-      field('binding', $.soft_binding), // Use soft_binding here
+      field('binding', $.soft_binding),
       '=',
       field('value', $._expression),
       ';'
     ),
 
-    soft_binding: $ => seq( // Corresponds to SoftBinding
+    // Soft binding used in `let` and lambda parameters
+    soft_binding: $ => seq(
         optional('mut'),
         field('name', $.identifier),
         optional(seq(':', field('type', $._type)))
@@ -121,10 +122,8 @@ module.exports = grammar({
     ),
 
     // --- Expressions ---
-    // Tree-sitter handles left-recursion, precedence defined via `prec` helpers
-    // Define basic expression categories
     _expression: $ => choice(
-      $.call_expression, // Higher precedence
+      $.call_expression,
       $.if_expression,
       $.lambda_expression,
       $.block_expression,
@@ -140,15 +139,14 @@ module.exports = grammar({
 
     parenthesized_expression: $ => seq('(', $._expression, ')'),
 
-    variable: $ => $._l_value, // Expressions can be variables
+    variable: $ => $._l_value,
 
-    _l_value: $ => choice( // Currently only identifiers
+    _l_value: $ => choice(
         $.identifier
-        // Add field access, deref later
     ),
 
-    call_expression: $ => prec.left(1, seq( // Give calls precedence
-      field('function', $._expression), // Function can be any expression
+    call_expression: $ => prec.left(1, seq(
+      field('function', $._expression),
       field('arguments', $.argument_list)
     )),
 
@@ -162,25 +160,22 @@ module.exports = grammar({
       'if',
       field('condition', $._expression),
       field('consequence', $.block_expression),
-      optional(seq('else', field('alternative', $.block_expression))) // Else is optional
+      optional(seq('else', field('alternative', $.block_expression)))
     ),
 
     lambda_expression: $ => seq(
-        'fn',
-        field('parameters', $.lambda_parameter_list),
-        field('body', $.block_expression)
+      '|',
+      field('parameters', optional($.soft_bindings)),
+      '|',
+      field('body', $._expression)
     ),
 
-    lambda_parameter_list: $ => seq(
-        '(',
-        optional(sepBy(',', $.soft_binding)), // Lambdas use soft bindings
-        ')'
-    ),
+    soft_bindings: $ => sepBy1(',', $.soft_binding),
 
     block_expression: $ => seq(
       '{',
       repeat($._statement),
-      optional($._expression), // Optional trailing expression
+      optional($._expression),
       '}'
     ),
 
