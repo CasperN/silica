@@ -380,7 +380,7 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
 }
 
 fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Substitutions, Error> {
-    // TODO: init_type_var here and assume it in the rest of the fn.
+    expression.init_type_var(context);
     match expression {
         Expression::L(LValue::Variable(name), ty) => {
             let ty = ty.get_or_insert_with(|| context.new_type_var());
@@ -401,7 +401,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             ty: _,
         } => {
             let mut subs = infer(context, condition)?;
-            let cond_ty = condition.init_type_var(context).unwrap_type();
+            let cond_ty = condition.unwrap_type();
             subs.and_then(&unify(cond_ty, &Type::Bool)?);
             condition.substitute(&subs);
 
@@ -413,8 +413,6 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             subs.and_then(&f_subs);
             false_expr.substitute(&subs);
 
-            true_expr.init_type_var(context);
-            false_expr.init_type_var(context);
             let t_ty = true_expr.unwrap_type();
             let f_ty = false_expr.unwrap_type();
             subs.and_then(&unify(t_ty, f_ty)?);
@@ -431,7 +429,6 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             for arg_expr in arg_exprs {
                 let arg_subs = infer(context, arg_expr)?;
                 subs.and_then(&arg_subs);
-                arg_expr.init_type_var(context);
                 arg_expr.substitute(&subs);
                 context.substitute(&subs);
                 arg_types.push(arg_expr.unwrap_type().clone());
@@ -439,12 +436,9 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             let fn_subs = infer(context, fn_expr)?;
             subs.and_then(&fn_subs);
 
-            fn_expr.init_type_var(context).substitute(&subs);
+            fn_expr.substitute(&subs);
             context.substitute(&subs);
 
-            if return_type.is_none() {
-                *return_type = Some(context.new_type_var());
-            }
             let return_type = return_type.as_mut().unwrap();
             subs.and_then(&unify(
                 fn_expr.unwrap_type(),
@@ -473,7 +467,6 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                 shadow.insert_soft_binding(binding.clone());
             }
             let mut subs = infer(shadow.context(), body)?;
-            body.init_type_var(shadow.context());
             subs.and_then(&unify(body.unwrap_type(), &lambda_return_type)?);
 
             body.substitute(&subs);
@@ -515,14 +508,14 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                         let e_subs = infer(shadow.context(), expr)?;
                         subs.and_then(&e_subs);
                         last_statement_type =
-                            expr.init_type_var(shadow.context()).unwrap_type().clone();
+                            expr.unwrap_type().clone();
                     }
                     Statement::Let { binding, value } => {
                         let context = shadow.context();
                         let value_subs = infer(context, value)?;
                         subs.and_then(&value_subs);
-                        value.init_type_var(context).substitute(&subs);
-                        let value_type = value.init_type_var(context).unwrap_type().clone();
+                        value.substitute(&subs);
+                        let value_type = value.unwrap_type().clone();
                         if let Some(binding_ty) = &binding.ty {
                             subs.and_then(&(unify(binding_ty, &value_type))?);
                         }
@@ -536,7 +529,6 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                         let e_subs = infer(context, expr)?;
                         subs.and_then(&e_subs);
                         let expr_ty = expr
-                            .init_type_var(context)
                             .substitute(&subs)
                             .unwrap_type()
                             .clone();
@@ -556,7 +548,6 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                         last_statement_type = Type::Unit;
                     }
                     Statement::Return(expr) => {
-                        expr.init_type_var(shadow.context());
                         let e_subs = infer(shadow.context(), expr)?;
                         subs.and_then(&e_subs);
                         subs.and_then(&dbg!(unify(
@@ -568,8 +559,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                     }
                 }
             }
-            assert!(block_ty.is_none());
-            *block_ty = Some(last_statement_type);
+            subs.and_then(&unify(block_ty.as_ref().unwrap(), &last_statement_type)?);
             shadow.finish();
             Ok(subs)
         }
@@ -621,8 +611,7 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 }
                 shadow.set_return_type(return_type.clone());
                 infer(shadow.context(), body)?;
-                let body_ty = body.init_type_var(shadow.context()).unwrap_type();
-                unify(return_type, body_ty)?;
+                unify(return_type, body.unwrap_type())?;
                 shadow.finish();
             }
         }
