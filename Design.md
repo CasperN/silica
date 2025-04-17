@@ -141,9 +141,28 @@ This section summarizes key design choices where Silica prioritizes certain goal
   2.  Implement Lowering from the type-annotated AST to the SSA/MIR form (`sst.rs`).
   3.  Enhance SSA/MIR representation and implement required analysis passes (lifetimes, definite initialization, effect handling).
   4.  Develop LLVM backend code generation from MIR.
-  
 
-## 5. AI Assistant Instructions
+## 5. Alternatives Considered (Deferred or Rejected)
+
+This section documents significant features or design choices that were considered but ultimately deferred or rejected for the current iteration of Silica, along with the rationale.
+
+### 5.1 Polymorphic Closures and `let` Generalization
+
+* **Alternative Considered:** Implementing Hindley-Milner style `let` polymorphism (where `let bound_fn = |x| ...` can be automatically generalized to a polymorphic type like `forall T...`) and/or full higher-rank polymorphism allowing polymorphic closures (`f: forall T. Fn(T) -> T`) to be passed as arguments.
+
+* **Potential Benefits:**
+    * Increased local abstraction and code reuse (defining polymorphic helpers locally via `let`).
+    * Greater expressiveness, enabling certain functional programming patterns more concisely.
+
+* **Reasons for Deferral / Why Not (Currently):**
+    * **Implementation Complexity:** Implementing generalization and/or higher-rank types complicates the type inference engine (`ast.rs::infer`, `unify`) and the `Type` representation (requiring type schemes, potentially complex instantiation logic).
+    * **Performance/Monomorphization:** While local `let` polymorphism is compatible with monomorphization, implementing higher-rank polymorphism (especially for function arguments) efficiently via pure monomorphization is challenging. It often requires complex compiler optimizations or risks needing runtime mechanisms like dictionary passing or boxing, which conflicts with Silica's performance goals and explicit control philosophy.
+    * **Focus on Core Goals:** The primary initial focus for Silica is exploring the interaction of algebraic effects, linearity/lifetimes, and low-level control. The added expressiveness of these advanced polymorphism features is considered secondary for now.
+    * **Alignment with Rust/C++:** Standard Rust/C++ do not support these forms of polymorphism for local functions/closures. Sticking to explicit top-level generics keeps the core type system simpler and potentially more familiar to the target audience.
+
+* **Decision:** Defer implementation of `let` generalization and higher-rank polymorphism for closures. Polymorphism will initially be supported only via explicitly annotated generic parameters on top-level function declarations (`fn foo<T>(...)`). This decision prioritizes focusing on effects and lifetimes and keeps the initial type system complexity manageable. This may be revisited later.
+
+## 6. AI Assistant Instructions
 Context & Workflow: These instructions are in a copy of the canonical design document. It is maintained externally by the user, in a markdown file, under source control. It was previously in a Google doc. This collaborative session uses separate immersive artifacts (identified by specific IDs listed below) to focus discussion and edits on individual sections. If this session does not contain the immersive artifacts, they may be copied from this file. Prioritize the content within the *most recent versions* of these relevant section artifacts over potentially incomplete or contradictory information from earlier conversation history. Workflow: Edits should be requested for specific sections using their designated IDs. Only the requested section's artifact will be regenerated. The user will integrate changes into their canonical document. Multiple sections may need to be queried to establish context.
 
 Section IDs:
