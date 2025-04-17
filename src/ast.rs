@@ -14,7 +14,7 @@ pub enum LValue {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
-    L(LValue),
+    L(LValue, Option<Type>),
     LiteralInt(i64),
     LiteralBool(bool),
     LiteralFloat(f64),
@@ -23,19 +23,79 @@ pub enum Expression {
         condition: Box<Expression>,
         true_expr: Box<Expression>,
         false_expr: Box<Expression>,
+        ty: Option<Type>,
     },
     Call {
         fn_expr: Box<Expression>,
         arg_exprs: Vec<Expression>,
+        ty: Option<Type>,
     },
     Block {
         statements: Vec<Statement>,
+        ty: Option<Type>,
     },
     Lambda {
         bindings: Vec<SoftBinding>,
         body: Box<Expression>,
+        ty: Option<Type>,
     },
 }
+impl Expression {
+    fn init_type_var(&mut self, context: &mut TypeContext) -> &mut Self {
+        match self {
+            | Self::LiteralInt(_) 
+            | Self::LiteralBool(_) 
+            | Self::LiteralFloat(_) 
+            | Self::LiteralUnit => {},
+            Self::L(_, ty)
+            | Self::If { ty, .. }
+            | Self::Block { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::Lambda { ty, .. } => {
+                if ty.is_none() {
+                    *ty = Some(context.new_type_var())
+                }
+            }
+        }
+        self
+    }
+    // Gets the type of the expression, assigning a new variable from the
+    // context if one hasn't been created yet.
+    fn unwrap_type(&mut self) -> &Type {
+        match self {
+            Self::LiteralInt(_) => &Type::Int,
+            Self::LiteralBool(_) => &Type::Bool,
+            Self::LiteralFloat(_) => &Type::Float,
+            Self::LiteralUnit => &Type::Unit,
+            Self::L(_, ty)
+            | Self::If { ty, .. }
+            | Self::Block { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::Lambda { ty, .. } => {
+                ty.as_ref().expect("unwrap_type called before init_type_var")
+            }
+        }
+    }
+    fn substitute(&mut self, subs: &Substitutions) -> &mut Self {
+        match self {
+            Self::L(_, _)  
+            | Self::LiteralInt(_) 
+            | Self::LiteralBool(_) 
+            | Self::LiteralFloat(_) 
+            | Self::LiteralUnit => {},
+            Self::If { ty, .. }
+            | Self::Block { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::Lambda { ty, .. } => {
+                ty.as_mut().expect(
+                    "Substituting type vars in an expression before init_type_var was called."
+                ).substitute(subs);
+            }
+        }
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Assign(LValue, Expression),
@@ -296,68 +356,88 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
 
 fn infer(
     context: &mut TypeContext,
-    expression: &Expression,
-) -> Result<(Type, Substitutions), Error> {
+    expression: &mut Expression,
+) -> Result<Substitutions, Error> {
     match expression {
-        Expression::L(LValue::Variable(name)) => {
+        Expression::L(LValue::Variable(name), ty) => {
+            let ty = ty.get_or_insert_with(|| context.new_type_var());
             if let Some(info) = context.variable_info(name) {
-                Ok((info.ty.clone(), Substitutions::new()))
+                unify(ty, &info.ty)
             } else {
                 Err(Error::UnknownName(name.to_string()))
             }
         }
-        Expression::LiteralUnit => Ok((Type::Unit, Substitutions::new())),
-        Expression::LiteralInt(_) => Ok((Type::Int, Substitutions::new())),
-        Expression::LiteralBool(_) => Ok((Type::Bool, Substitutions::new())),
-        Expression::LiteralFloat(_) => Ok((Type::Float, Substitutions::new())),
+        Expression::LiteralUnit => Ok(Substitutions::new()),
+        Expression::LiteralInt(_) => Ok(Substitutions::new()),
+        Expression::LiteralBool(_) => Ok(Substitutions::new()),
+        Expression::LiteralFloat(_) => Ok(Substitutions::new()),
         Expression::If {
             condition,
             true_expr,
             false_expr,
+            ty: _,
         } => {
-            let (mut cond_ty, mut subs) = infer(context, condition)?;
-            cond_ty.substitute(&subs);
-            subs.and_then(&unify(&cond_ty, &Type::Bool)?);
+            let mut subs = infer(context, condition)?;
+            let cond_ty = condition.init_type_var(context).unwrap_type();
+            subs.and_then(&unify(cond_ty, &Type::Bool)?);
+            condition.substitute(&subs);
 
-            let (mut t_ty, t_subs) = infer(context, true_expr)?;
+            let t_subs = infer(context, true_expr)?;
             subs.and_then(&t_subs);
-            t_ty.substitute(&subs);
+            true_expr.substitute(&subs);
 
-            let (mut f_ty, f_subs) = infer(context, false_expr)?;
+            let f_subs = infer(context, false_expr)?;
             subs.and_then(&f_subs);
-            f_ty.substitute(&subs);
+            false_expr.substitute(&subs);
 
-            subs.and_then(&unify(&t_ty, &f_ty)?);
+            true_expr.init_type_var(context);
+            false_expr.init_type_var(context);
+            let t_ty = true_expr.unwrap_type();
+            let f_ty = false_expr.unwrap_type();
+            subs.and_then(&unify(t_ty, f_ty)?);
 
-            Ok((t_ty, subs))
+            Ok(subs)
         }
-        Expression::Call { fn_expr, arg_exprs } => {
+        Expression::Call {
+            fn_expr,
+            arg_exprs,
+            ty: return_type,
+        } => {
             let mut arg_types = vec![];
             let mut subs = Substitutions::new();
             for arg_expr in arg_exprs {
-                let (mut arg_type, arg_subs) = infer(context, arg_expr)?;
+                let arg_subs = infer(context, arg_expr)?;
                 subs.and_then(&arg_subs);
-                arg_type.substitute(&subs);
+                arg_expr.init_type_var(context);
+                arg_expr.substitute(&subs);
                 context.substitute(&subs);
-                arg_types.push(arg_type);
+                arg_types.push(arg_expr.unwrap_type().clone());
             }
-            let (mut fn_ty, fn_subs) = infer(context, fn_expr)?;
+            let fn_subs = infer(context, fn_expr)?;
             subs.and_then(&fn_subs);
-            fn_ty.substitute(&subs);
+
+            fn_expr.init_type_var(context).substitute(&subs);
             context.substitute(&subs);
 
-            let mut return_type = context.new_type_var();
+            if return_type.is_none() {
+                *return_type = Some(context.new_type_var());
+            }
+            let return_type = return_type.as_mut().unwrap();
             subs.and_then(&unify(
-                &fn_ty,
+                fn_expr.unwrap_type(),
                 &Type::Fn(arg_types, Box::new(return_type.clone())),
             )?);
-            fn_ty.substitute(&subs);
+            fn_expr.substitute(&subs);
             return_type.substitute(&subs);
             context.substitute(&subs);
 
-            Ok((return_type, subs))
+            Ok(subs)
         }
-        Expression::Lambda { bindings, body } => {
+        Expression::Lambda {
+            bindings,
+            body,
+            ty: fn_ty,
+        } => {
             let arg_name_set: HashSet<_> = bindings.iter().map(|b| b.name.as_str()).collect();
             if arg_name_set.len() != bindings.len() {
                 return Err(Error::DuplicateArgNames(expression.clone()));
@@ -366,8 +446,10 @@ fn infer(
             for binding in bindings.iter() {
                 shadow.insert_soft_binding(binding.clone());
             }
-            let (return_type, subs) = infer(shadow.context(), body)?;
+            let mut subs = infer(shadow.context(), body)?;
             shadow.context().substitute(&subs);
+            body.init_type_var(shadow.context()).substitute(&subs);
+            let return_type = body.unwrap_type().clone();
 
             let mut arg_types = Vec::new();
             for binding in bindings.iter() {
@@ -379,38 +461,47 @@ fn infer(
                     .clone();
                 arg_types.push(arg_type);
             }
-            let fn_ty = Type::Fn(arg_types, Box::new(return_type));
+            if fn_ty.is_none() {
+                *fn_ty = Some(shadow.context().new_type_var());
+            }
+            let fn_ty = fn_ty.as_mut().unwrap();
+            subs.and_then(
+                &unify(fn_ty, &Type::Fn(arg_types, Box::new(return_type)))?
+            );
+            fn_ty.substitute(&subs);
             shadow.finish();
-            Ok((fn_ty, subs))
+            Ok(subs)
         }
-        Expression::Block { statements } => {
+        Expression::Block { statements, ty: block_ty } => {
             let mut subs = Substitutions::new();
             let mut shadow = context.shadow();
             let mut last_statement_type = Type::Unit;
             for statement in statements {
                 match statement {
                     Statement::Expression(expr) => {
-                        let (e_ty, e_subs) = infer(shadow.context(), expr)?;
+                        let e_subs = infer(shadow.context(), expr)?;
                         subs.and_then(&e_subs);
-                        last_statement_type = e_ty;
+                        last_statement_type = expr.init_type_var(shadow.context()).unwrap_type().clone();
                     }
                     Statement::Let { binding, value } => {
                         let context = shadow.context();
-                        let (mut value_type, value_subs) = infer(context, value)?;
+                        let value_subs = infer(context, value)?;
                         subs.and_then(&value_subs);
-                        value_type.substitute(&subs);
+                        value.init_type_var(context).substitute(&subs);
+                        let value_type = value.init_type_var(context).unwrap_type().clone();
                         if let Some(binding_ty) = &binding.ty {
                             subs.and_then(&(unify(binding_ty, &value_type))?);
                         }
                         context.substitute(&subs);
-                        shadow.insert(binding.name.clone(), value_type, binding.mutable);
+                        value.substitute(&subs);
+                        shadow.insert(binding.name.clone(), value_type.clone(), binding.mutable);
                         last_statement_type = Type::Unit;
                     }
                     Statement::Assign(LValue::Variable(name), expr) => {
                         let context = shadow.context();
-                        let (mut expr_ty, e_subs) = infer(context, expr)?;
+                        let e_subs = infer(context, expr)?;
                         subs.and_then(&e_subs);
-                        expr_ty.substitute(&subs);
+                        let expr_ty = expr.init_type_var(context).substitute(&subs).unwrap_type().clone();
 
                         // Check whether the expession can be assigned to the variable.
                         let variable_info = context.variable_info(name);
@@ -423,18 +514,21 @@ fn infer(
                         }
                         subs.and_then(&unify(&expr_ty, &variable_info.ty)?);
                         context.substitute(&subs);
+                        expr.substitute(&subs);
                         last_statement_type = Type::Unit;
                     }
                     Statement::Return(_expr) => todo!(),
                 }
             }
+            assert!(block_ty.is_none());
+            *block_ty = Some(last_statement_type);
             shadow.finish();
-            Ok((last_statement_type, subs))
+            Ok(subs)
         }
     }
 }
 
-fn typecheck_program(program: &Program) -> Result<(), Error> {
+fn typecheck_program(program: &mut Program) -> Result<(), Error> {
     // First, load declarations into typing context.
     let mut context = TypeContext::new();
     let mut shadow = context.shadow();
@@ -459,7 +553,7 @@ fn typecheck_program(program: &Program) -> Result<(), Error> {
         }
     }
     // Second, typecheck function bodies.
-    for declaration in program.0.iter() {
+    for declaration in program.0.iter_mut() {
         match declaration {
             Declaration::Fn(FnDecl {
                 name: _,
@@ -470,16 +564,16 @@ fn typecheck_program(program: &Program) -> Result<(), Error> {
                 if body.is_none() {
                     continue; // External fn, take it for granted.
                 }
-                let body = body.as_ref().unwrap();
+                let body = body.as_mut().unwrap();
 
                 // Declare a new shadow to insert fn variables.
                 let mut shadow = shadow.context().shadow();
                 for binding in args.iter() {
                     shadow.insert_binding(binding.clone()); // TODO: variables need to declare mutaiblity.
                 }
-                let (mut ty, subs) = infer(shadow.context(), body)?;
-                ty.substitute(&subs);
-                unify(&ty, return_type)?;
+                infer(shadow.context(), body)?;
+                let body_ty = body.init_type_var(shadow.context()).unwrap_type();
+                unify(return_type, body_ty)?;
                 shadow.finish();
             }
         }
@@ -510,7 +604,7 @@ impl From<()> for Expression {
 }
 impl From<&str> for Statement {
     fn from(value: &str) -> Self {
-        Statement::Expression(Expression::L(LValue::Variable(value.to_string())))
+        Statement::Expression(Expression::L(LValue::Variable(value.to_string()), None))
     }
 }
 impl From<i64> for Statement {
@@ -520,7 +614,7 @@ impl From<i64> for Statement {
 }
 impl From<&str> for Expression {
     fn from(value: &str) -> Self {
-        Expression::L(LValue::Variable(value.to_string()))
+        Expression::L(LValue::Variable(value.to_string()), None)
     }
 }
 impl From<&str> for LValue {
@@ -557,6 +651,7 @@ pub mod test_helpers {
         Expression::Call {
             fn_expr: Box::new(f.into()),
             arg_exprs,
+            ty: None,
         }
     }
     pub fn assign_stmt(left: impl Into<LValue>, right: impl Into<Expression>) -> Statement {
@@ -571,15 +666,20 @@ pub mod test_helpers {
             condition: Box::new(cond.into()),
             true_expr: Box::new(true_expr.into()),
             false_expr: Box::new(false_expr.into()),
+            ty: None,
         }
     }
     pub fn block_expr(statements: Vec<Statement>) -> Expression {
-        Expression::Block { statements }
+        Expression::Block {
+            statements,
+            ty: None,
+        }
     }
     pub fn lambda_expr(bindings: Vec<SoftBinding>, body: impl Into<Expression>) -> Expression {
         Expression::Lambda {
             bindings,
             body: Box::new(body.into()),
+            ty: None,
         }
     }
 }
@@ -590,7 +690,7 @@ mod tests {
     use super::*;
     #[test]
     fn two_plus_two() {
-        let program = &Program(vec![
+        let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
                 name: "plus".to_string(),
                 args: vec![
@@ -604,62 +704,57 @@ mod tests {
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::Int,
-                body: Some(Expression::Block {
-                    statements: vec![
-                        let_stmt("a", None, false, 2),
-                        let_stmt("b", None, false, 2),
-                        let_stmt(
-                            "c",
-                            None,
-                            false,
-                            call_expr("plus", vec!["a".into(), "b".into()]),
-                        ),
-                        "c".into(),
-                    ],
-                }),
+                body: Some(block_expr(vec![
+                    let_stmt("a", None, false, 2),
+                    let_stmt("b", None, false, 2),
+                    let_stmt(
+                        "c",
+                        None,
+                        false,
+                        call_expr("plus", vec!["a".into(), "b".into()]),
+                    ),
+                    "c".into(),
+                ])),
             }),
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn shadow_earlier_variables() {
-        let program = &Program(vec![Declaration::Fn(FnDecl {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
             name: "main".to_string(),
             args: vec![],
             return_type: Type::Bool,
-            body: Some(Expression::Block {
-                statements: vec![
-                    let_stmt("a", None, false, 2),
-                    let_stmt("a", None, false, 2.0),
-                    let_stmt("a", None, false, true),
-                    "a".into(),
-                ],
-            }),
+            body: Some(block_expr(vec![
+                let_stmt("a", None, false, 2),
+                let_stmt("a", None, false, 2.0),
+                let_stmt("a", None, false, true),
+                "a".into(),
+            ])),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
 
     #[test]
     fn assign_to_mutable_binding() {
-        let program = &Program(vec![Declaration::Fn(FnDecl {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
             name: "main".to_string(),
             args: vec![TypedBinding::new("a", Type::Int, true)], // mutable.
             return_type: Type::Unit,
-            body: Some(Expression::Block {
-                statements: vec![assign_stmt("a", 3)],
-            }),
+            body: Some(block_expr(vec![assign_stmt("a", 3)])),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn error_assign_wrong_type_to_mutable_binding() {
-        let program = &Program(vec![Declaration::Fn(FnDecl {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
             name: "main".to_string(),
             args: vec![],
             return_type: Type::Unit,
-            body: Some(Expression::Block {
-                statements: vec![let_stmt("a", None, true, 2), assign_stmt("a", ())],
-            }),
+            body: Some(block_expr(vec![
+                let_stmt("a", None, true, 2),
+                assign_stmt("a", ()),
+            ])),
         })]);
         assert_eq!(
             typecheck_program(program),
@@ -668,7 +763,7 @@ mod tests {
     }
     #[test]
     fn error_assign_to_immutable_binding() {
-        let program = &Program(vec![Declaration::Fn(FnDecl {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
             name: "main".to_string(),
             args: vec![],
             return_type: Type::Unit,
@@ -684,7 +779,7 @@ mod tests {
     }
     #[test]
     fn if_expression_unifies() {
-        let program = &Program(vec![
+        let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
                 name: "round".to_string(),
                 args: vec![TypedBinding::new("a", Type::Float, false)],
@@ -707,7 +802,7 @@ mod tests {
     }
     #[test]
     fn use_lambda() {
-        let program = &Program(vec![
+        let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
                 name: "plus".to_string(),
                 args: vec![
@@ -741,7 +836,7 @@ mod tests {
     }
     #[test]
     fn return_lambda() {
-        let program = &Program(vec![
+        let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
                 name: "plus".to_string(),
                 args: vec![
