@@ -43,10 +43,10 @@ pub enum Expression {
 impl Expression {
     fn init_type_var(&mut self, context: &mut TypeContext) -> &mut Self {
         match self {
-            | Self::LiteralInt(_) 
-            | Self::LiteralBool(_) 
-            | Self::LiteralFloat(_) 
-            | Self::LiteralUnit => {},
+            Self::LiteralInt(_)
+            | Self::LiteralBool(_)
+            | Self::LiteralFloat(_)
+            | Self::LiteralUnit => {}
             Self::L(_, ty)
             | Self::If { ty, .. }
             | Self::Block { ty, .. }
@@ -71,25 +71,27 @@ impl Expression {
             | Self::If { ty, .. }
             | Self::Block { ty, .. }
             | Self::Call { ty, .. }
-            | Self::Lambda { ty, .. } => {
-                ty.as_ref().expect("unwrap_type called before init_type_var")
-            }
+            | Self::Lambda { ty, .. } => ty
+                .as_ref()
+                .expect("unwrap_type called before init_type_var"),
         }
     }
     fn substitute(&mut self, subs: &Substitutions) -> &mut Self {
         match self {
-            Self::L(_, _)  
-            | Self::LiteralInt(_) 
-            | Self::LiteralBool(_) 
-            | Self::LiteralFloat(_) 
-            | Self::LiteralUnit => {},
+            Self::L(_, _)
+            | Self::LiteralInt(_)
+            | Self::LiteralBool(_)
+            | Self::LiteralFloat(_)
+            | Self::LiteralUnit => {}
             Self::If { ty, .. }
             | Self::Block { ty, .. }
             | Self::Call { ty, .. }
             | Self::Lambda { ty, .. } => {
-                ty.as_mut().expect(
-                    "Substituting type vars in an expression before init_type_var was called."
-                ).substitute(subs);
+                ty.as_mut()
+                    .expect(
+                        "Substituting type vars in an expression before init_type_var was called.",
+                    )
+                    .substitute(subs);
             }
         }
         self
@@ -170,6 +172,11 @@ pub(crate) enum Type {
     Unit,
     Fn(Vec<Type>, Box<Type>),
 }
+impl Default for Type {
+    fn default() -> Self {
+        Type::Unit
+    }
+}
 impl Type {
     fn contains_type_var(&self, type_var: TypeVar) -> bool {
         match self {
@@ -205,10 +212,12 @@ struct VariableInfo {
     mutable: bool,
 }
 
+// TODO: Move TypeContext, ShadowTypeContext, and friends into a sub-module to protect field access.
 #[derive(Debug, Default, PartialEq)]
 struct TypeContext {
     variables: HashMap<String, VariableInfo>,
     next_type_var: u32,
+    return_type: Type,
 }
 impl TypeContext {
     fn new() -> Self {
@@ -230,8 +239,9 @@ impl TypeContext {
     fn shadow(&mut self) -> ShadowTypeContext {
         ShadowTypeContext {
             type_context: self,
-            shadowed: HashMap::new(),
+            shadowed_variables: HashMap::new(),
             finished: false,
+            shadowed_return_type: None,
         }
     }
     // Returns a new unknown type.
@@ -245,17 +255,18 @@ impl TypeContext {
 #[derive(Debug)]
 struct ShadowTypeContext<'a> {
     type_context: &'a mut TypeContext,
-    shadowed: HashMap<String, Option<VariableInfo>>,
+    shadowed_variables: HashMap<String, Option<VariableInfo>>,
+    shadowed_return_type: Option<Type>,
     finished: bool,
 }
 impl<'a> ShadowTypeContext<'a> {
     fn insert(&mut self, name: String, ty: Type, mutable: bool) {
         let info = VariableInfo { ty, mutable };
-        if let Entry::Vacant(entry) = self.shadowed.entry(name.clone()) {
+        if let Entry::Vacant(entry) = self.shadowed_variables.entry(name.clone()) {
             let original = self.type_context.variables.insert(name, info);
             entry.insert(original);
         } else {
-            // The original was already saved in `shadowed`,
+            // The original was already saved in `shadowed_variables`,
             // no need to touch that.
             self.type_context.variables.insert(name, info);
         }
@@ -269,6 +280,17 @@ impl<'a> ShadowTypeContext<'a> {
         let ty = ty.unwrap_or_else(|| self.context().new_type_var());
         self.insert(name, ty, mutable);
     }
+    fn set_return_type(&mut self, ty: Type) {
+        if self.shadowed_return_type.is_some() {
+            panic!("Return type shadowed multiple times.");
+        }
+        self.shadowed_return_type = Some(ty);
+        core::mem::swap(
+            self.shadowed_return_type.as_mut().unwrap(),
+            &mut self.type_context.return_type,
+        );
+    }
+
     fn context_contains(&mut self, name: &str) -> bool {
         self.type_context.variables.contains_key(name)
     }
@@ -280,7 +302,7 @@ impl<'a> ShadowTypeContext<'a> {
 }
 impl<'a> Drop for ShadowTypeContext<'a> {
     fn drop(&mut self) {
-        for (var_name, original_type) in self.shadowed.drain() {
+        for (var_name, original_type) in self.shadowed_variables.drain() {
             match original_type {
                 Some(ty) => {
                     self.type_context.variables.insert(var_name, ty);
@@ -289,6 +311,9 @@ impl<'a> Drop for ShadowTypeContext<'a> {
                     self.type_context.variables.remove(&var_name);
                 }
             }
+        }
+        if let Some(ty) = self.shadowed_return_type.take() {
+            self.type_context.return_type = ty;
         }
     }
 }
@@ -354,10 +379,8 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
     }
 }
 
-fn infer(
-    context: &mut TypeContext,
-    expression: &mut Expression,
-) -> Result<Substitutions, Error> {
+fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Substitutions, Error> {
+    // TODO: init_type_var here and assume it in the rest of the fn.
     match expression {
         Expression::L(LValue::Variable(name), ty) => {
             let ty = ty.get_or_insert_with(|| context.new_type_var());
@@ -436,20 +459,26 @@ fn infer(
         Expression::Lambda {
             bindings,
             body,
-            ty: fn_ty,
+            ty: lambda_type,
         } => {
             let arg_name_set: HashSet<_> = bindings.iter().map(|b| b.name.as_str()).collect();
             if arg_name_set.len() != bindings.len() {
                 return Err(Error::DuplicateArgNames(expression.clone()));
             }
+            let mut lambda_return_type = context.new_type_var();
             let mut shadow = context.shadow();
+            shadow.set_return_type(lambda_return_type.clone());
+
             for binding in bindings.iter() {
                 shadow.insert_soft_binding(binding.clone());
             }
             let mut subs = infer(shadow.context(), body)?;
+            body.init_type_var(shadow.context());
+            subs.and_then(&unify(body.unwrap_type(), &lambda_return_type)?);
+
+            body.substitute(&subs);
             shadow.context().substitute(&subs);
-            body.init_type_var(shadow.context()).substitute(&subs);
-            let return_type = body.unwrap_type().clone();
+            lambda_return_type.substitute(&subs);
 
             let mut arg_types = Vec::new();
             for binding in bindings.iter() {
@@ -461,18 +490,22 @@ fn infer(
                     .clone();
                 arg_types.push(arg_type);
             }
-            if fn_ty.is_none() {
-                *fn_ty = Some(shadow.context().new_type_var());
+            if lambda_type.is_none() {
+                *lambda_type = Some(shadow.context().new_type_var());
             }
-            let fn_ty = fn_ty.as_mut().unwrap();
-            subs.and_then(
-                &unify(fn_ty, &Type::Fn(arg_types, Box::new(return_type)))?
-            );
-            fn_ty.substitute(&subs);
+            let lambda_type = lambda_type.as_mut().unwrap();
+            subs.and_then(&unify(
+                lambda_type,
+                &Type::Fn(arg_types, Box::new(lambda_return_type)),
+            )?);
+            lambda_type.substitute(&subs);
             shadow.finish();
             Ok(subs)
         }
-        Expression::Block { statements, ty: block_ty } => {
+        Expression::Block {
+            statements,
+            ty: block_ty,
+        } => {
             let mut subs = Substitutions::new();
             let mut shadow = context.shadow();
             let mut last_statement_type = Type::Unit;
@@ -481,7 +514,8 @@ fn infer(
                     Statement::Expression(expr) => {
                         let e_subs = infer(shadow.context(), expr)?;
                         subs.and_then(&e_subs);
-                        last_statement_type = expr.init_type_var(shadow.context()).unwrap_type().clone();
+                        last_statement_type =
+                            expr.init_type_var(shadow.context()).unwrap_type().clone();
                     }
                     Statement::Let { binding, value } => {
                         let context = shadow.context();
@@ -501,7 +535,11 @@ fn infer(
                         let context = shadow.context();
                         let e_subs = infer(context, expr)?;
                         subs.and_then(&e_subs);
-                        let expr_ty = expr.init_type_var(context).substitute(&subs).unwrap_type().clone();
+                        let expr_ty = expr
+                            .init_type_var(context)
+                            .substitute(&subs)
+                            .unwrap_type()
+                            .clone();
 
                         // Check whether the expession can be assigned to the variable.
                         let variable_info = context.variable_info(name);
@@ -517,7 +555,17 @@ fn infer(
                         expr.substitute(&subs);
                         last_statement_type = Type::Unit;
                     }
-                    Statement::Return(_expr) => todo!(),
+                    Statement::Return(expr) => {
+                        expr.init_type_var(shadow.context());
+                        let e_subs = infer(shadow.context(), expr)?;
+                        subs.and_then(&e_subs);
+                        subs.and_then(&dbg!(unify(
+                            expr.unwrap_type(),
+                            &shadow.context().return_type
+                        ))?);
+                        last_statement_type = expr.unwrap_type().clone();
+                        // TODO: Probably should issue a warning for unreachable statements.
+                    }
                 }
             }
             assert!(block_ty.is_none());
@@ -571,6 +619,7 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 for binding in args.iter() {
                     shadow.insert_binding(binding.clone()); // TODO: variables need to declare mutaiblity.
                 }
+                shadow.set_return_type(return_type.clone());
                 infer(shadow.context(), body)?;
                 let body_ty = body.init_type_var(shadow.context()).unwrap_type();
                 unify(return_type, body_ty)?;
@@ -647,6 +696,10 @@ pub mod test_helpers {
             value: value.into(),
         }
     }
+    pub fn return_stmt(expr: impl Into<Expression>) -> Statement {
+        Statement::Return(expr.into())
+    }
+
     pub fn call_expr(f: impl Into<Expression>, arg_exprs: Vec<Expression>) -> Expression {
         Expression::Call {
             fn_expr: Box::new(f.into()),
@@ -865,5 +918,66 @@ mod tests {
             }),
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn return_in_lambda() {
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                name: "plus".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::Int, false),
+                    TypedBinding::new("b", Type::Int, false),
+                ],
+                return_type: Type::Int,
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::Fn(vec![Type::Int], Box::new(Type::Int)),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "plus_two",
+                        None,
+                        false,
+                        lambda_expr(
+                            vec![SoftBinding::new("x", None, false)],
+                            block_expr(vec![return_stmt(call_expr(
+                                "plus",
+                                vec![2.into(), "x".into()],
+                            ))]),
+                        ),
+                    ),
+                    return_stmt("plus_two"),
+                ])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn return_in_one_branch() {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            args: vec![],
+            return_type: Type::Int,
+            body: Some(block_expr(vec![
+                // Explicit return in true branch, implicit return in false.
+                if_expr(true, block_expr(vec![return_stmt(2)]), 3).into(),
+            ])),
+        })]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn error_return_wrong_type_in_one_branch() {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            args: vec![],
+            return_type: Type::Int,
+            body: Some(block_expr(vec![
+                // Explicit return in true branch, implicit return in false.
+                if_expr(true, block_expr(vec![return_stmt(2.5)]), 3).into(),
+            ])),
+        })]);
+        assert!(matches!(typecheck_program(program), Err(Error::NotUnifiable(_, _))));
     }
 }
