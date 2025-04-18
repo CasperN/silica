@@ -2,6 +2,7 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeVar(u32);
@@ -14,7 +15,18 @@ impl std::fmt::Debug for TypeVar {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LValue {
     Variable(String),
-    // Deref, Field access, etc
+    Field(Box<Expression>, String), // Deref, Field access, etc
+}
+
+impl LValue {
+    fn substitute(&mut self, subs: &Substitutions) {
+        match self {
+            Self::Variable(_) => {}
+            Self::Field(expr, _field_name) => {
+                expr.substitute(subs);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +36,11 @@ pub enum Expression {
     LiteralBool(bool),
     LiteralFloat(f64),
     LiteralUnit,
+    LiteralStruct {
+        name: String,
+        fields: HashMap<String, Expression>,
+        ty: Option<Type>,
+    },
     If {
         condition: Box<Expression>,
         true_expr: Box<Expression>,
@@ -46,7 +63,7 @@ pub enum Expression {
     },
 }
 impl Expression {
-    fn ensure_type_initialized(&mut self, context: &mut TypeContext) -> &mut Self {
+    fn ensure_type_initialized(&mut self, context: &mut TypeContext) {
         match self {
             Self::LiteralInt(_)
             | Self::LiteralBool(_)
@@ -65,8 +82,15 @@ impl Expression {
                     *ty = Some(context.new_type_var())
                 }
             }
+            Self::LiteralStruct { name: _, fields, ty } => {
+                for field_expr in fields.values_mut() {
+                    field_expr.ensure_type_initialized(context);
+                }
+                if ty.is_none() {
+                    *ty = Some(context.new_type_var());
+                }
+            }
         }
-        self
     }
     // Gets the type of the expression, assigning a new variable from the
     // context if one hasn't been created yet.
@@ -84,7 +108,9 @@ impl Expression {
             }
             | Self::Lambda {
                 lambda_type: ty, ..
-            } => ty
+            } 
+            | Self::LiteralStruct { name: _, fields: _, ty }
+            => ty
                 .as_ref()
                 .expect("unwrap_type called before ensure_type_initialized"),
         }
@@ -101,7 +127,10 @@ impl Expression {
             | Self::LiteralBool(_)
             | Self::LiteralFloat(_)
             | Self::LiteralUnit => {}
-            Self::L(LValue::Variable(_), ty) => unwrap_and_substitute(ty),
+            Self::L(lvalue, ty) => {
+                lvalue.substitute(subs);
+                unwrap_and_substitute(ty);
+            }
             Self::If {
                 condition,
                 true_expr,
@@ -135,8 +164,7 @@ impl Expression {
             Self::Block { statements, ty } => {
                 for statement in statements {
                     match statement {
-                        Statement::Assign(LValue::Variable(_), expr)
-                        | Statement::Expression(expr)
+                        Statement::Expression(expr)
                         | Statement::Return(expr)
                         | Statement::Let {
                             binding: _,
@@ -144,9 +172,25 @@ impl Expression {
                         } => {
                             expr.substitute(subs);
                         }
+                        Statement::Assign(lvalue, expr) => {
+                            lvalue.substitute(subs);
+                            expr.substitute(subs);
+                        }
                     }
                 }
                 unwrap_and_substitute(ty)
+            }
+            Self::LiteralStruct {
+                name: _,
+                fields,
+                ty,
+            } => {
+                for field_expr in fields.values_mut() {
+                    field_expr.substitute(subs);
+                }
+                ty.as_mut()
+                    .expect("Substituting before type vars initialized.")
+                    .substitute(subs);
             }
         }
         self
@@ -218,13 +262,76 @@ impl FnDecl {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct StructDecl {
+    name: String,
+    type_var_count: usize,
+    fields: HashMap<String, Type>,
+}
+impl StructDecl {
+    fn new(name: &str, fields: &[(&str, Type)]) -> Self {
+        let mut fields: HashMap<String, Type> = fields
+            .iter()
+            .map(|(name, ty)| (name.to_string(), ty.clone()))
+            .collect();
+
+        // Replace any type variables with the lowest natural numbers.
+        let mut type_vars = HashSet::new();
+        for field_type in fields.values() {
+            field_type.insert_free_type_vars(&mut type_vars);
+        }
+        let mut subs = Substitutions::new();
+        for (i, tv) in type_vars.iter().enumerate() {
+            let canonical_tv = Type::Var(TypeVar(i as u32));
+            subs.insert(*tv, canonical_tv);
+        }
+        for field_type in fields.values_mut() {
+            field_type.substitute(&subs);
+        }
+        StructDecl {
+            name: name.to_string(),
+            type_var_count: type_vars.len(),
+            fields,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Declaration {
     Fn(FnDecl),
+    Struct(StructDecl),
     // Structs, unions, effects, traits, etc
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct Program(pub Vec<Declaration>);
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructInstance {
+    params: Vec<Type>,
+    decl: Rc<StructDecl>,
+}
+impl StructInstance {
+    fn field_type(&self, field: &str) -> Result<Type, Error> {
+        if let Some(field_type) = self.decl.fields.get(field) {
+            let mut field_type = field_type.clone();
+            if !self.params.is_empty() {
+                let mut subs = Substitutions::new();
+                for (i, param) in self.params.iter().enumerate() {
+                    subs.insert(TypeVar(i as u32), param.clone());
+                }
+                field_type.substitute(&subs);
+            }
+            Ok(field_type)
+        } else {
+            Err(Error::UnrecognizedField(field.to_string()))
+        }
+    }
+    fn substitute(&mut self, subs: &Substitutions) {
+        for param in self.params.iter_mut() {
+            param.substitute(subs);
+        }
+    }
+}
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub(crate) enum Type {
@@ -236,6 +343,7 @@ pub(crate) enum Type {
     Unit,
     Fn(Vec<Type>, Box<Type>),
     Forall(Vec<TypeVar>, Box<Type>),
+    StructInstance(StructInstance),
 }
 impl Type {
     fn contains_type_var(&self, type_var: TypeVar) -> bool {
@@ -247,6 +355,9 @@ impl Type {
                     || ret_ty.contains_type_var(type_var)
             }
             Self::Forall(_, ty) => ty.contains_type_var(type_var),
+            Self::StructInstance(StructInstance { params, decl: _ }) => {
+                params.iter().any(|p| p.contains_type_var(type_var))
+            }
         }
     }
     fn substitute(&mut self, subs: &Substitutions) {
@@ -267,6 +378,9 @@ impl Type {
                 forall_vars.retain(|forall_var| !subs.0.contains_key(forall_var));
                 ty.substitute(subs);
             }
+            Self::StructInstance(struct_instance) => {
+                struct_instance.substitute(subs);
+            }
         }
     }
     // Instantiates Forall types with new type variables.
@@ -285,6 +399,37 @@ impl Type {
     fn is_polymorphic(&self) -> bool {
         matches!(self, Self::Forall(_, _))
     }
+    fn insert_free_type_vars(&self, output: &mut HashSet<TypeVar>) {
+        match self {
+            Self::Int | Self::Bool | Self::Float | Self::Unit => {}
+            Self::Var(tv) => {
+                output.insert(*tv);
+            }
+            Self::Fn(arg_types, ret_ty) => {
+                for arg_type in arg_types.iter() {
+                    arg_type.insert_free_type_vars(output);
+                }
+                ret_ty.insert_free_type_vars(output);
+            }
+            // Free type variables are only asked for by struct generalization.
+            // but we don't expect generic members.
+            Self::Forall(_, _) => panic!(
+                "Free type variables are only asked for by struct generalization... \
+                but we don't expect generic members."
+            ),
+            Self::StructInstance(StructInstance { params, decl: _ }) => {
+                for param in params {
+                    param.insert_free_type_vars(output)
+                }
+            }
+        }
+    }
+}
+
+#[derive(PartialEq, Debug)]
+enum NamedItem {
+    Variable(VariableInfo),
+    Struct(Rc<StructDecl>),
 }
 
 #[derive(PartialEq, Debug)]
@@ -296,7 +441,7 @@ struct VariableInfo {
 // TODO: Move TypeContext, ShadowTypeContext, and friends into a sub-module to protect field access.
 #[derive(Debug, Default, PartialEq)]
 struct TypeContext {
-    variables: HashMap<String, VariableInfo>,
+    names: HashMap<String, NamedItem>,
     next_type_var: u32,
     return_type: Type,
 }
@@ -305,11 +450,30 @@ impl TypeContext {
         Self::default()
     }
     fn variable_info(&self, variable: &str) -> Option<&VariableInfo> {
-        self.variables.get(variable)
+        if let Some(NamedItem::Variable(info)) = self.names.get(variable) {
+            Some(info)
+        } else {
+            None
+        }
     }
+    fn instantiate_struct(&mut self, name: &str) -> Result<StructInstance, Error> {
+        let decl = if let Some(NamedItem::Struct(decl)) = self.names.get(name) {
+            decl.clone()
+        } else {
+            return Err(Error::NoSuchStruct(name.to_string()));
+        };
+        let mut params = Vec::new();
+        for _ in 0..decl.type_var_count {
+            params.push(self.new_type_var());
+        }
+        Ok(StructInstance { params, decl })
+    }
+
     fn substitute(&mut self, subs: &Substitutions) {
-        for var in self.variables.values_mut() {
-            var.ty.substitute(subs);
+        for name in self.names.values_mut() {
+            if let NamedItem::Variable(var) = name {
+                var.ty.substitute(subs);
+            }
         }
     }
     // Variables should be inserted via the returned shadow, which
@@ -336,30 +500,45 @@ impl TypeContext {
 #[derive(Debug)]
 struct ShadowTypeContext<'a> {
     type_context: &'a mut TypeContext,
-    shadowed_variables: HashMap<String, Option<VariableInfo>>,
+    shadowed_variables: HashMap<String, Option<NamedItem>>,
     shadowed_return_type: Option<Type>,
     finished: bool,
 }
 impl<'a> ShadowTypeContext<'a> {
-    fn insert(&mut self, name: String, ty: Type, mutable: bool) {
-        let info = VariableInfo { ty, mutable };
+    fn insert_variable(&mut self, name: String, ty: Type, mutable: bool) {
+        let info = NamedItem::Variable(VariableInfo { ty, mutable });
         if let Entry::Vacant(entry) = self.shadowed_variables.entry(name.clone()) {
-            let original = self.type_context.variables.insert(name, info);
+            let original = self.type_context.names.insert(name, info);
             entry.insert(original);
         } else {
             // The original was already saved in `shadowed_variables`,
             // no need to touch that.
-            self.type_context.variables.insert(name, info);
+            self.type_context.names.insert(name, info);
         }
     }
     fn insert_binding(&mut self, binding: TypedBinding) {
         let TypedBinding { name, ty, mutable } = binding;
-        self.insert(name, ty, mutable);
+        self.insert_variable(name, ty, mutable);
     }
     fn insert_soft_binding(&mut self, binding: SoftBinding) {
         let SoftBinding { name, ty, mutable } = binding;
         let ty = ty.unwrap_or_else(|| self.context().new_type_var());
-        self.insert(name, ty, mutable);
+        self.insert_variable(name, ty, mutable);
+    }
+    // Defines a struct. Returns if there was a previous definition.
+    fn define_struct(&mut self, decl: StructDecl) -> bool {
+        let name = decl.name.clone();
+        let decl = NamedItem::Struct(Rc::new(decl));
+        if let Entry::Vacant(entry) = self.shadowed_variables.entry(name.clone()) {
+            let original = self.type_context.names.insert(name, decl);
+            entry.insert(original);
+            false
+        } else {
+            // The original was already saved in `shadowed_variables`,
+            // no need to touch that.
+            self.type_context.names.insert(name, decl);
+            true
+        }
     }
     fn set_return_type(&mut self, ty: Type) {
         if self.shadowed_return_type.is_some() {
@@ -373,7 +552,7 @@ impl<'a> ShadowTypeContext<'a> {
     }
 
     fn context_contains(&mut self, name: &str) -> bool {
-        self.type_context.variables.contains_key(name)
+        self.type_context.names.contains_key(name)
     }
 
     fn context(&mut self) -> &mut TypeContext {
@@ -386,10 +565,10 @@ impl<'a> Drop for ShadowTypeContext<'a> {
         for (var_name, original_type) in self.shadowed_variables.drain() {
             match original_type {
                 Some(ty) => {
-                    self.type_context.variables.insert(var_name, ty);
+                    self.type_context.names.insert(var_name, ty);
                 }
                 None => {
-                    self.type_context.variables.remove(&var_name);
+                    self.type_context.names.remove(&var_name);
                 }
             }
         }
@@ -423,12 +602,15 @@ impl Substitutions {
 #[derive(PartialEq, Debug)]
 enum Error {
     UnknownName(String),
+    NoSuchStruct(String),
     NotUnifiable(Type, Type),
     InfiniteType(TypeVar, Type),
     DuplicateArgNames(Expression),
     DuplicateTopLevelName(String),
     AssignToImmutableBinding(String),
     TopLevelFnArgsMustBeTyped(String),
+    UnrecognizedField(String),
+    FieldAccessToNonStruct(Expression, String),
 }
 
 fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
@@ -462,6 +644,27 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
             }
             Ok(subs)
         }
+        (
+            Type::StructInstance(StructInstance {
+                params: left_params,
+                decl: left_decl,
+            }),
+            Type::StructInstance(StructInstance {
+                params: right_params,
+                decl: right_decl,
+            }),
+        ) if left_decl == right_decl => {
+            let mut subs = Substitutions::new();
+            assert_eq!(left_params.len(), right_params.len());
+            for (l, r) in left_params.iter().zip(right_params.iter()) {
+                let mut l = l.clone();
+                let mut r = r.clone();
+                l.substitute(&subs);
+                r.substitute(&subs);
+                subs.and_then(&unify(&l, &r)?);
+            }
+            Ok(subs)
+        }
         _ => Err(Error::NotUnifiable(left.clone(), right.clone())),
     }
 }
@@ -483,10 +686,45 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                 Err(Error::UnknownName(name.to_string()))
             }
         }
+        Expression::L(LValue::Field(expr, field), ty) => {
+            let mut subs = infer(context, expr)?;
+            expr.substitute(&subs);
+            let ty = ty.as_mut().unwrap();
+            if let Type::StructInstance(struct_instance) = expr.unwrap_type() {
+                let field_type = struct_instance.field_type(field)?;
+                subs.and_then(&unify(&field_type, &ty)?);
+                ty.substitute(&subs);
+            } else {
+                return Err(Error::FieldAccessToNonStruct(*expr.clone(), field.clone()));
+            }
+            Ok(subs)
+        }
         Expression::LiteralUnit => Ok(Substitutions::new()),
         Expression::LiteralInt(_) => Ok(Substitutions::new()),
         Expression::LiteralBool(_) => Ok(Substitutions::new()),
         Expression::LiteralFloat(_) => Ok(Substitutions::new()),
+        Expression::LiteralStruct {
+            name,
+            fields,
+            ty,
+        } => {
+            let mut struct_instance = context.instantiate_struct(name)?;
+            let mut subs = Substitutions::new();
+            for (field_name, field_expr) in fields.iter_mut() {
+                
+                let decl_ty = struct_instance.field_type(field_name)?;
+                subs.and_then(&infer(context, field_expr)?);
+                field_expr.substitute(&subs);
+                subs.and_then(&unify(field_expr.unwrap_type(), &decl_ty)?);
+                field_expr.substitute(&subs);
+                struct_instance.substitute(&subs);
+            }
+            let ty = ty.as_mut().unwrap();
+            subs.and_then(&unify(ty, &Type::StructInstance(struct_instance))?);
+            ty.substitute(&subs);
+            expression.substitute(&subs);
+            Ok(subs)
+        }
         Expression::If {
             condition,
             true_expr,
@@ -615,7 +853,11 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                         }
                         context.substitute(&subs);
                         value.substitute(&subs);
-                        shadow.insert(binding.name.clone(), value_type.clone(), binding.mutable);
+                        shadow.insert_variable(
+                            binding.name.clone(),
+                            value_type.clone(),
+                            binding.mutable,
+                        );
                         last_statement_type = Type::Unit;
                     }
                     Statement::Assign(LValue::Variable(name), expr) => {
@@ -637,6 +879,9 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                         context.substitute(&subs);
                         expr.substitute(&subs);
                         last_statement_type = Type::Unit;
+                    }
+                    Statement::Assign(LValue::Field(_, _), _) => {
+                        todo!()
                     }
                     Statement::Return(expr) => {
                         let e_subs = infer(shadow.context(), expr)?;
@@ -669,7 +914,16 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                     arg_types.push(binding.ty.clone());
                 }
                 // TODO: Verify that top level declarations have no free type variables.
-                shadow.insert(fn_decl.name.clone(), fn_decl.as_type(), false); // TODO: args need to declare mutability.
+                // TODO: args need to declare mutability.
+                shadow.insert_variable(fn_decl.name.clone(), fn_decl.as_type(), false);
+            }
+            Declaration::Struct(struct_declaration) => {
+                let redefined = shadow.define_struct(struct_declaration.clone());
+                if redefined {
+                    return Err(Error::DuplicateTopLevelName(
+                        struct_declaration.name.clone(),
+                    ));
+                }
             }
         }
     }
@@ -698,6 +952,7 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 unify(return_type, body.unwrap_type())?;
                 shadow.finish();
             }
+            Declaration::Struct(_) => {}
         }
     }
     shadow.finish();
@@ -724,6 +979,11 @@ impl From<()> for Expression {
         Expression::LiteralUnit
     }
 }
+impl From<LValue> for Expression {
+    fn from(l: LValue) -> Self {
+        Expression::L(l, None)
+    }
+}
 impl From<&str> for Statement {
     fn from(value: &str) -> Self {
         Statement::Expression(Expression::L(LValue::Variable(value.to_string()), None))
@@ -747,6 +1007,11 @@ impl From<&str> for LValue {
 impl From<Expression> for Statement {
     fn from(expr: Expression) -> Self {
         Statement::Expression(expr)
+    }
+}
+impl From<LValue> for Statement {
+    fn from(l: LValue) -> Self {
+        Statement::Expression(l.into())
     }
 }
 
@@ -807,6 +1072,9 @@ pub mod test_helpers {
             body: Box::new(body.into()),
             lambda_type: None,
         }
+    }
+    pub fn field(expr: impl Into<Expression>, name: &str) -> LValue {
+        LValue::Field(Box::new(expr.into()), name.into())
     }
 }
 
@@ -1146,7 +1414,7 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt("x", None, false, call_expr("id", vec![12.34.into()])),
                     let_stmt("b", None, false, call_expr("id", vec![false.into()])),
-                    if_expr("b", "x", 23.45).into()
+                    if_expr("b", "x", 23.45).into(),
                 ])),
             }),
         ]);
@@ -1232,13 +1500,20 @@ mod tests {
             return_type: Type::Int,
             body: Some(block_expr(vec![
                 // Explicit return in true branch, implicit return in false.
-                let_stmt("x", None, false,
+                let_stmt(
+                    "x",
+                    None,
+                    false,
                     lambda_expr(
-                        vec![SoftBinding{ name: "x".to_string(), ty: None, mutable:false }],
-                        call_expr("x", vec!["x".into()])
-                    )
+                        vec![SoftBinding {
+                            name: "x".to_string(),
+                            ty: None,
+                            mutable: false,
+                        }],
+                        call_expr("x", vec!["x".into()]),
+                    ),
                 ),
-                2.into()
+                2.into(),
             ])),
         })]);
         assert!(matches!(
@@ -1272,10 +1547,6 @@ mod tests {
             ])),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
-    }
-    #[test]
-    fn test_higher_order_fns() {
-
     }
 
     #[test]
@@ -1314,76 +1585,106 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "factorial".to_string(),
-                args: vec![ TypedBinding::new("x", Type::Int, false) ],
+                args: vec![TypedBinding::new("x", Type::Int, false)],
                 return_type: Type::Int,
                 body: Some(if_expr(
                     call_expr("leq", vec!["x".into(), 1.into()]),
                     1,
-                    call_expr("mul", vec![
-                        "x".into(),
-                        call_expr("factorial", vec![
-                            call_expr("sub", vec!["x".into(), 1.into()])
-                        ])
-                    ])
+                    call_expr(
+                        "mul",
+                        vec![
+                            "x".into(),
+                            call_expr(
+                                "factorial",
+                                vec![call_expr("sub", vec!["x".into(), 1.into()])],
+                            ),
+                        ],
+                    ),
                 )),
             }),
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
 
-#[test]
-fn higher_order_functions() {
-    let fn_int_to_int = Type::Fn(vec![Type::Int], Box::new(Type::Int));
+    #[test]
+    fn higher_order_functions() {
+        let fn_int_to_int = Type::Fn(vec![Type::Int], Box::new(Type::Int));
 
-    let program = &mut Program(vec![
-        // Declare external fn apply(f: fn(Int)->Int, x: Int) -> Int;
-        Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "apply".to_string(),
-            args: vec![
-                TypedBinding::new("f", fn_int_to_int.clone(), false),
-                TypedBinding::new("x", Type::Int, false),
+        let program = &mut Program(vec![
+            // Declare external fn apply(f: fn(Int)->Int, x: Int) -> Int;
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "apply".to_string(),
+                args: vec![
+                    TypedBinding::new("f", fn_int_to_int.clone(), false),
+                    TypedBinding::new("x", Type::Int, false),
+                ],
+                return_type: Type::Int,
+                body: None, // External
+            }),
+            // Declare external fn make_adder(y: Int) -> fn(Int)->Int;
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "make_adder".to_string(),
+                args: vec![TypedBinding::new("y", Type::Int, false)],
+                return_type: fn_int_to_int.clone(),
+                body: None, // External
+            }),
+            // Declare fn main() -> Int {
+            //   let add5 = make_adder(5);
+            //   apply(add5, 10)
+            // }
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::Int,
+                body: Some(block_expr(vec![
+                    // let add_5 = make_adder(5)
+                    let_stmt("add5", None, false, call_expr("make_adder", vec![5.into()])),
+                    // apply(add5, 10)
+                    call_expr("apply", vec!["add5".into(), 10.into()]).into(),
+                ])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+
+    #[test]
+    fn struct_field_access() {
+        let pair = StructDecl::new(
+            "Pair",
+            &[
+                ("left", Type::Var(TypeVar(0))),
+                ("right", Type::Var(TypeVar(1))),
             ],
-            return_type: Type::Int,
-            body: None, // External
-        }),
-        // Declare external fn make_adder(y: Int) -> fn(Int)->Int;
-        Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "make_adder".to_string(),
-            args: vec![TypedBinding::new("y", Type::Int, false)],
-            return_type: fn_int_to_int.clone(),
-            body: None, // External
-        }),
-        // Declare fn main() -> Int {
-        //   let add5 = make_adder(5);
-        //   apply(add5, 10)
-        // }
-        Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: Type::Int,
-            body: Some(block_expr(vec![
-                // let add_5 = make_adder(5)
-                let_stmt(
-                    "add5",
-                    None,   
-                    false,  
-                    call_expr("make_adder", vec![5.into()])
-                ),
-                // apply(add5, 10)
-                call_expr(
-                    "apply", 
-                    vec![     
-                        "add5".into(), 
-                        10.into()      
-                    ]
-                ).into() 
-            ])),
-        }),
-    ]);
-    assert_eq!(typecheck_program(program), Ok(()));
-}
+        );
 
+        let program = &mut Program(vec![
+            Declaration::Struct(pair),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::Bool,
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "p",
+                        None,
+                        false,
+                        Expression::LiteralStruct {
+                            name: "Pair".to_string(),
+                            fields: HashMap::from_iter([
+                                ("left".into(), true.into()),
+                                ("right".into(), 123.into()),
+                            ]),
+                            ty: None,
+                        },
+                    ),
+                    field("p", "left").into(),
+                ])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
 }
