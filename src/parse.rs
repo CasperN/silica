@@ -121,6 +121,7 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     };
 
     Ok(Declaration::Fn(FnDecl {
+        forall: vec![], // TODO: Parse polymorphic function declarations.
         name: name.to_string(),
         args: params,
         return_type,
@@ -345,9 +346,10 @@ fn build_variable_expr(node: &Node, source: &str) -> BuildResult<Expression> {
         field_name: None,
         child_index: Some(0),
     })?;
-    Ok(Expression::L(LValue::Variable(
-        get_node_text(&ident_node, source).to_string()
-    ), None))
+    Ok(Expression::L(
+        LValue::Variable(get_node_text(&ident_node, source).to_string()),
+        None,
+    ))
 }
 
 fn build_block_expr(node: &Node, source: &str) -> BuildResult<Expression> {
@@ -388,7 +390,10 @@ fn build_block_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     if let Some(expr) = final_expr {
         statements.push(Statement::Expression(expr)); // Convert final expr to statement
     }
-    Ok(Expression::Block { statements, ty: None })
+    Ok(Expression::Block {
+        statements,
+        ty: None,
+    })
 }
 
 // --- TODO: Implement remaining build functions ---
@@ -486,7 +491,7 @@ fn build_if_expr(node: &Node, source: &str) -> BuildResult<Expression> {
         Some(alt_node) => build_block_expr(&alt_node, source)?, // Assume block expr
         None => Expression::Block {
             statements: vec![Statement::Expression(Expression::LiteralUnit)],
-            ty: None
+            ty: None,
         }, // Default else
     };
 
@@ -518,7 +523,7 @@ fn build_lambda_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     Ok(Expression::Lambda {
         bindings: build_lambda_parameter_list(&params_node, source)?,
         body: Box::new(build_expression(&body_node, source)?),
-        ty: None
+        lambda_type: None,
     })
 }
 
@@ -554,7 +559,7 @@ fn build_call_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     Ok(Expression::Call {
         fn_expr: Box::new(build_expression(&func_node, source)?),
         arg_exprs: build_argument_list(&args_node, source)?,
-        ty: None
+        return_type: None,
     })
 }
 
@@ -604,6 +609,7 @@ mod tests {
         assert_eq!(
             build_ast_program(source_code),
             Ok(Program(vec![Declaration::Fn(FnDecl {
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::Int,
@@ -625,6 +631,7 @@ mod tests {
         ";
         let expected_program = Program(vec![
             Declaration::Fn(FnDecl {
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::Int, false),
@@ -634,6 +641,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::Int,
@@ -667,6 +675,7 @@ mod tests {
         ";
         let program = Program(vec![
             Declaration::Fn(FnDecl {
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::Int, false),
@@ -676,6 +685,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::Fn(vec![Type::Int], Box::new(Type::Int)),
