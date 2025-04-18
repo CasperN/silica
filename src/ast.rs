@@ -46,7 +46,7 @@ pub enum Expression {
     },
 }
 impl Expression {
-    fn init_type_var(&mut self, context: &mut TypeContext) -> &mut Self {
+    fn ensure_type_initialized(&mut self, context: &mut TypeContext) -> &mut Self {
         match self {
             Self::LiteralInt(_)
             | Self::LiteralBool(_)
@@ -86,14 +86,14 @@ impl Expression {
                 lambda_type: ty, ..
             } => ty
                 .as_ref()
-                .expect("unwrap_type called before init_type_var"),
+                .expect("unwrap_type called before ensure_type_initialized"),
         }
     }
     fn substitute(&mut self, subs: &Substitutions) -> &mut Self {
         let unwrap_and_substitute = |option_ty: &mut Option<Type>| {
             option_ty
                 .as_mut()
-                .expect("Substituting type vars in an expression before init_type_var was called.")
+                .expect("Substituting type vars in an expression before ensure_type_initialized was called.")
                 .substitute(subs);
         };
         match self {
@@ -145,8 +145,8 @@ impl Expression {
                             expr.substitute(subs);
                         }
                     }
-                    unwrap_and_substitute(ty)
                 }
+                unwrap_and_substitute(ty)
             }
         }
         self
@@ -467,10 +467,7 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
 }
 
 fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Substitutions, Error> {
-    expression.init_type_var(context);
-    if matches!(expression, Expression::Call { .. }) {
-        dbg!(&expression);
-    }
+    expression.ensure_type_initialized(context);
     match expression {
         Expression::L(LValue::Variable(name), ty) => {
             let ty = ty.as_mut().unwrap();
@@ -1130,7 +1127,31 @@ mod tests {
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
-
+    #[test]
+    fn use_polymorphic_top_level_fn_polymorphically() {
+        // id(2) + id(2)
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                forall: vec![TypeVar(0)],
+                name: "id".to_string(),
+                args: vec![TypedBinding::new("a", Type::Var(TypeVar(0)), false)],
+                return_type: Type::Var(TypeVar(0)),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::Float,
+                body: Some(block_expr(vec![
+                    let_stmt("x", None, false, call_expr("id", vec![12.34.into()])),
+                    let_stmt("b", None, false, call_expr("id", vec![false.into()])),
+                    if_expr("b", "x", 23.45).into()
+                ])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
     #[test]
     fn error_polymorphic_top_level_fn() {
         // id(2) + id(2)
@@ -1202,4 +1223,167 @@ mod tests {
             Err(Error::NotUnifiable(_, _))
         ));
     }
+    #[test]
+    fn error_infinite_type() {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
+            forall: vec![],
+            name: "main".to_string(),
+            args: vec![],
+            return_type: Type::Int,
+            body: Some(block_expr(vec![
+                // Explicit return in true branch, implicit return in false.
+                let_stmt("x", None, false,
+                    lambda_expr(
+                        vec![SoftBinding{ name: "x".to_string(), ty: None, mutable:false }],
+                        call_expr("x", vec!["x".into()])
+                    )
+                ),
+                2.into()
+            ])),
+        })]);
+        assert!(matches!(
+            typecheck_program(program),
+            Err(Error::InfiniteType(_, _))
+        ));
+    }
+
+    #[test]
+    fn empty_block_has_type_unit() {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
+            forall: vec![],
+            name: "main".to_string(),
+            args: vec![],
+            return_type: Type::Unit,
+            body: Some(block_expr(vec![])),
+        })]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn block_with_just_lets_has_type_unit() {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
+            forall: vec![],
+            name: "main".to_string(),
+            args: vec![],
+            return_type: Type::Unit,
+            body: Some(block_expr(vec![
+                let_stmt("x", None, false, 1),
+                let_stmt("y", None, false, false),
+                let_stmt("z", None, false, 19.95),
+            ])),
+        })]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn test_higher_order_fns() {
+
+    }
+
+    #[test]
+    fn factorial_fn() {
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "mul".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::Int, false),
+                    TypedBinding::new("b", Type::Int, false),
+                ],
+                return_type: Type::Int,
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "sub".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::Int, false),
+                    TypedBinding::new("b", Type::Int, false),
+                ],
+                return_type: Type::Int,
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "leq".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::Int, false),
+                    TypedBinding::new("b", Type::Int, false),
+                ],
+                return_type: Type::Bool,
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "factorial".to_string(),
+                args: vec![ TypedBinding::new("x", Type::Int, false) ],
+                return_type: Type::Int,
+                body: Some(if_expr(
+                    call_expr("leq", vec!["x".into(), 1.into()]),
+                    1,
+                    call_expr("mul", vec![
+                        "x".into(),
+                        call_expr("factorial", vec![
+                            call_expr("sub", vec!["x".into(), 1.into()])
+                        ])
+                    ])
+                )),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+
+#[test]
+fn higher_order_functions() {
+    let fn_int_to_int = Type::Fn(vec![Type::Int], Box::new(Type::Int));
+
+    let program = &mut Program(vec![
+        // Declare external fn apply(f: fn(Int)->Int, x: Int) -> Int;
+        Declaration::Fn(FnDecl {
+            forall: vec![],
+            name: "apply".to_string(),
+            args: vec![
+                TypedBinding::new("f", fn_int_to_int.clone(), false),
+                TypedBinding::new("x", Type::Int, false),
+            ],
+            return_type: Type::Int,
+            body: None, // External
+        }),
+        // Declare external fn make_adder(y: Int) -> fn(Int)->Int;
+        Declaration::Fn(FnDecl {
+            forall: vec![],
+            name: "make_adder".to_string(),
+            args: vec![TypedBinding::new("y", Type::Int, false)],
+            return_type: fn_int_to_int.clone(),
+            body: None, // External
+        }),
+        // Declare fn main() -> Int {
+        //   let add5 = make_adder(5);
+        //   apply(add5, 10)
+        // }
+        Declaration::Fn(FnDecl {
+            forall: vec![],
+            name: "main".to_string(),
+            args: vec![],
+            return_type: Type::Int,
+            body: Some(block_expr(vec![
+                // let add_5 = make_adder(5)
+                let_stmt(
+                    "add5",
+                    None,   
+                    false,  
+                    call_expr("make_adder", vec![5.into()])
+                ),
+                // apply(add5, 10)
+                call_expr(
+                    "apply", 
+                    vec![     
+                        "add5".into(), 
+                        10.into()      
+                    ]
+                ).into() 
+            ])),
+        }),
+    ]);
+    assert_eq!(typecheck_program(program), Ok(()));
+}
+
 }
