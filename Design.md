@@ -9,12 +9,21 @@ Silica is envisioned as an experimental systems programming language combining f
 ## 2. Core Language Features
 
 ### 2.1 Type System Foundations
-* Foundation (HM Hybrid): Uses a Hindley-Milner inspired system. Top-level functions require full type annotations (generics, lifetimes, effects). Local type inference (Algorithm W-like) deduces types for let bindings within functions.
+* Foundation (HM Hybrid): Uses a Hindley-Milner inspired system.
+  * Top-level functions require full type annotations (generics, lifetimes, effects).
+  * Local type inference (Algorithm W-like) deduces types for let bindings within functions.
 * Polymorphism:
-  * Universal (forall) types: (forall T: TraitBound...). This allows for standard generic code reusable across different types satisfying specified constraints (traits). Traits define shared interfaces or properties that types can implement. Generic functions are preserved in Silica’s Mid-level IR (MIR) for analysis before potential monomorphization in the LLVM backend.
-  * Existential (exists) types: (exists S: TraitBound...). This lets generics provide a hidden type S, that only has some defined interface (trait bounds). Primarily used for abstracting types, especially the opaque state/implementation of coroutines (see 2.3). Requires explicit annotations. Practical Explanation: Think of it like returning an abstract "iterator" or "future" where you know what it does (its interface or trait bounds) but not its exact internal type.
-* Function Signatures & Effects: Effectful functions always return an opaque coroutine object (Co<T!E>) via existential types (fn foo() -> S where exists S: Co<T!E> + Bounds...). Effects enable library implementations of features like exceptions, generators, and async/await, promoting composability (e.g., Co<T, Fail<E>, Async> combines failure and async effects). Pure functions return values directly (fn add(x: i32, y: i32) -> i32).
-* Algebraic Effects (Motivation): Effects provide a single, type-safe framework to implement exceptions, callbacks, generators, async/await as library features. These would normally be language features. Effects are also more simply composable . In Rust, Future<Result<Iterator<Item=T>, E>> is very different from Iterator<Item=Future<Result<T, E>>>. With effects, they’d both be Co<T, Fail<E>, Async>. Function signatures explicitly declare the effects that their returned coroutine might perform.
+  * Universal (forall) types: (forall T: TraitBound...).
+    * This allows for standard generic code reusable across different types satisfying specified constraints (traits).
+    * Traits define shared interfaces or properties that types can implement.
+  * Existential (exists) types: (exists S: TraitBound...).
+    * This lets generics provide a hidden type S, that only has some defined interface (trait bounds).
+    * Primarily used for abstracting types, especially the opaque state/implementation of coroutines (see 2.3).
+    * Requires explicit annotations.
+    * Practical Explanation: Think of it like returning an abstract "iterator" or "future" where you know what it does (its interface or trait bounds) but not its exact internal type.
+* Algebraic Effects (Motivation): Effects provide a single, type-safe framework to implement exceptions, callbacks, generators, async/await as library features. These would normally be language features.
+  * Effects are also more simply composable: In Rust, `Future<Result<Iterator<Item=T>, E>>` is very different from `Iterator<Item=Future<Result<T, E>>>.` With effects, they’d both be `Co<T, Fail<E>, Async>`. In essence, effects form a "flat" set, unlike monads which have some encapsulation order.
+  * Function signatures explicitly declare the effects that their returned coroutine might perform.
 
 ### 2.2 Linearity, Ownership, and Movability
 Silica incorporate linear types (values consumed exactly once) for compile-time resource safety, preventing leaks and double-use (e.g. in memory or file handles). This strict default is made ergonomic via the following relaxations:
@@ -26,12 +35,12 @@ Silica incorporate linear types (values consumed exactly once) for compile-time 
 
 * **Opt-in implicits**: The following traits further relax linearity rules by controlling implicit destruction and copying:
   * ImplicitDrop (Affine): Allows values to be used at most once . If unused by scope end, its drop method is called automatically. Enables affinity.
-
-        trait ImplicitDrop {
-          // Non-effectful cleanup logic.
-          fn drop(&deinit self);
-        }
-
+      ```
+      trait ImplicitDrop {
+        // Non-effectful cleanup logic.
+        fn drop(&deinit self);
+      }
+      ```
       *Note:* `drop` cannot perform effects. Effectful cleanup requires an explicit function like `destroy(&deinit self) -> Co<() ! E>`.
   * ImplicitCopy (Relevant/Unrestricted): Allows values to be used one or more times (relevant) or any number of times (unrestricted, if also ImplicitDrop). Implicit copies are made via the copy method when needed.
 
@@ -61,9 +70,11 @@ Silica incorporate linear types (values consumed exactly once) for compile-time 
 Aggregate types (and closures/coroutines) can only have those traits if all their members (and captured state) have these properties.
 
 ### 2.3 Effects, Coroutines, and Syntax
-Algebraic Effects are a generalization of exceptions and coroutines that can model what would normally be language-level features at the library level. Most notably, these include generators, async/await, and exceptions. They can be tought of as "resumable exceptions".
+Algebraic Effects are a generalization of exceptions and coroutines. It can implement features at a library level would normally be implemented at a language-level. Most notably, these include generators, async/await, and exceptions. They can be thought of as "resumable exceptions".
 
 The following example demonstrates two algebraic effects, `UserPrompt` and `Fail`.
+Syntax Notes: Imperative core; expression-oriented; Largely inspired by Rust.
+
   ```
   // 1. Define effects
   effect UserPrompt { ask(String) -> String } // Resumable
@@ -98,10 +109,24 @@ The following example demonstrates two algebraic effects, `UserPrompt` and `Fail
   }
   ```
 
-* Core Mechanism: Effects separate what operation (defined by effect `E { op(X)->Y }`) from how it's handled. `perform E.op(x)` suspends the current coroutine; control transfers outwards to the nearest enclosing handle block that matches E.op.
-* Postfix Handlers (handle): Primary way to manage coroutine execution and handle effects. Applied postfix: `expr handle { Effect.op(arg, resume) => { ... }, return result => { ... } }`. Control transfers to the matching arm; the handler decides when/how to resume. Resumption may be delayed (e.g., for async).
-* `?` Operator (Sugar): Manages coroutine execution: returns success value T or propagates unhandled effects E. Operates on Co<T!E> values. Equivalent to a default forwarding handle block:
-Semantics: `expr?` is roughly equivalent to installing a default handler that forwards any effect using perform:
+* Function Signatures & Effects:
+  * Effectful functions always return an opaque coroutine object via existential types (`fn foo() -> S where exists S: Co<T!E> + Move`).
+  * Pure functions return values directly (fn add(x: i32, y: i32) -> i32).
+* Effects are a control flow mechanism. They separate the invocation of an operation (defined by effect `E { op(X)->Y }`) from how it's handled.
+  * `perform E.op(x)` suspends the current coroutine
+  * Control transfers outwards to the nearest enclosing `handle` block that matches `E.op`.
+  * The handler decides when/how to resume. Resumption may be delayed (e.g., for async).
+  * If the handler resumes a coroutine, control is transferred back to the suspension point.
+  * Values may be passed from coroutine to handler and back.
+  * Unlike many languages with exceptions, control flow does not _immediately_ transfer when an expression performs an effect. Instead the expression evaluate to a coroutine object which may be copied or moved. The effect must be explicitly propagated with `?` or `handle` to escape.
+* Postfix `handle` block: Primary way to manage coroutine execution and handle effects.
+  * e.g.: `expr handle { Effect.op(arg, resume) => { ... }, return result => { ... } }`.
+  * Handling Scoping: Effects performed within a handler arm (i.e., inside the `{...}` following `=>`) are not caught by the handler itself; perform always propagates outwards from the arm to the next enclosing handler scope. (Subject to the tunneling caveat below)
+  * Tunneling: Handle blocks in the body of an effect-parameterized function will always propagate the parameterized effect, even if the implementation handles effects of the same type. The parameterized effect "tunnels through" the body of a polymorphic function. This prevents accidental handling as generic code cannot know the type of an effect its generic over. [link to algebraic effect tunneling paper here]
+* `?` Operator: Operates on `Co<T!E>` values. Evaluates to `T`, but propagates effects `E`, affecting control flow.
+  * Usage: Simplifies chaining effectful operations. 
+  * Can only be used within another effectful function context that includes the propagated effects `E`.
+  *  `expr?` is roughly equivalent to installing a default handler that forwards any effect using perform:
     ```
     // Conceptual desugaring of `expr?` where expr yields a Co<T!E>
     expr handle {
@@ -117,12 +142,8 @@ Semantics: `expr?` is roughly equivalent to installing a default handler that fo
         return v => v,  // the handle returns v, and thus `expr?` evaluates to v.
     }
     ```
+* Representation: Effectful functions return opaque coroutines (`Co<T!E>`) via existential types (-> S where exists S: Co<...> + Bounds...). Bounds reflect captured state properties.
 
-* Usage: Simplifies chaining effectful operations. Can only be used within another effectful function context that includes the propagated effects E.
-* Handling Scoping: Effects performed within a handler arm (i.e., inside the `{...}` following `=>`) are not caught by the handler itself; perform always propagates outwards from the arm to the next enclosing handler scope. (Subject to the tunneling caveat below)
-* Tunneling: Handle blocks in the body of an effect-parameterized function will always propagate the parameterized effect, even if the implementation handles effects of the same type. The parameterized effect "tunnels through" the body of a polymorphic function. This prevents accidental handling as generic code cannot know the type of an effect its generic over. [link to algebraic effect tunneling paper here]
-* Representation: Effectful functions return opaque coroutines (Co<T!E>) via existential types (-> S where exists S: Co<...> + Bounds...). Bounds reflect captured state properties. Co trait interface TBD.
-Syntax Notes: Imperative core; expression-oriented; Rust-like keywords. Postfix match; `->` pointer access; No implicit deref; Loops via stdlib functions using Yield/Break effects.
 
 ## 3. Design Trade-offs
 This section summarizes key design choices where Silica prioritizes certain goals over others, accepting the associated trade-offs.
@@ -134,11 +155,21 @@ This section summarizes key design choices where Silica prioritizes certain goal
 
 ## 4. Implementation State & Plans
 * **Parser:** An initial `tree-sitter` grammar has been implemented in `grammar.js`. `parse.rs` accesses the generated parser via the Rust tree-sitter bindings and uses them to build the basic AST structures defined in `ast.rs`. This needs additional testing and integration.
-* **AST & Type Checker:** `ast.rs` implements basic AST nodes (literals, if, call, block, lambda, let, assign). It contains a Hindley-Milner based type inference system (`infer`, `unify`) that operates on this AST. During type checking, it **mutates the AST nodes in-place** to store the inferred type information within an `Option<Type>` field associated with each expression node. This approach annotates the AST with types without generating a separate Typed AST structure. It successfully handles basic type checking, variable scoping, and mutability checks for assignments on the current language subset. Lacks AST representation and type checking logic for core Silica features: references, effects/coroutines, aggregates (structs/enums), traits, and explicit generics. `Return` statement handling within blocks is currently unimplemented.
-* **Mid Level SSA IR** `ssa.rs` defines basic data structures for an SSA IR (`SsaVar`, `Instruction`, `BasicBlock`, etc.) and includes an SSA validation pass (`typecheck_ssa`) for this basic structure. Lifetime and definite initialization analysis is planned to be implemented at this layer.
+* **AST & Type Checker:** `ast.rs` implements basic AST nodes (literals, if, call, block, lambda, let, assign, structs). It contains a Hindley-Milner based type inference system (`infer`, `unify`).
+  * During type checking, it **mutates the AST nodes in-place** to store the inferred type information within an `Type` field associated with each expression node.
+  * Efficient type unification is achieved using interior mutability and shared pointers.
+  * It successfully handles basic type checking, variable scoping, and mutability checks for assignments on the current language subset. Lacks AST representation and type checking logic for core Silica features: references, effects/coroutines, aggregates (structs/enums), traits, and explicit generics. `Return` statement handling within blocks is currently unimplemented.
+* **Mid Level SSA IR**
+  * `ssa.rs` defines basic data structures for an SSA IR (`SsaVar`, `Instruction`, `BasicBlock`, etc.) and includes an SSA validation pass (`typecheck_ssa`) for this basic structure.
+  * Lifetime and definite initialization analysis is planned to be implemented at this layer.
+  * Generic functions are preserved in the MIR for analysis before potential monomorphization in the LLVM backend.
 * **Implementation Plan**:
   1.  Enhance Parser (`grammar.js`, `parse.rs`) and AST/TypeChecker (`ast.rs`) to support more language features (e.g., structs, basic references).
+      1.  The parser does not yet support structs, through the AST/Typechecker does.
+      2.  References and Effects are the likely next step for the type checker
   2.  Implement Lowering from the type-annotated AST to the SSA/MIR form (`sst.rs`).
+      1.  First, implement last-use analysis
+      2.  Use this to 
   3.  Enhance SSA/MIR representation and implement required analysis passes (lifetimes, definite initialization, effect handling).
   4.  Develop LLVM backend code generation from MIR.
 
@@ -172,6 +203,7 @@ Section IDs:
   * `silica_effects_syntax` (Section 2.3)
   * `silica_tradeoffs` (Section 3)
   * `silica_implementation` (Section 4)
+  * `silica_alternatives_considered` (Section 5)
   * `silica_ai_assistant_instructions` (This Section)
 
 The primary designer (the user) is the authority on design decisions. The design is iterative.
@@ -193,6 +225,8 @@ Key Design Concepts & Decisions Summary:
   * `?` Operator: Manages `Co` execution + propagates effects via forwarding `handle`.
   * `handle`: Transfers control; `resume` can be delayed (async).
   * `perform`: Inside handler arm always forwards outwards.
+  * pass-by-value requires `Move`
+  * efficient unification via interior mutability/Union-Find.
 
 **Core Challenge:** The main complexity lies in the interaction between linearity, lifetimes, effects (including their execution model), immovability, initialization tracking (`&out`/`&deinit`), and generics, particularly within the MIR analysis passes.
 
