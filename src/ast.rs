@@ -5,7 +5,6 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum LValue {
     Variable(String),
@@ -46,9 +45,8 @@ pub enum Expression {
     },
 }
 impl Expression {
-    // Gets the type of the expression, assigning a new variable from the
-    // context if one hasn't been created yet.
-    fn unwrap_type(&mut self) -> Type {
+    // Clones the type of the expression.
+    fn get_type(&self) -> Type {
         match self {
             Self::LiteralInt(_) => Type::int(),
             Self::LiteralBool(_) => Type::bool_(),
@@ -67,9 +65,11 @@ impl Expression {
                 name: _,
                 fields: _,
                 ty,
-            } => ty
-                .compress()
-                .clone(),
+            } => {
+                let mut ty = ty.clone();
+                ty.compress();
+                ty
+            }
         }
     }
 }
@@ -203,7 +203,6 @@ impl std::fmt::Debug for Type {
     }
 }
 
-
 #[derive(Default, Debug, Clone, PartialEq)]
 enum TypeI {
     Int,
@@ -264,10 +263,14 @@ impl Type {
     // Recursively compresses away any instances of `Follow` in the type.
     fn compress(&mut self) -> &mut Self {
         self.compress_direct_path();
-        match &mut *self.0.borrow_mut(){
-            TypeI::Bool | TypeI::Float | TypeI::Int
-            | TypeI::Unit | TypeI::Unknown| TypeI::Param(_) => {}
-            TypeI::Follow(_) => unreachable!(),  // compress direct path.
+        match &mut *self.0.borrow_mut() {
+            TypeI::Bool
+            | TypeI::Float
+            | TypeI::Int
+            | TypeI::Unit
+            | TypeI::Unknown
+            | TypeI::Param(_) => {}
+            TypeI::Follow(_) => unreachable!(), // compress direct path.
             TypeI::Fn(args, ret) => {
                 for arg in args.iter_mut() {
                     arg.compress_direct_path();
@@ -513,7 +516,7 @@ impl<'a> ShadowTypeContext<'a> {
     }
     fn insert_soft_binding(&mut self, binding: SoftBinding) {
         let SoftBinding { name, ty, mutable } = binding;
-        let ty = ty.unwrap_or_else(|| Type::unknown());
+        let ty = ty.unwrap_or_else(Type::unknown);
         self.insert_variable(name, ty, mutable);
     }
     // Defines a struct. Returns if there was a previous definition.
@@ -614,9 +617,8 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
                 return Err(Error::NotUnifiable(left.clone(), right.clone()));
             }
             unify(left_ret_ty, right_ret_ty)?;
-            let zipped = left_arg_types.iter().zip(right_arg_types.iter().cloned());
-            for (left_arg_ty, right_arg_ty) in zipped {
-                unify(&left_arg_ty, &right_arg_ty)?;
+            for (l, r) in left_arg_types.iter().zip(right_arg_types.iter()) {
+                unify(l, r)?;
             }
             Ok(())
         }
@@ -639,14 +641,12 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
                         Left:{left:?}, Right:{right:?}"
                     )
                 });
-                unify(&left_ty, &right_ty)?
+                unify(left_ty, right_ty)?
             }
             Ok(())
         }
         _ => Err(Error::NotUnifiable(left.clone(), right.clone())),
     };
-    left.compress();
-    right.compress();
     result
 }
 
@@ -669,7 +669,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
         }
         Expression::L(LValue::Field(expr, field), ty) => {
             infer(context, expr)?;
-            if let TypeI::StructInstance(struct_instance) = &*expr.unwrap_type().inner() {
+            if let TypeI::StructInstance(struct_instance) = &*expr.get_type().inner() {
                 let field_type = struct_instance.field_type(field)?;
                 unify(&field_type, ty)?;
             } else {
@@ -686,7 +686,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             for (field_name, field_expr) in fields.iter_mut() {
                 let decl_ty = struct_instance.field_type(field_name)?;
                 infer(context, field_expr)?;
-                unify(&field_expr.unwrap_type(), &decl_ty)?;
+                unify(&field_expr.get_type(), &decl_ty)?;
             }
             unify(ty, &Type::struct_(struct_instance))?;
             Ok(())
@@ -698,13 +698,13 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             ty: _,
         } => {
             infer(context, condition)?;
-            let cond_ty = condition.unwrap_type();
+            let cond_ty = condition.get_type();
             unify(&cond_ty, &Type::bool_())?;
 
             infer(context, true_expr)?;
             infer(context, false_expr)?;
-            let t_ty = true_expr.unwrap_type();
-            let f_ty = false_expr.unwrap_type();
+            let t_ty = true_expr.get_type();
+            let f_ty = false_expr.get_type();
             unify(&t_ty, &f_ty)?;
 
             Ok(())
@@ -719,11 +719,11 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             let mut arg_types = vec![];
             for arg_expr in arg_exprs.iter_mut() {
                 infer(context, arg_expr)?;
-                arg_types.push(arg_expr.unwrap_type().clone());
+                arg_types.push(arg_expr.get_type().clone());
             }
 
             unify(
-                &fn_expr.unwrap_type(),
+                &fn_expr.get_type(),
                 &Type::func(arg_types, return_type.clone()),
             )?;
             Ok(())
@@ -745,7 +745,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                 shadow.insert_soft_binding(binding.clone());
             }
             infer(shadow.context(), body)?;
-            unify(&body.unwrap_type(), &lambda_return_type)?;
+            unify(&body.get_type(), &lambda_return_type)?;
 
             let mut arg_types = Vec::new();
             for binding in bindings.iter() {
@@ -757,10 +757,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                     .clone();
                 arg_types.push(arg_type);
             }
-            unify(
-                lambda_type,
-                &Type::func(arg_types, lambda_return_type),
-            )?;
+            unify(lambda_type, &Type::func(arg_types, lambda_return_type))?;
             shadow.finish();
             Ok(())
         }
@@ -774,12 +771,12 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                 match statement {
                     Statement::Expression(expr) => {
                         infer(shadow.context(), expr)?;
-                        last_statement_type = expr.unwrap_type().clone();
+                        last_statement_type = expr.get_type().clone();
                     }
                     Statement::Let { binding, value } => {
                         let context = shadow.context();
                         infer(context, value)?;
-                        let value_type = value.unwrap_type().clone();
+                        let value_type = value.get_type().clone();
                         if let Some(binding_ty) = &binding.ty {
                             unify(binding_ty, &value_type)?;
                         }
@@ -803,7 +800,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                         if !variable_info.mutable {
                             return Err(Error::AssignToImmutableBinding(name.to_string()));
                         }
-                        unify(&expr.unwrap_type(), &variable_info.ty)?;
+                        unify(&expr.get_type(), &variable_info.ty)?;
                         last_statement_type = Type::unit();
                     }
                     Statement::Assign(LValue::Field(_, _), _) => {
@@ -811,8 +808,8 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                     }
                     Statement::Return(expr) => {
                         infer(shadow.context(), expr)?;
-                        unify(&expr.unwrap_type(), &shadow.context().return_type)?;
-                        last_statement_type = expr.unwrap_type().clone();
+                        unify(&expr.get_type(), &shadow.context().return_type)?;
+                        last_statement_type = expr.get_type().clone();
                         // TODO: Probably should issue a warning for unreachable statements.
                     }
                 }
@@ -874,7 +871,7 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 }
                 shadow.set_return_type(return_type.clone());
                 infer(shadow.context(), body)?;
-                unify(return_type, &body.unwrap_type())?;
+                unify(return_type, &body.get_type())?;
                 shadow.finish();
             }
             Declaration::Struct(_) => {}
@@ -911,7 +908,10 @@ impl From<LValue> for Expression {
 }
 impl From<&str> for Statement {
     fn from(value: &str) -> Self {
-        Statement::Expression(Expression::L(LValue::Variable(value.to_string()), Type::unknown()))
+        Statement::Expression(Expression::L(
+            LValue::Variable(value.to_string()),
+            Type::unknown(),
+        ))
     }
 }
 impl From<i64> for Statement {
@@ -1013,28 +1013,50 @@ mod tests {
         let mut v0 = Type::unknown();
         let mut v1 = Type::unknown();
         unify(&v0, &v1).unwrap();
-        v0.compress();
-        v1.compress();
-        assert_eq!(v0, v1);
+        assert_eq!(v0.compress(), v1.compress());
+    }
+    #[test]
+    fn left_unify_many_type_vars() {
+        let mut types = Vec::new();
+        for _ in 0..10 {
+            types.push(Type::unknown());
+        }
+        for i in 0..9 {
+            unify(&types[i], &types[i + 1]).unwrap();
+        }
+        unify(&types[9], &Type::unit()).unwrap();
+        assert_eq!(*types[0].compress(), Type::unit());
+    }
+    #[test]
+    fn right_unify_many_type_vars() {
+        let mut types = Vec::new();
+        for _ in 0..10 {
+            types.push(Type::unknown());
+        }
+        for i in 0..9 {
+            unify(&types[i + 1], &types[i]).unwrap();
+        }
+        unify(&types[9], &Type::unit()).unwrap();
+        assert_eq!(*types[0].compress(), Type::unit());
     }
     #[test]
     fn unify_fn_return_type() {
         let type_var_0 = Type::unknown();
-        let  f1 = Type::func(vec![], type_var_0);
-        let  f2 = Type::func(vec![], Type::int());
+        let mut f1 = Type::func(vec![], type_var_0);
+        let mut f2 = Type::func(vec![], Type::int());
         unify(&f1, &f2).unwrap();
 
-        assert_eq!(f1, f2);
+        assert_eq!(f1.compress(), f2.compress());
     }
     #[test]
     fn unify_fns() {
         let type_var_0 = Type::unknown();
         let type_var_1 = Type::unknown();
-        let f1 = Type::func(vec![type_var_0.clone()], type_var_0.clone());
-        let f2 = Type::func(vec![type_var_1], Type::int());
+        let mut f1 = Type::func(vec![type_var_0.clone()], type_var_0.clone());
+        let mut f2 = Type::func(vec![type_var_1], Type::int());
         unify(&f1, &f2).unwrap();
 
-        assert_eq!(f1, f2);
+        assert_eq!(f1.compress(), f2.compress());
     }
 
     #[test]

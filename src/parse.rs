@@ -219,10 +219,7 @@ fn build_type(node: &Node, source: &str) -> BuildResult<Type> {
                 }
                 // Skip 'fn', '(', ')', ',' tokens
             }
-            Ok(Type::func(
-                arg_types,
-                return_type.unwrap_or(Type::unit()),
-            ))
+            Ok(Type::func(arg_types, return_type.unwrap_or(Type::unit())))
         }
         // TODO: Named type support
         // "named_type" | "identifier" => Ok(Type::Named(get_node_text(node, source))), // Assuming Type::Named
