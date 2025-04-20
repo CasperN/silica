@@ -100,10 +100,10 @@ impl Expression {
     // context if one hasn't been created yet.
     fn unwrap_type(&mut self) -> &Type {
         match self {
-            Self::LiteralInt(_) => &Type::Int,
-            Self::LiteralBool(_) => &Type::Bool,
-            Self::LiteralFloat(_) => &Type::Float,
-            Self::LiteralUnit => &Type::Unit,
+            Self::LiteralInt(_) => &Type(TypeI::Int),
+            Self::LiteralBool(_) => &Type(TypeI::Bool),
+            Self::LiteralFloat(_) => &Type(TypeI::Float),
+            Self::LiteralUnit => &Type(TypeI::Unit),
             Self::L(_, ty)
             | Self::If { ty, .. }
             | Self::Block { ty, .. }
@@ -261,9 +261,9 @@ pub struct FnDecl {
 impl FnDecl {
     fn as_type(&self) -> Type {
         let arg_types = self.args.iter().map(|b| b.ty.clone()).collect();
-        Type::Forall(
+        Type::forall(
             self.forall.clone(),
-            Box::new(Type::Fn(arg_types, Box::new(self.return_type.clone()))),
+            Type::func(arg_types, self.return_type.clone()),
         )
     }
 }
@@ -328,7 +328,10 @@ impl StructInstance {
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
-pub(crate) enum Type {
+pub struct Type(TypeI);
+
+#[derive(Default, Debug, Clone, PartialEq)]
+enum TypeI {
     Var(TypeVar),
     Param(u32),
     Int,
@@ -340,66 +343,102 @@ pub(crate) enum Type {
     Forall(Vec<u32>, Box<Type>),
     StructInstance(StructInstance),
 }
-impl Type {
+impl TypeI {
     fn contains_type_var(&self, type_var: TypeVar) -> bool {
         match self {
-            Self::Int | Self::Bool | Self::Float | Self::Unit | Self::Param(_) => false,
-            Self::Var(self_type_var) => *self_type_var == type_var,
-            Self::Fn(arg_types, ret_ty) => {
+            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Param(_) => false,
+            TypeI::Var(self_type_var) => *self_type_var == type_var,
+            TypeI::Fn(arg_types, ret_ty) => {
                 arg_types.iter().any(|ty| ty.contains_type_var(type_var))
                     || ret_ty.contains_type_var(type_var)
             }
-            Self::Forall(_, ty) => ty.contains_type_var(type_var),
-            Self::StructInstance(StructInstance { params, decl: _ }) => {
+            TypeI::Forall(_, ty) => ty.contains_type_var(type_var),
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
                 params.values().any(|p| p.contains_type_var(type_var))
             }
         }
     }
+}
+
+impl Type {
+    pub fn bool_() -> Self {
+        Type(TypeI::Bool)
+    }
+    pub fn int() -> Self {
+        Type(TypeI::Int)
+    }
+    pub fn float() -> Self {
+        Type(TypeI::Float)
+    }
+    pub fn unit() -> Self {
+        Type(TypeI::Unit)
+    }
+    pub fn func(args: Vec<Type>, ret: Type) -> Self {
+        Type(TypeI::Fn(args, Box::new(ret)))
+    }
+    pub fn param(id: u32) -> Self {
+        Self(TypeI::Param(id))
+    }
+    pub fn variable(v: u32) -> Self {
+        Self(TypeI::Var(TypeVar(v)))
+    }
+    pub fn forall(params: Vec<u32>, ty: Type) -> Self {
+        Self(TypeI::Forall(params, Box::new(ty)))
+    }
+    pub fn struct_(s: StructInstance) -> Self {
+        Self(TypeI::StructInstance(s))
+    }
+    fn inner(&self) -> &TypeI {
+        &self.0
+    }
+    fn contains_type_var(&self, type_var: TypeVar) -> bool {
+        self.0.contains_type_var(type_var)
+    }
     fn substitute(&mut self, subs: &Substitutions) {
-        match self {
-            Self::Int | Self::Bool | Self::Float | Self::Unit | Self::Param(_) => {}
-            Self::Var(tv) => {
+        match &mut self.0 {
+            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Param(_) => {}
+            TypeI::Var(tv) => {
                 if let Some(sub) = subs.0.get(tv) {
                     *self = sub.clone();
                 }
             }
-            Self::Fn(arg_types, ret_ty) => {
+            TypeI::Fn(arg_types, ret_ty) => {
                 for ty in arg_types.iter_mut() {
                     ty.substitute(subs);
                 }
                 ret_ty.substitute(subs);
             }
-            Self::Forall(_, ty) => {
+            TypeI::Forall(_, ty) => {
                 ty.substitute(subs);
             }
-            Self::StructInstance(struct_instance) => {
+            TypeI::StructInstance(struct_instance) => {
                 struct_instance.substitute(subs);
             }
         }
     }
     fn instantiate_with(&mut self, subs: &HashMap<u32, Type>) {
-        match self {
-            Self::Int | Self::Bool | Self::Float | Self::Unit => {}
-            Self::Param(b) => {
+        match &mut self.0 {
+            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit => {}
+            TypeI::Param(b) => {
                 *self = subs
                     .get(b)
                     .cloned()
                     .unwrap_or_else(|| panic!("Cannot instantiate type var {b}"));
             }
-            Self::Var(_) => {
+            TypeI::Var(_) => {
                 panic!("Instantiating a type with type vars");
             }
-            Self::Fn(arg_types, ret_ty) => {
+            TypeI::Fn(arg_types, ret_ty) => {
                 for ty in arg_types.iter_mut() {
                     ty.instantiate_with(subs);
                 }
                 ret_ty.instantiate_with(subs);
             }
-            Self::Forall(forall_vars, ty) => {
+            TypeI::Forall(forall_vars, ty) => {
                 forall_vars.retain(|forall_var| !subs.contains_key(forall_var));
                 ty.instantiate_with(subs);
             }
-            Self::StructInstance(StructInstance { params, decl: _ }) => {
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
                 for param in params.values_mut() {
                     param.instantiate_with(subs);
                 }
@@ -408,7 +447,7 @@ impl Type {
     }
     // Instantiates Forall types with new type variables.
     fn instantiate(self, context: &mut TypeContext) -> Self {
-        if let Self::Forall(params, mut ty) = self {
+        if let TypeI::Forall(params, mut ty) = self.0 {
             let mut subs = HashMap::new();
             for b in params {
                 subs.insert(b, context.new_type_var());
@@ -420,15 +459,15 @@ impl Type {
         }
     }
     fn is_polymorphic(&self) -> bool {
-        matches!(self, Self::Forall(_, _))
+        matches!(self.0, TypeI::Forall(_, _))
     }
     fn insert_type_params(&self, output: &mut HashSet<u32>) {
-        match self {
-            Self::Int | Self::Bool | Self::Float | Self::Unit | Self::Var(_) => {}
-            Self::Param(b) => {
+        match &self.0 {
+            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Var(_) => {}
+            TypeI::Param(b) => {
                 output.insert(*b);
             }
-            Self::Fn(arg_types, ret_ty) => {
+            TypeI::Fn(arg_types, ret_ty) => {
                 for arg_type in arg_types.iter() {
                     arg_type.insert_type_params(output);
                 }
@@ -436,11 +475,11 @@ impl Type {
             }
             // Free type variables are only asked for by struct generalization.
             // but we don't expect generic members.
-            Self::Forall(_, _) => panic!(
+            TypeI::Forall(_, _) => panic!(
                 "Free type variables are only asked for by struct generalization... \
                 but we don't expect generic members."
             ),
-            Self::StructInstance(StructInstance { params, decl: _ }) => {
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
                 for param in params.values() {
                     param.insert_type_params(output)
                 }
@@ -516,7 +555,7 @@ impl TypeContext {
     fn new_type_var(&mut self) -> Type {
         let v = self.next_type_var;
         self.next_type_var += 1;
-        Type::Var(TypeVar(v))
+        Type::variable(v)
     }
 }
 
@@ -637,20 +676,20 @@ enum Error {
 }
 
 fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
-    match (left, right) {
-        (Type::Int, Type::Int)
-        | (Type::Float, Type::Float)
-        | (Type::Bool, Type::Bool)
-        | (Type::Unit, Type::Unit) => Ok(Substitutions::new()),
-        (Type::Var(tv), ty) | (ty, Type::Var(tv)) => {
+    match (&left.0, &right.0) {
+        (TypeI::Int, TypeI::Int)
+        | (TypeI::Float, TypeI::Float)
+        | (TypeI::Bool, TypeI::Bool)
+        | (TypeI::Unit, TypeI::Unit) => Ok(Substitutions::new()),
+        (TypeI::Var(tv), ty) | (ty, TypeI::Var(tv)) => {
             if ty.contains_type_var(*tv) {
-                return Err(Error::InfiniteType(*tv, ty.clone()));
+                return Err(Error::InfiniteType(*tv, Type(ty.clone())));
             }
             let mut subs = Substitutions::new();
-            subs.insert(*tv, ty.clone());
+            subs.insert(*tv, Type(ty.clone()));
             Ok(subs)
         }
-        (Type::Fn(left_arg_types, left_ret_ty), Type::Fn(right_arg_types, right_ret_ty)) => {
+        (TypeI::Fn(left_arg_types, left_ret_ty), TypeI::Fn(right_arg_types, right_ret_ty)) => {
             if left_arg_types.len() != right_arg_types.len() {
                 return Err(Error::NotUnifiable(left.clone(), right.clone()));
             }
@@ -668,11 +707,11 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
             Ok(subs)
         }
         (
-            Type::StructInstance(StructInstance {
+            TypeI::StructInstance(StructInstance {
                 params: left_params,
                 decl: left_decl,
             }),
-            Type::StructInstance(StructInstance {
+            TypeI::StructInstance(StructInstance {
                 params: right_params,
                 decl: right_decl,
             }),
@@ -720,7 +759,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             let mut subs = infer(context, expr)?;
             expr.substitute(&subs);
             let ty = ty.as_mut().unwrap();
-            if let Type::StructInstance(struct_instance) = expr.unwrap_type() {
+            if let TypeI::StructInstance(struct_instance) = expr.unwrap_type().inner() {
                 let field_type = struct_instance.field_type(field)?;
                 subs.and_then(&unify(&field_type, ty)?);
                 ty.substitute(&subs);
@@ -745,7 +784,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                 struct_instance.substitute(&subs);
             }
             let ty = ty.as_mut().unwrap();
-            subs.and_then(&unify(ty, &Type::StructInstance(struct_instance))?);
+            subs.and_then(&unify(ty, &Type::struct_(struct_instance))?);
             ty.substitute(&subs);
             expression.substitute(&subs);
             Ok(subs)
@@ -758,7 +797,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
         } => {
             let mut subs = infer(context, condition)?;
             let cond_ty = condition.unwrap_type();
-            subs.and_then(&unify(cond_ty, &Type::Bool)?);
+            subs.and_then(&unify(cond_ty, &Type::bool_())?);
             condition.substitute(&subs);
 
             let t_subs = infer(context, true_expr)?;
@@ -799,7 +838,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             let return_type = return_type.as_mut().unwrap();
             subs.and_then(&unify(
                 fn_expr.unwrap_type(),
-                &Type::Fn(arg_types, Box::new(return_type.clone())),
+                &Type::func(arg_types, return_type.clone()),
             )?);
             fn_expr.substitute(&subs);
             return_type.substitute(&subs);
@@ -846,7 +885,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             let lambda_type = lambda_type.as_mut().unwrap();
             subs.and_then(&unify(
                 lambda_type,
-                &Type::Fn(arg_types, Box::new(lambda_return_type)),
+                &Type::func(arg_types, lambda_return_type),
             )?);
             lambda_type.substitute(&subs);
             shadow.finish();
@@ -858,7 +897,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
         } => {
             let mut subs = Substitutions::new();
             let mut shadow = context.shadow();
-            let mut last_statement_type = Type::Unit;
+            let mut last_statement_type = Type::unit();
             for statement in statements {
                 match statement {
                     Statement::Expression(expr) => {
@@ -883,7 +922,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                             value_type.clone(),
                             binding.mutable,
                         );
-                        last_statement_type = Type::Unit;
+                        last_statement_type = Type::unit();
                     }
                     Statement::Assign(LValue::Variable(name), expr) => {
                         let context = shadow.context();
@@ -903,7 +942,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                         subs.and_then(&unify(&expr_ty, &variable_info.ty)?);
                         context.substitute(&subs);
                         expr.substitute(&subs);
-                        last_statement_type = Type::Unit;
+                        last_statement_type = Type::unit();
                     }
                     Statement::Assign(LValue::Field(_, _), _) => {
                         todo!()
@@ -1110,22 +1149,22 @@ mod tests {
     #[test]
     fn substitution_and_then() {
         let mut s1 = Substitutions::new();
-        s1.insert(TypeVar(0), Type::Var(TypeVar(1)));
+        s1.insert(TypeVar(0), Type::variable(1));
         let mut s2 = Substitutions::new();
-        s2.insert(TypeVar(1), Type::Int);
+        s2.insert(TypeVar(1), Type::int());
         s1.and_then(&s2);
 
         let mut result = Substitutions::new();
-        result.insert(TypeVar(0), Type::Int);
-        result.insert(TypeVar(1), Type::Int);
+        result.insert(TypeVar(0), Type::int());
+        result.insert(TypeVar(1), Type::int());
 
         assert_eq!(s1, result);
     }
 
     #[test]
     fn unify_type_vars() {
-        let mut v0 = Type::Var(TypeVar(0));
-        let mut v1 = Type::Var(TypeVar(1));
+        let mut v0 = Type::variable(0);
+        let mut v1 = Type::variable(1);
         let u = unify(&v0, &v1).unwrap();
         v0.substitute(&u);
         v1.substitute(&u);
@@ -1133,9 +1172,9 @@ mod tests {
     }
     #[test]
     fn unify_fn_return_type() {
-        let type_var_0 = Type::Var(TypeVar(0));
-        let mut f1 = Type::Fn(vec![], Box::new(type_var_0));
-        let mut f2 = Type::Fn(vec![], Box::new(Type::Int));
+        let type_var_0 = Type::variable(0);
+        let mut f1 = Type::func(vec![], type_var_0);
+        let mut f2 = Type::func(vec![], Type::int());
         let u = unify(&f1, &f2).unwrap();
 
         f1.substitute(&u);
@@ -1144,10 +1183,10 @@ mod tests {
     }
     #[test]
     fn unify_fns() {
-        let type_var_0 = Type::Var(TypeVar(0));
-        let type_var_1 = Type::Var(TypeVar(1));
-        let mut f1 = Type::Fn(vec![type_var_0.clone()], Box::new(type_var_0.clone()));
-        let mut f2 = Type::Fn(vec![type_var_1], Box::new(Type::Int));
+        let type_var_0 = Type::variable(0);
+        let type_var_1 = Type::variable(1);
+        let mut f1 = Type::func(vec![type_var_0.clone()], type_var_0.clone());
+        let mut f2 = Type::func(vec![type_var_1], Type::int());
         let u = unify(&f1, &f2).unwrap();
 
         f1.substitute(&u);
@@ -1162,17 +1201,17 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: Some(block_expr(vec![
                     let_stmt("a", None, false, 2),
                     let_stmt("b", None, false, 2),
@@ -1194,7 +1233,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::Bool,
+            return_type: Type::bool_(),
             body: Some(block_expr(vec![
                 let_stmt("a", None, false, 2),
                 let_stmt("a", None, false, 2.0),
@@ -1210,8 +1249,8 @@ mod tests {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
             forall: vec![],
             name: "main".to_string(),
-            args: vec![TypedBinding::new("a", Type::Int, true)], // mutable.
-            return_type: Type::Unit,
+            args: vec![TypedBinding::new("a", Type::int(), true)], // mutable.
+            return_type: Type::unit(),
             body: Some(block_expr(vec![assign_stmt("a", 3)])),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
@@ -1222,7 +1261,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::Unit,
+            return_type: Type::unit(),
             body: Some(block_expr(vec![
                 let_stmt("a", None, true, 2),
                 assign_stmt("a", ()),
@@ -1230,7 +1269,7 @@ mod tests {
         })]);
         assert_eq!(
             typecheck_program(program),
-            Err(Error::NotUnifiable(Type::Unit, Type::Int))
+            Err(Error::NotUnifiable(Type::unit(), Type::int()))
         );
     }
     #[test]
@@ -1239,7 +1278,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::Unit,
+            return_type: Type::unit(),
             body: Some(block_expr(vec![
                 let_stmt("a", None, false, 2),
                 assign_stmt("a", 3),
@@ -1256,15 +1295,15 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "round".to_string(),
-                args: vec![TypedBinding::new("a", Type::Float, false)],
-                return_type: Type::Int,
+                args: vec![TypedBinding::new("a", Type::float(), false)],
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: Some(block_expr(vec![
                     let_stmt("a", None, false, true),
                     let_stmt("b", None, false, 2),
@@ -1282,17 +1321,17 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
@@ -1318,17 +1357,17 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Fn(vec![Type::Int], Box::new(Type::Int)),
+                return_type: Type::func(vec![Type::int()], Type::int()),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
@@ -1352,17 +1391,17 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Fn(vec![Type::Int], Box::new(Type::Int)),
+                return_type: Type::func(vec![Type::int()], Type::int()),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
@@ -1389,25 +1428,25 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec![0],
                 name: "id".to_string(),
-                args: vec![TypedBinding::new("a", Type::Param(0), false)],
-                return_type: Type::Param(0),
+                args: vec![TypedBinding::new("a", Type::param(0), false)],
+                return_type: Type::param(0),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Fn(vec![Type::Int], Box::new(Type::Int)),
+                return_type: Type::func(vec![Type::int()], Type::int()),
                 body: Some(block_expr(vec![call_expr(
                     "plus",
                     vec![
@@ -1427,15 +1466,15 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec![0],
                 name: "id".to_string(),
-                args: vec![TypedBinding::new("a", Type::Param(0), false)],
-                return_type: Type::Param(0),
+                args: vec![TypedBinding::new("a", Type::param(0), false)],
+                return_type: Type::param(0),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Float,
+                return_type: Type::float(),
                 body: Some(block_expr(vec![
                     let_stmt("x", None, false, call_expr("id", vec![12.34.into()])),
                     let_stmt("b", None, false, call_expr("id", vec![false.into()])),
@@ -1452,25 +1491,25 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec![0],
                 name: "id".to_string(),
-                args: vec![TypedBinding::new("a", Type::Param(0), false)],
-                return_type: Type::Param(0),
+                args: vec![TypedBinding::new("a", Type::param(0), false)],
+                return_type: Type::param(0),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Fn(vec![Type::Int], Box::new(Type::Int)),
+                return_type: Type::func(vec![Type::int()], Type::int()),
                 body: Some(block_expr(vec![call_expr(
                     "plus",
                     vec![
@@ -1491,7 +1530,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::Int,
+            return_type: Type::int(),
             body: Some(block_expr(vec![
                 // Explicit return in true branch, implicit return in false.
                 if_expr(true, block_expr(vec![return_stmt(2)]), 3).into(),
@@ -1505,7 +1544,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::Int,
+            return_type: Type::int(),
             body: Some(block_expr(vec![
                 // Explicit return in true branch, implicit return in false.
                 if_expr(true, block_expr(vec![return_stmt(2.5)]), 3).into(),
@@ -1522,7 +1561,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::Int,
+            return_type: Type::int(),
             body: Some(block_expr(vec![
                 // Explicit return in true branch, implicit return in false.
                 let_stmt(
@@ -1553,7 +1592,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::Unit,
+            return_type: Type::unit(),
             body: Some(block_expr(vec![])),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
@@ -1564,7 +1603,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::Unit,
+            return_type: Type::unit(),
             body: Some(block_expr(vec![
                 let_stmt("x", None, false, 1),
                 let_stmt("y", None, false, false),
@@ -1581,37 +1620,37 @@ mod tests {
                 forall: vec![],
                 name: "mul".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "sub".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "leq".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Bool,
+                return_type: Type::bool_(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "factorial".to_string(),
-                args: vec![TypedBinding::new("x", Type::Int, false)],
-                return_type: Type::Int,
+                args: vec![TypedBinding::new("x", Type::int(), false)],
+                return_type: Type::int(),
                 body: Some(if_expr(
                     call_expr("leq", vec!["x".into(), 1.into()]),
                     1,
@@ -1633,7 +1672,7 @@ mod tests {
 
     #[test]
     fn higher_order_functions() {
-        let fn_int_to_int = Type::Fn(vec![Type::Int], Box::new(Type::Int));
+        let fn_int_to_int = Type::func(vec![Type::int()], Type::int());
 
         let program = &mut Program(vec![
             // Declare external fn apply(f: fn(Int)->Int, x: Int) -> Int;
@@ -1642,16 +1681,16 @@ mod tests {
                 name: "apply".to_string(),
                 args: vec![
                     TypedBinding::new("f", fn_int_to_int.clone(), false),
-                    TypedBinding::new("x", Type::Int, false),
+                    TypedBinding::new("x", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None, // External
             }),
             // Declare external fn make_adder(y: Int) -> fn(Int)->Int;
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "make_adder".to_string(),
-                args: vec![TypedBinding::new("y", Type::Int, false)],
+                args: vec![TypedBinding::new("y", Type::int(), false)],
                 return_type: fn_int_to_int.clone(),
                 body: None, // External
             }),
@@ -1663,7 +1702,7 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: Some(block_expr(vec![
                     // let add_5 = make_adder(5)
                     let_stmt("add5", None, false, call_expr("make_adder", vec![5.into()])),
@@ -1679,7 +1718,7 @@ mod tests {
     fn struct_field_access() {
         let pair = StructDecl::new(
             "Pair",
-            &[("left", Type::Param(0)), ("right", Type::Param(1))],
+            &[("left", Type::param(0)), ("right", Type::param(1))],
         );
 
         let program = &mut Program(vec![
@@ -1688,7 +1727,7 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Bool,
+                return_type: Type::bool_(),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "p",

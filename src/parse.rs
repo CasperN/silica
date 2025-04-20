@@ -104,7 +104,7 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     let params = build_parameter_list(&params_node, source)?;
     let return_type = match return_type_node_opt {
         Some(n) => build_type(&n, source)?,
-        None => Type::Unit, // Default return type if not specified
+        None => Type::unit(), // Default return type if not specified
     };
 
     // Check if body is ';' (external) or a block expression
@@ -180,17 +180,17 @@ fn build_type(node: &Node, source: &str) -> BuildResult<Type> {
                 // "u16" => Ok(Type::U16),
                 // "i32" => Ok(Type::I32),
                 // "u32" => Ok(Type::U32),
-                // "i64" => Ok(Type::I64), // Was Type::Int
+                // "i64" => Ok(Type::I64), // Was Type::int()
                 // "u64" => Ok(Type::U64),
                 // "i128" => Ok(Type::I128),
                 // "u128" => Ok(Type::U128),
                 // "isize" => Ok(Type::Isize),
                 // "usize" => Ok(Type::Usize),
                 // "f64" => Ok(Type::F64), // Was Type::Float
-                "f64" => Ok(Type::Float),
-                "i64" => Ok(Type::Int),
-                "bool" => Ok(Type::Bool),
-                "unit" => Ok(Type::Unit),
+                "f64" => Ok(Type::float()),
+                "i64" => Ok(Type::int()),
+                "bool" => Ok(Type::bool_()),
+                "unit" => Ok(Type::unit()),
                 _ => Err(AstBuildError::Other(format!(
                     "Unknown primitive type: {}",
                     type_name
@@ -219,9 +219,9 @@ fn build_type(node: &Node, source: &str) -> BuildResult<Type> {
                 }
                 // Skip 'fn', '(', ')', ',' tokens
             }
-            Ok(Type::Fn(
+            Ok(Type::func(
                 arg_types,
-                Box::new(return_type.unwrap_or(Type::Unit)), // Default? Error?
+                return_type.unwrap_or(Type::unit()),
             ))
         }
         // TODO: Named type support
@@ -612,7 +612,7 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: Some(block_expr(vec![2.into()]))
             })]))
         );
@@ -634,17 +634,17 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
@@ -678,17 +678,17 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::Int, false),
-                    TypedBinding::new("b", Type::Int, false),
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
                 ],
-                return_type: Type::Int,
+                return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::Fn(vec![Type::Int], Box::new(Type::Int)),
+                return_type: Type::func(vec![Type::int()], Type::int()),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
