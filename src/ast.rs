@@ -98,12 +98,12 @@ impl Expression {
     }
     // Gets the type of the expression, assigning a new variable from the
     // context if one hasn't been created yet.
-    fn unwrap_type(&mut self) -> &Type {
+    fn unwrap_type(&mut self) -> Type {
         match self {
-            Self::LiteralInt(_) => &Type(TypeI::Int),
-            Self::LiteralBool(_) => &Type(TypeI::Bool),
-            Self::LiteralFloat(_) => &Type(TypeI::Float),
-            Self::LiteralUnit => &Type(TypeI::Unit),
+            Self::LiteralInt(_) => Type(TypeI::Int),
+            Self::LiteralBool(_) => Type(TypeI::Bool),
+            Self::LiteralFloat(_) => Type(TypeI::Float),
+            Self::LiteralUnit => Type(TypeI::Unit),
             Self::L(_, ty)
             | Self::If { ty, .. }
             | Self::Block { ty, .. }
@@ -119,7 +119,8 @@ impl Expression {
                 ty,
             } => ty
                 .as_ref()
-                .expect("unwrap_type called before ensure_type_initialized"),
+                .expect("unwrap_type called before ensure_type_initialized")
+                .clone(),
         }
     }
     fn substitute(&mut self, subs: &Substitutions) -> &mut Self {
@@ -779,7 +780,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                 let decl_ty = struct_instance.field_type(field_name)?;
                 subs.and_then(&infer(context, field_expr)?);
                 field_expr.substitute(&subs);
-                subs.and_then(&unify(field_expr.unwrap_type(), &decl_ty)?);
+                subs.and_then(&unify(&field_expr.unwrap_type(), &decl_ty)?);
                 field_expr.substitute(&subs);
                 struct_instance.substitute(&subs);
             }
@@ -797,7 +798,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
         } => {
             let mut subs = infer(context, condition)?;
             let cond_ty = condition.unwrap_type();
-            subs.and_then(&unify(cond_ty, &Type::bool_())?);
+            subs.and_then(&unify(&cond_ty, &Type::bool_())?);
             condition.substitute(&subs);
 
             let t_subs = infer(context, true_expr)?;
@@ -810,7 +811,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
 
             let t_ty = true_expr.unwrap_type();
             let f_ty = false_expr.unwrap_type();
-            subs.and_then(&unify(t_ty, f_ty)?);
+            subs.and_then(&unify(&t_ty, &f_ty)?);
 
             Ok(subs)
         }
@@ -837,7 +838,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
 
             let return_type = return_type.as_mut().unwrap();
             subs.and_then(&unify(
-                fn_expr.unwrap_type(),
+                &fn_expr.unwrap_type(),
                 &Type::func(arg_types, return_type.clone()),
             )?);
             fn_expr.substitute(&subs);
@@ -866,7 +867,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                 shadow.insert_soft_binding(binding.clone());
             }
             let mut subs = infer(shadow.context(), body)?;
-            subs.and_then(&unify(body.unwrap_type(), &lambda_return_type)?);
+            subs.and_then(&unify(&body.unwrap_type(), &lambda_return_type)?);
 
             body.substitute(&subs);
             shadow.context().substitute(&subs);
@@ -950,7 +951,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                     Statement::Return(expr) => {
                         let e_subs = infer(shadow.context(), expr)?;
                         subs.and_then(&e_subs);
-                        subs.and_then(&unify(expr.unwrap_type(), &shadow.context().return_type)?);
+                        subs.and_then(&unify(&expr.unwrap_type(), &shadow.context().return_type)?);
                         last_statement_type = expr.unwrap_type().clone();
                         // TODO: Probably should issue a warning for unreachable statements.
                     }
@@ -1013,7 +1014,7 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 }
                 shadow.set_return_type(return_type.clone());
                 infer(shadow.context(), body)?;
-                unify(return_type, body.unwrap_type())?;
+                unify(return_type, &body.unwrap_type())?;
                 shadow.finish();
             }
             Declaration::Struct(_) => {}
