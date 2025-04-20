@@ -1,5 +1,6 @@
 // Abstract syntax tree and type checking.
 
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -16,17 +17,6 @@ impl std::fmt::Debug for TypeVar {
 pub enum LValue {
     Variable(String),
     Field(Box<Expression>, String), // Deref, Field access, etc
-}
-
-impl LValue {
-    fn substitute(&mut self, subs: &Substitutions) {
-        match self {
-            Self::Variable(_) => {}
-            Self::Field(expr, _field_name) => {
-                expr.substitute(subs);
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,10 +90,10 @@ impl Expression {
     // context if one hasn't been created yet.
     fn unwrap_type(&mut self) -> Type {
         match self {
-            Self::LiteralInt(_) => Type(TypeI::Int),
-            Self::LiteralBool(_) => Type(TypeI::Bool),
-            Self::LiteralFloat(_) => Type(TypeI::Float),
-            Self::LiteralUnit => Type(TypeI::Unit),
+            Self::LiteralInt(_) => Type::int(),
+            Self::LiteralBool(_) => Type::bool_(),
+            Self::LiteralFloat(_) => Type::float(),
+            Self::LiteralUnit => Type::unit(),
             Self::L(_, ty)
             | Self::If { ty, .. }
             | Self::Block { ty, .. }
@@ -118,90 +108,11 @@ impl Expression {
                 fields: _,
                 ty,
             } => ty
-                .as_ref()
+                .as_mut()
                 .expect("unwrap_type called before ensure_type_initialized")
+                .compress()
                 .clone(),
         }
-    }
-    fn substitute(&mut self, subs: &Substitutions) -> &mut Self {
-        let unwrap_and_substitute = |option_ty: &mut Option<Type>| {
-            option_ty
-                .as_mut()
-                .expect("Substituting type vars in an expression before ensure_type_initialized was called.")
-                .substitute(subs);
-        };
-        match self {
-            Self::LiteralInt(_)
-            | Self::LiteralBool(_)
-            | Self::LiteralFloat(_)
-            | Self::LiteralUnit => {}
-            Self::L(lvalue, ty) => {
-                lvalue.substitute(subs);
-                unwrap_and_substitute(ty);
-            }
-            Self::If {
-                condition,
-                true_expr,
-                false_expr,
-                ty,
-            } => {
-                condition.substitute(subs);
-                true_expr.substitute(subs);
-                false_expr.substitute(subs);
-                unwrap_and_substitute(ty)
-            }
-            Self::Call {
-                fn_expr,
-                arg_exprs,
-                return_type,
-            } => {
-                fn_expr.substitute(subs);
-                for arg_expr in arg_exprs {
-                    arg_expr.substitute(subs);
-                }
-                unwrap_and_substitute(return_type);
-            }
-            Self::Lambda {
-                bindings: _,
-                body,
-                lambda_type,
-            } => {
-                body.substitute(subs);
-                unwrap_and_substitute(lambda_type);
-            }
-            Self::Block { statements, ty } => {
-                for statement in statements {
-                    match statement {
-                        Statement::Expression(expr)
-                        | Statement::Return(expr)
-                        | Statement::Let {
-                            binding: _,
-                            value: expr,
-                        } => {
-                            expr.substitute(subs);
-                        }
-                        Statement::Assign(lvalue, expr) => {
-                            lvalue.substitute(subs);
-                            expr.substitute(subs);
-                        }
-                    }
-                }
-                unwrap_and_substitute(ty)
-            }
-            Self::LiteralStruct {
-                name: _,
-                fields,
-                ty,
-            } => {
-                for field_expr in fields.values_mut() {
-                    field_expr.substitute(subs);
-                }
-                ty.as_mut()
-                    .expect("Substituting before type vars initialized.")
-                    .substitute(subs);
-            }
-        }
-        self
     }
 }
 
@@ -321,19 +232,23 @@ impl StructInstance {
             Err(Error::UnrecognizedField(field.to_string()))
         }
     }
-    fn substitute(&mut self, subs: &Substitutions) {
-        for param in self.params.values_mut() {
-            param.substitute(subs);
-        }
+}
+
+#[derive(Default, Clone, PartialEq)]
+pub struct Type(Rc<RefCell<TypeI>>);
+
+// Make it transparent over the contents.
+impl std::fmt::Debug for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner();
+        write!(f, "{inner:?}")
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq)]
-pub struct Type(TypeI);
 
 #[derive(Default, Debug, Clone, PartialEq)]
 enum TypeI {
-    Var(TypeVar),
+    Var(TypeVar), // TODO: Delete this.
     Param(u32),
     Int,
     Bool,
@@ -343,11 +258,16 @@ enum TypeI {
     Fn(Vec<Type>, Box<Type>),
     Forall(Vec<u32>, Box<Type>),
     StructInstance(StructInstance),
+
+    // The Follow variant means this type was an unknown type variable
+    // and now aliases another.
+    Follow(Type),
 }
 impl TypeI {
     fn contains_type_var(&self, type_var: TypeVar) -> bool {
         match self {
             TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Param(_) => false,
+            TypeI::Follow(ty) => ty.contains_type_var(type_var),
             TypeI::Var(self_type_var) => *self_type_var == type_var,
             TypeI::Fn(arg_types, ret_ty) => {
                 arg_types.iter().any(|ty| ty.contains_type_var(type_var))
@@ -362,69 +282,142 @@ impl TypeI {
 }
 
 impl Type {
+    fn new(i: TypeI) -> Self {
+        Self(Rc::new(RefCell::new(i)))
+    }
     pub fn bool_() -> Self {
-        Type(TypeI::Bool)
+        Self::new(TypeI::Bool)
     }
     pub fn int() -> Self {
-        Type(TypeI::Int)
+        Self::new(TypeI::Int)
     }
     pub fn float() -> Self {
-        Type(TypeI::Float)
+        Self::new(TypeI::Float)
     }
     pub fn unit() -> Self {
-        Type(TypeI::Unit)
+        Self::new(TypeI::Unit)
     }
     pub fn func(args: Vec<Type>, ret: Type) -> Self {
-        Type(TypeI::Fn(args, Box::new(ret)))
+        Self::new(TypeI::Fn(args, Box::new(ret)))
     }
     pub fn param(id: u32) -> Self {
-        Self(TypeI::Param(id))
+        Self::new(TypeI::Param(id))
     }
     pub fn variable(v: u32) -> Self {
-        Self(TypeI::Var(TypeVar(v)))
+        Self::new(TypeI::Var(TypeVar(v)))
     }
     pub fn forall(params: Vec<u32>, ty: Type) -> Self {
-        Self(TypeI::Forall(params, Box::new(ty)))
+        Self::new(TypeI::Forall(params, Box::new(ty)))
     }
     pub fn struct_(s: StructInstance) -> Self {
-        Self(TypeI::StructInstance(s))
+        Self::new(TypeI::StructInstance(s))
     }
-    fn inner(&self) -> &TypeI {
-        &self.0
+    fn inner(&self) -> std::cell::Ref<TypeI> {
+        self.0.borrow()
     }
-    fn contains_type_var(&self, type_var: TypeVar) -> bool {
-        self.0.contains_type_var(type_var)
-    }
-    fn substitute(&mut self, subs: &Substitutions) {
-        match &mut self.0 {
-            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Param(_) => {}
-            TypeI::Var(tv) => {
-                if let Some(sub) = subs.0.get(tv) {
-                    *self = sub.clone();
+    // Recursively compresses away any instances of `Follow` in the type.
+    fn compress(&mut self) -> &mut Self {
+        self.compress_direct_path();
+        match &mut *self.0.borrow_mut(){
+            TypeI::Bool | TypeI::Float | TypeI::Int
+            | TypeI::Unit | TypeI::Var(_) | TypeI::Param(_) => {}
+            TypeI::Follow(_) => unreachable!(),  // compress direct path.
+            TypeI::Fn(args, ret) => {
+                for arg in args.iter_mut() {
+                    arg.compress_direct_path();
+                    arg.compress();
                 }
-            }
-            TypeI::Fn(arg_types, ret_ty) => {
-                for ty in arg_types.iter_mut() {
-                    ty.substitute(subs);
-                }
-                ret_ty.substitute(subs);
+                ret.compress_direct_path();
+                ret.compress();
             }
             TypeI::Forall(_, ty) => {
-                ty.substitute(subs);
+                ty.compress_direct_path();
+                ty.compress();
             }
-            TypeI::StructInstance(struct_instance) => {
-                struct_instance.substitute(subs);
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
+                for param_type in params.values_mut() {
+                    param_type.compress_direct_path();
+                    param_type.compress();
+                }
+            }
+        }
+        self
+    }
+    // Compresses Follow paths (e.g. Follow(Follow(T)) -> T ).
+    fn compress_direct_path(&mut self) -> &mut Self {
+        // Fast path, we're not following anyone.
+        if !matches!(&*self.inner(), TypeI::Follow(_)) {
+            return self;
+        }
+        // Follow the type references to the end.
+        let mut end = self.clone();
+        loop {
+            let next = if let TypeI::Follow(other) = &*end.0.borrow() {
+                other.clone()
+            } else {
+                break;
+            };
+            end = next;
+        }
+        // Traverse the path again and make everyone point to end.
+        let mut follower = self.clone();
+        loop {
+            let next = if let TypeI::Follow(other) = &*follower.0.borrow() {
+                other.clone()
+            } else {
+                break;
+            };
+            *follower.0.borrow_mut() = TypeI::Follow(end.clone());
+            follower = next;
+        }
+        // This Type can point to the end-type, omitting any Follow nodes.
+        *self = end.clone();
+        self
+    }
+    fn contains_type_var(&self, type_var: TypeVar) -> bool {
+        self.inner().contains_type_var(type_var)
+    }
+    fn contains_ptr(&self, other: &Type) -> bool {
+        if Rc::ptr_eq(&self.0, &other.0) {
+            return true;
+        }
+        match &*self.0.borrow() {
+            TypeI::Int
+            | TypeI::Bool
+            | TypeI::Float
+            | TypeI::Unit
+            | TypeI::Param(_)
+            | TypeI::Var(_) => false,
+            TypeI::Follow(ty) => ty.contains_ptr(other),
+            TypeI::Forall(_, ty) => ty.contains_ptr(other),
+            TypeI::Fn(arg_types, ret_type) => {
+                arg_types.iter().any(|a| a.contains_ptr(other)) || ret_type.contains_ptr(other)
+            }
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
+                // We assume that declarations cannot contain unification cycles,
+                // so just check the params.
+                params.values().any(|p| p.contains_ptr(other))
             }
         }
     }
+    fn point_to(&mut self, other: &Self) -> Result<(), Error> {
+        if other.contains_ptr(self) {
+            return Err(Error::InfiniteType(TypeVar(1995), Type::unit()));
+        }
+        *self.0.borrow_mut() = TypeI::Follow(other.clone());
+        Ok(())
+    }
+
     fn instantiate_with(&mut self, subs: &HashMap<u32, Type>) {
-        match &mut self.0 {
+        let mut i = self.inner().clone();
+        match &mut i {
             TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit => {}
             TypeI::Param(b) => {
                 *self = subs
                     .get(b)
                     .cloned()
                     .unwrap_or_else(|| panic!("Cannot instantiate type var {b}"));
+                return;
             }
             TypeI::Var(_) => {
                 panic!("Instantiating a type with type vars");
@@ -444,11 +437,14 @@ impl Type {
                     param.instantiate_with(subs);
                 }
             }
+            TypeI::Follow(_) => panic!("TypeI::Follow used."),
         }
+        *self = Self::new(i)
     }
     // Instantiates Forall types with new type variables.
     fn instantiate(self, context: &mut TypeContext) -> Self {
-        if let TypeI::Forall(params, mut ty) = self.0 {
+        let i = self.inner().clone();
+        if let TypeI::Forall(params, mut ty) = i {
             let mut subs = HashMap::new();
             for b in params {
                 subs.insert(b, context.new_type_var());
@@ -460,10 +456,10 @@ impl Type {
         }
     }
     fn is_polymorphic(&self) -> bool {
-        matches!(self.0, TypeI::Forall(_, _))
+        matches!(&*self.inner(), TypeI::Forall(_, _))
     }
     fn insert_type_params(&self, output: &mut HashSet<u32>) {
-        match &self.0 {
+        match &*self.inner() {
             TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Var(_) => {}
             TypeI::Param(b) => {
                 output.insert(*b);
@@ -485,6 +481,7 @@ impl Type {
                     param.insert_type_params(output)
                 }
             }
+            TypeI::Follow(_) => panic!("TypeI::Follow used."),
         }
     }
 }
@@ -530,14 +527,6 @@ impl TypeContext {
             params.insert(*param_id, self.new_type_var());
         }
         Ok(StructInstance { params, decl })
-    }
-
-    fn substitute(&mut self, subs: &Substitutions) {
-        for name in self.names.values_mut() {
-            if let NamedItem::Variable(var) = name {
-                var.ty.substitute(subs);
-            }
-        }
     }
     // Variables should be inserted via the returned shadow, which
     // is a context-guard that when finished, undoes any insertions.
@@ -641,27 +630,6 @@ impl<'a> Drop for ShadowTypeContext<'a> {
     }
 }
 
-#[derive(Debug, Default, PartialEq)]
-struct Substitutions(HashMap<TypeVar, Type>);
-impl Substitutions {
-    fn new() -> Self {
-        Self::default()
-    }
-    // Applies `other` after `self`.
-    fn and_then(&mut self, other: &Self) -> &mut Self {
-        for ty in self.0.values_mut() {
-            ty.substitute(other);
-        }
-        for (tv, ty) in other.0.iter() {
-            self.0.insert(*tv, ty.clone());
-        }
-        self
-    }
-    fn insert(&mut self, tv: TypeVar, ty: Type) {
-        self.0.insert(tv, ty);
-    }
-}
-
 #[derive(PartialEq, Debug)]
 enum Error {
     UnknownName(String),
@@ -676,36 +644,42 @@ enum Error {
     FieldAccessToNonStruct(Expression, String),
 }
 
-fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
-    match (&left.0, &right.0) {
+// Unifies two types via interior mutability.
+// Errors if the types ae not unifiable.
+fn unify(left: &Type, right: &Type) -> Result<(), Error> {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.compress();
+    right.compress();
+
+    // `.inner` borrows from the Refcell. That borrow must end before
+    // `point_to` runs, which borrows mutably. Hence, we use a
+    // matches! statement instead of handling this case in the match.
+    if matches!(&*left.inner(), TypeI::Var(_)) {
+        left.point_to(&right)?;
+        return Ok(());
+    }
+    if matches!(&*right.inner(), TypeI::Var(_)) {
+        right.point_to(&left)?;
+        return Ok(());
+    }
+    // Assign the std::Rc::Ref RAII objects.
+    // They can't be temporaries in the match statement.
+    let result = match (&*left.inner(), &*right.inner()) {
         (TypeI::Int, TypeI::Int)
         | (TypeI::Float, TypeI::Float)
         | (TypeI::Bool, TypeI::Bool)
-        | (TypeI::Unit, TypeI::Unit) => Ok(Substitutions::new()),
-        (TypeI::Var(tv), ty) | (ty, TypeI::Var(tv)) => {
-            if ty.contains_type_var(*tv) {
-                return Err(Error::InfiniteType(*tv, Type(ty.clone())));
-            }
-            let mut subs = Substitutions::new();
-            subs.insert(*tv, Type(ty.clone()));
-            Ok(subs)
-        }
+        | (TypeI::Unit, TypeI::Unit) => Ok(()),
         (TypeI::Fn(left_arg_types, left_ret_ty), TypeI::Fn(right_arg_types, right_ret_ty)) => {
             if left_arg_types.len() != right_arg_types.len() {
                 return Err(Error::NotUnifiable(left.clone(), right.clone()));
             }
-            let mut subs = unify(left_ret_ty, right_ret_ty)?;
-            // TODO: Inefficient cloning. Maybe unify should mutate types in place?
-            let zipped = left_arg_types
-                .iter()
-                .cloned()
-                .zip(right_arg_types.iter().cloned());
-            for (mut left_arg_ty, mut right_arg_ty) in zipped {
-                left_arg_ty.substitute(&subs);
-                right_arg_ty.substitute(&subs);
-                subs.and_then(&unify(&left_arg_ty, &right_arg_ty)?);
+            unify(left_ret_ty, right_ret_ty)?;
+            let zipped = left_arg_types.iter().zip(right_arg_types.iter().cloned());
+            for (left_arg_ty, right_arg_ty) in zipped {
+                unify(&left_arg_ty, &right_arg_ty)?;
             }
-            Ok(subs)
+            Ok(())
         }
         (
             TypeI::StructInstance(StructInstance {
@@ -717,7 +691,6 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
                 decl: right_decl,
             }),
         ) if left_decl == right_decl => {
-            let mut subs = Substitutions::new();
             assert_eq!(left_params.len(), right_params.len());
             for (param_id, left_ty) in left_params.iter() {
                 let right_ty = right_params.get(param_id).unwrap_or_else(|| {
@@ -727,28 +700,28 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
                         Left:{left:?}, Right:{right:?}"
                     )
                 });
-                let mut left_ty = left_ty.clone();
-                let mut right_ty = right_ty.clone();
-                left_ty.substitute(&subs);
-                right_ty.substitute(&subs);
-                subs.and_then(&unify(&left_ty, &right_ty)?);
+                unify(&left_ty, &right_ty)?
             }
-            Ok(subs)
+            Ok(())
         }
         _ => Err(Error::NotUnifiable(left.clone(), right.clone())),
-    }
+    };
+    left.compress();
+    right.compress();
+    result
 }
 
-fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Substitutions, Error> {
+// Infers the type of the given expression in the given context.
+// Mutates the expression to set the type.
+fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), Error> {
     expression.ensure_type_initialized(context);
     match expression {
         Expression::L(LValue::Variable(name), ty) => {
             let ty = ty.as_mut().unwrap();
             if let Some(info) = context.variable_info(name) {
                 if info.ty.is_polymorphic() {
-                    let subs = unify(ty, &info.ty.clone().instantiate(context))?;
-                    ty.substitute(&subs);
-                    Ok(subs)
+                    unify(ty, &info.ty.clone().instantiate(context))?;
+                    Ok(())
                 } else {
                     unify(ty, &info.ty)
                 }
@@ -757,38 +730,30 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             }
         }
         Expression::L(LValue::Field(expr, field), ty) => {
-            let mut subs = infer(context, expr)?;
-            expr.substitute(&subs);
+            infer(context, expr)?;
             let ty = ty.as_mut().unwrap();
-            if let TypeI::StructInstance(struct_instance) = expr.unwrap_type().inner() {
+            if let TypeI::StructInstance(struct_instance) = &*expr.unwrap_type().inner() {
                 let field_type = struct_instance.field_type(field)?;
-                subs.and_then(&unify(&field_type, ty)?);
-                ty.substitute(&subs);
+                unify(&field_type, ty)?;
             } else {
                 return Err(Error::FieldAccessToNonStruct(*expr.clone(), field.clone()));
             }
-            Ok(subs)
+            Ok(())
         }
-        Expression::LiteralUnit => Ok(Substitutions::new()),
-        Expression::LiteralInt(_) => Ok(Substitutions::new()),
-        Expression::LiteralBool(_) => Ok(Substitutions::new()),
-        Expression::LiteralFloat(_) => Ok(Substitutions::new()),
+        Expression::LiteralUnit => Ok(()),
+        Expression::LiteralInt(_) => Ok(()),
+        Expression::LiteralBool(_) => Ok(()),
+        Expression::LiteralFloat(_) => Ok(()),
         Expression::LiteralStruct { name, fields, ty } => {
-            let mut struct_instance = context.instantiate_struct(name)?;
-            let mut subs = Substitutions::new();
+            let struct_instance = context.instantiate_struct(name)?;
             for (field_name, field_expr) in fields.iter_mut() {
                 let decl_ty = struct_instance.field_type(field_name)?;
-                subs.and_then(&infer(context, field_expr)?);
-                field_expr.substitute(&subs);
-                subs.and_then(&unify(&field_expr.unwrap_type(), &decl_ty)?);
-                field_expr.substitute(&subs);
-                struct_instance.substitute(&subs);
+                infer(context, field_expr)?;
+                unify(&field_expr.unwrap_type(), &decl_ty)?;
             }
             let ty = ty.as_mut().unwrap();
-            subs.and_then(&unify(ty, &Type::struct_(struct_instance))?);
-            ty.substitute(&subs);
-            expression.substitute(&subs);
-            Ok(subs)
+            unify(ty, &Type::struct_(struct_instance))?;
+            Ok(())
         }
         Expression::If {
             condition,
@@ -796,59 +761,37 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             false_expr,
             ty: _,
         } => {
-            let mut subs = infer(context, condition)?;
+            infer(context, condition)?;
             let cond_ty = condition.unwrap_type();
-            subs.and_then(&unify(&cond_ty, &Type::bool_())?);
-            condition.substitute(&subs);
+            unify(&cond_ty, &Type::bool_())?;
 
-            let t_subs = infer(context, true_expr)?;
-            subs.and_then(&t_subs);
-            true_expr.substitute(&subs);
-
-            let f_subs = infer(context, false_expr)?;
-            subs.and_then(&f_subs);
-            false_expr.substitute(&subs);
-
+            infer(context, true_expr)?;
+            infer(context, false_expr)?;
             let t_ty = true_expr.unwrap_type();
             let f_ty = false_expr.unwrap_type();
-            subs.and_then(&unify(&t_ty, &f_ty)?);
+            unify(&t_ty, &f_ty)?;
 
-            Ok(subs)
+            Ok(())
         }
         Expression::Call {
             fn_expr,
             arg_exprs,
             return_type,
         } => {
-            let mut subs = Substitutions::new();
-            let fn_subs = infer(context, fn_expr)?;
-            subs.and_then(&fn_subs);
-            fn_expr.substitute(&subs);
+            infer(context, fn_expr)?;
 
             let mut arg_types = vec![];
             for arg_expr in arg_exprs.iter_mut() {
-                let arg_subs = infer(context, arg_expr)?;
-                subs.and_then(&arg_subs);
-                arg_expr.substitute(&subs);
-                context.substitute(&subs);
+                infer(context, arg_expr)?;
                 arg_types.push(arg_expr.unwrap_type().clone());
             }
-            fn_expr.substitute(&subs);
-            context.substitute(&subs);
 
             let return_type = return_type.as_mut().unwrap();
-            subs.and_then(&unify(
+            unify(
                 &fn_expr.unwrap_type(),
                 &Type::func(arg_types, return_type.clone()),
-            )?);
-            fn_expr.substitute(&subs);
-            return_type.substitute(&subs);
-            context.substitute(&subs);
-            for arg_expr in arg_exprs.iter_mut() {
-                arg_expr.substitute(&subs);
-            }
-            fn_expr.substitute(&subs);
-            Ok(subs)
+            )?;
+            Ok(())
         }
         Expression::Lambda {
             bindings,
@@ -859,19 +802,15 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             if arg_name_set.len() != bindings.len() {
                 return Err(Error::DuplicateArgNames(expression.clone()));
             }
-            let mut lambda_return_type = context.new_type_var();
+            let lambda_return_type = context.new_type_var();
             let mut shadow = context.shadow();
             shadow.set_return_type(lambda_return_type.clone());
 
             for binding in bindings.iter() {
                 shadow.insert_soft_binding(binding.clone());
             }
-            let mut subs = infer(shadow.context(), body)?;
-            subs.and_then(&unify(&body.unwrap_type(), &lambda_return_type)?);
-
-            body.substitute(&subs);
-            shadow.context().substitute(&subs);
-            lambda_return_type.substitute(&subs);
+            infer(shadow.context(), body)?;
+            unify(&body.unwrap_type(), &lambda_return_type)?;
 
             let mut arg_types = Vec::new();
             for binding in bindings.iter() {
@@ -884,40 +823,32 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                 arg_types.push(arg_type);
             }
             let lambda_type = lambda_type.as_mut().unwrap();
-            subs.and_then(&unify(
+            unify(
                 lambda_type,
                 &Type::func(arg_types, lambda_return_type),
-            )?);
-            lambda_type.substitute(&subs);
+            )?;
             shadow.finish();
-            Ok(subs)
+            Ok(())
         }
         Expression::Block {
             statements,
             ty: block_ty,
         } => {
-            let mut subs = Substitutions::new();
             let mut shadow = context.shadow();
             let mut last_statement_type = Type::unit();
             for statement in statements {
                 match statement {
                     Statement::Expression(expr) => {
-                        let e_subs = infer(shadow.context(), expr)?;
-                        subs.and_then(&e_subs);
-                        expr.substitute(&subs);
+                        infer(shadow.context(), expr)?;
                         last_statement_type = expr.unwrap_type().clone();
                     }
                     Statement::Let { binding, value } => {
                         let context = shadow.context();
-                        let value_subs = infer(context, value)?;
-                        subs.and_then(&value_subs);
-                        value.substitute(&subs);
+                        infer(context, value)?;
                         let value_type = value.unwrap_type().clone();
                         if let Some(binding_ty) = &binding.ty {
-                            subs.and_then(&(unify(binding_ty, &value_type))?);
+                            unify(binding_ty, &value_type)?;
                         }
-                        context.substitute(&subs);
-                        value.substitute(&subs);
                         shadow.insert_variable(
                             binding.name.clone(),
                             value_type.clone(),
@@ -927,9 +858,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                     }
                     Statement::Assign(LValue::Variable(name), expr) => {
                         let context = shadow.context();
-                        let e_subs = infer(context, expr)?;
-                        subs.and_then(&e_subs);
-                        let expr_ty = expr.substitute(&subs).unwrap_type().clone();
+                        infer(context, expr)?;
 
                         // Check whether the expession can be assigned to the variable.
                         let variable_info = context.variable_info(name);
@@ -940,26 +869,23 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
                         if !variable_info.mutable {
                             return Err(Error::AssignToImmutableBinding(name.to_string()));
                         }
-                        subs.and_then(&unify(&expr_ty, &variable_info.ty)?);
-                        context.substitute(&subs);
-                        expr.substitute(&subs);
+                        unify(&expr.unwrap_type(), &variable_info.ty)?;
                         last_statement_type = Type::unit();
                     }
                     Statement::Assign(LValue::Field(_, _), _) => {
                         todo!()
                     }
                     Statement::Return(expr) => {
-                        let e_subs = infer(shadow.context(), expr)?;
-                        subs.and_then(&e_subs);
-                        subs.and_then(&unify(&expr.unwrap_type(), &shadow.context().return_type)?);
+                        infer(shadow.context(), expr)?;
+                        unify(&expr.unwrap_type(), &shadow.context().return_type)?;
                         last_statement_type = expr.unwrap_type().clone();
                         // TODO: Probably should issue a warning for unreachable statements.
                     }
                 }
             }
-            subs.and_then(&unify(block_ty.as_ref().unwrap(), &last_statement_type)?);
+            unify(block_ty.as_ref().unwrap(), &last_statement_type)?;
             shadow.finish();
-            Ok(subs)
+            Ok(())
         }
     }
 }
@@ -1147,51 +1073,33 @@ pub mod test_helpers {
 mod tests {
     use super::test_helpers::*;
     use super::*;
-    #[test]
-    fn substitution_and_then() {
-        let mut s1 = Substitutions::new();
-        s1.insert(TypeVar(0), Type::variable(1));
-        let mut s2 = Substitutions::new();
-        s2.insert(TypeVar(1), Type::int());
-        s1.and_then(&s2);
-
-        let mut result = Substitutions::new();
-        result.insert(TypeVar(0), Type::int());
-        result.insert(TypeVar(1), Type::int());
-
-        assert_eq!(s1, result);
-    }
 
     #[test]
     fn unify_type_vars() {
         let mut v0 = Type::variable(0);
         let mut v1 = Type::variable(1);
-        let u = unify(&v0, &v1).unwrap();
-        v0.substitute(&u);
-        v1.substitute(&u);
+        unify(&v0, &v1).unwrap();
+        v0.compress();
+        v1.compress();
         assert_eq!(v0, v1);
     }
     #[test]
     fn unify_fn_return_type() {
         let type_var_0 = Type::variable(0);
-        let mut f1 = Type::func(vec![], type_var_0);
-        let mut f2 = Type::func(vec![], Type::int());
-        let u = unify(&f1, &f2).unwrap();
+        let  f1 = Type::func(vec![], type_var_0);
+        let  f2 = Type::func(vec![], Type::int());
+        unify(&f1, &f2).unwrap();
 
-        f1.substitute(&u);
-        f2.substitute(&u);
         assert_eq!(f1, f2);
     }
     #[test]
     fn unify_fns() {
         let type_var_0 = Type::variable(0);
         let type_var_1 = Type::variable(1);
-        let mut f1 = Type::func(vec![type_var_0.clone()], type_var_0.clone());
-        let mut f2 = Type::func(vec![type_var_1], Type::int());
-        let u = unify(&f1, &f2).unwrap();
+        let f1 = Type::func(vec![type_var_0.clone()], type_var_0.clone());
+        let f2 = Type::func(vec![type_var_1], Type::int());
+        unify(&f1, &f2).unwrap();
 
-        f1.substitute(&u);
-        f2.substitute(&u);
         assert_eq!(f1, f2);
     }
 
@@ -1447,7 +1355,7 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::func(vec![Type::int()], Type::int()),
+                return_type: Type::int(),
                 body: Some(block_expr(vec![call_expr(
                     "plus",
                     vec![
