@@ -348,7 +348,7 @@ fn build_variable_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     })?;
     Ok(Expression::L(
         LValue::Variable(get_node_text(&ident_node, source).to_string()),
-        None,
+        Type::unknown(),
     ))
 }
 
@@ -392,7 +392,7 @@ fn build_block_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     }
     Ok(Expression::Block {
         statements,
-        ty: None,
+        ty: Type::unknown(),
     })
 }
 
@@ -491,7 +491,7 @@ fn build_if_expr(node: &Node, source: &str) -> BuildResult<Expression> {
         Some(alt_node) => build_block_expr(&alt_node, source)?, // Assume block expr
         None => Expression::Block {
             statements: vec![Statement::Expression(Expression::LiteralUnit)],
-            ty: None,
+            ty: Type::unknown(),
         }, // Default else
     };
 
@@ -499,7 +499,7 @@ fn build_if_expr(node: &Node, source: &str) -> BuildResult<Expression> {
         condition: Box::new(build_expression(&cond_node, source)?),
         true_expr: Box::new(build_block_expr(&cons_node, source)?), // Assume block expr
         false_expr: Box::new(false_expr),
-        ty: None,
+        ty: Type::unknown(),
     })
 }
 
@@ -523,7 +523,7 @@ fn build_lambda_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     Ok(Expression::Lambda {
         bindings: build_lambda_parameter_list(&params_node, source)?,
         body: Box::new(build_expression(&body_node, source)?),
-        lambda_type: None,
+        lambda_type: Type::unknown(),
     })
 }
 
@@ -559,7 +559,7 @@ fn build_call_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     Ok(Expression::Call {
         fn_expr: Box::new(build_expression(&func_node, source)?),
         arg_exprs: build_argument_list(&args_node, source)?,
-        return_type: None,
+        return_type: Type::unknown(),
     })
 }
 

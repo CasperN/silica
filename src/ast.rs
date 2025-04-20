@@ -14,7 +14,7 @@ pub enum LValue {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
-    L(LValue, Option<Type>),
+    L(LValue, Type),
     LiteralInt(i64),
     LiteralBool(bool),
     LiteralFloat(f64),
@@ -22,63 +22,30 @@ pub enum Expression {
     LiteralStruct {
         name: String,
         fields: HashMap<String, Expression>,
-        ty: Option<Type>,
+        ty: Type,
     },
     If {
         condition: Box<Expression>,
         true_expr: Box<Expression>,
         false_expr: Box<Expression>,
-        ty: Option<Type>,
+        ty: Type,
     },
     Call {
         fn_expr: Box<Expression>,
         arg_exprs: Vec<Expression>,
-        return_type: Option<Type>,
+        return_type: Type,
     },
     Block {
         statements: Vec<Statement>,
-        ty: Option<Type>,
+        ty: Type,
     },
     Lambda {
         bindings: Vec<SoftBinding>,
         body: Box<Expression>,
-        lambda_type: Option<Type>,
+        lambda_type: Type,
     },
 }
 impl Expression {
-    fn ensure_type_initialized(&mut self, context: &mut TypeContext) {
-        match self {
-            Self::LiteralInt(_)
-            | Self::LiteralBool(_)
-            | Self::LiteralFloat(_)
-            | Self::LiteralUnit => {}
-            Self::L(_, ty)
-            | Self::If { ty, .. }
-            | Self::Block { ty, .. }
-            | Self::Call {
-                return_type: ty, ..
-            }
-            | Self::Lambda {
-                lambda_type: ty, ..
-            } => {
-                if ty.is_none() {
-                    *ty = Some(Type::unknown())
-                }
-            }
-            Self::LiteralStruct {
-                name: _,
-                fields,
-                ty,
-            } => {
-                for field_expr in fields.values_mut() {
-                    field_expr.ensure_type_initialized(context);
-                }
-                if ty.is_none() {
-                    *ty = Some(Type::unknown());
-                }
-            }
-        }
-    }
     // Gets the type of the expression, assigning a new variable from the
     // context if one hasn't been created yet.
     fn unwrap_type(&mut self) -> Type {
@@ -101,8 +68,6 @@ impl Expression {
                 fields: _,
                 ty,
             } => ty
-                .as_mut()
-                .expect("unwrap_type called before ensure_type_initialized")
                 .compress()
                 .clone(),
         }
@@ -416,7 +381,7 @@ impl Type {
                     param.instantiate_with(subs);
                 }
             }
-            TypeI::Follow(_) => panic!("TypeI::Follow used."),
+            TypeI::Follow(_) => panic!("Instantiating a TypeI::Follow."),
         }
         *self = Self::new(i)
     }
@@ -688,10 +653,8 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
 // Infers the type of the given expression in the given context.
 // Mutates the expression to set the type.
 fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), Error> {
-    expression.ensure_type_initialized(context);
     match expression {
         Expression::L(LValue::Variable(name), ty) => {
-            let ty = ty.as_mut().unwrap();
             if let Some(info) = context.variable_info(name) {
                 if info.ty.is_polymorphic() {
                     // This only applies if name is a top level polymorphic function.
@@ -706,7 +669,6 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
         }
         Expression::L(LValue::Field(expr, field), ty) => {
             infer(context, expr)?;
-            let ty = ty.as_mut().unwrap();
             if let TypeI::StructInstance(struct_instance) = &*expr.unwrap_type().inner() {
                 let field_type = struct_instance.field_type(field)?;
                 unify(&field_type, ty)?;
@@ -726,7 +688,6 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                 infer(context, field_expr)?;
                 unify(&field_expr.unwrap_type(), &decl_ty)?;
             }
-            let ty = ty.as_mut().unwrap();
             unify(ty, &Type::struct_(struct_instance))?;
             Ok(())
         }
@@ -761,7 +722,6 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                 arg_types.push(arg_expr.unwrap_type().clone());
             }
 
-            let return_type = return_type.as_mut().unwrap();
             unify(
                 &fn_expr.unwrap_type(),
                 &Type::func(arg_types, return_type.clone()),
@@ -797,7 +757,6 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                     .clone();
                 arg_types.push(arg_type);
             }
-            let lambda_type = lambda_type.as_mut().unwrap();
             unify(
                 lambda_type,
                 &Type::func(arg_types, lambda_return_type),
@@ -858,7 +817,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                     }
                 }
             }
-            unify(block_ty.as_ref().unwrap(), &last_statement_type)?;
+            unify(block_ty, &last_statement_type)?;
             shadow.finish();
             Ok(())
         }
@@ -947,12 +906,12 @@ impl From<()> for Expression {
 }
 impl From<LValue> for Expression {
     fn from(l: LValue) -> Self {
-        Expression::L(l, None)
+        Expression::L(l, Type::unknown())
     }
 }
 impl From<&str> for Statement {
     fn from(value: &str) -> Self {
-        Statement::Expression(Expression::L(LValue::Variable(value.to_string()), None))
+        Statement::Expression(Expression::L(LValue::Variable(value.to_string()), Type::unknown()))
     }
 }
 impl From<i64> for Statement {
@@ -962,7 +921,7 @@ impl From<i64> for Statement {
 }
 impl From<&str> for Expression {
     fn from(value: &str) -> Self {
-        Expression::L(LValue::Variable(value.to_string()), None)
+        Expression::L(LValue::Variable(value.to_string()), Type::unknown())
     }
 }
 impl From<&str> for LValue {
@@ -1008,7 +967,7 @@ pub mod test_helpers {
         Expression::Call {
             fn_expr: Box::new(f.into()),
             arg_exprs,
-            return_type: None,
+            return_type: Type::unknown(),
         }
     }
     pub fn assign_stmt(left: impl Into<LValue>, right: impl Into<Expression>) -> Statement {
@@ -1023,20 +982,20 @@ pub mod test_helpers {
             condition: Box::new(cond.into()),
             true_expr: Box::new(true_expr.into()),
             false_expr: Box::new(false_expr.into()),
-            ty: None,
+            ty: Type::unknown(),
         }
     }
     pub fn block_expr(statements: Vec<Statement>) -> Expression {
         Expression::Block {
             statements,
-            ty: None,
+            ty: Type::unknown(),
         }
     }
     pub fn lambda_expr(bindings: Vec<SoftBinding>, body: impl Into<Expression>) -> Expression {
         Expression::Lambda {
             bindings,
             body: Box::new(body.into()),
-            lambda_type: None,
+            lambda_type: Type::unknown(),
         }
     }
     pub fn field(expr: impl Into<Expression>, name: &str) -> LValue {
@@ -1623,7 +1582,7 @@ mod tests {
                                 ("left".into(), true.into()),
                                 ("right".into(), 123.into()),
                             ]),
-                            ty: None,
+                            ty: Type::unknown(),
                         },
                     ),
                     field("p", "left").into(),
