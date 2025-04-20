@@ -5,13 +5,6 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TypeVar(u32);
-impl std::fmt::Debug for TypeVar {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "T{}", self.0)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LValue {
@@ -69,7 +62,7 @@ impl Expression {
                 lambda_type: ty, ..
             } => {
                 if ty.is_none() {
-                    *ty = Some(context.new_type_var())
+                    *ty = Some(Type::unknown())
                 }
             }
             Self::LiteralStruct {
@@ -81,7 +74,7 @@ impl Expression {
                     field_expr.ensure_type_initialized(context);
                 }
                 if ty.is_none() {
-                    *ty = Some(context.new_type_var());
+                    *ty = Some(Type::unknown());
                 }
             }
         }
@@ -248,37 +241,25 @@ impl std::fmt::Debug for Type {
 
 #[derive(Default, Debug, Clone, PartialEq)]
 enum TypeI {
-    Var(TypeVar), // TODO: Delete this.
-    Param(u32),
     Int,
     Bool,
     Float,
     #[default]
     Unit,
-    Fn(Vec<Type>, Box<Type>),
-    Forall(Vec<u32>, Box<Type>),
+    Fn(Vec<Type>, Type),
+    Forall(Vec<u32>, Type),
     StructInstance(StructInstance),
 
-    // The Follow variant means this type was an unknown type variable
-    // and now aliases another.
+    // Unknown type variable. Unifies with any other type.
+    // Should not appear in generic types.
+    Unknown,
+
+    // A type parameter. It should not appear during unification as
+    // types need to be instantiated before then.
+    Param(u32),
+
+    // Points to another type that this is an alias for, as per the union-find algorithm.
     Follow(Type),
-}
-impl TypeI {
-    fn contains_type_var(&self, type_var: TypeVar) -> bool {
-        match self {
-            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Param(_) => false,
-            TypeI::Follow(ty) => ty.contains_type_var(type_var),
-            TypeI::Var(self_type_var) => *self_type_var == type_var,
-            TypeI::Fn(arg_types, ret_ty) => {
-                arg_types.iter().any(|ty| ty.contains_type_var(type_var))
-                    || ret_ty.contains_type_var(type_var)
-            }
-            TypeI::Forall(_, ty) => ty.contains_type_var(type_var),
-            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
-                params.values().any(|p| p.contains_type_var(type_var))
-            }
-        }
-    }
 }
 
 impl Type {
@@ -298,16 +279,16 @@ impl Type {
         Self::new(TypeI::Unit)
     }
     pub fn func(args: Vec<Type>, ret: Type) -> Self {
-        Self::new(TypeI::Fn(args, Box::new(ret)))
+        Self::new(TypeI::Fn(args, ret))
     }
     pub fn param(id: u32) -> Self {
         Self::new(TypeI::Param(id))
     }
-    pub fn variable(v: u32) -> Self {
-        Self::new(TypeI::Var(TypeVar(v)))
+    pub fn unknown() -> Self {
+        Self::new(TypeI::Unknown)
     }
     pub fn forall(params: Vec<u32>, ty: Type) -> Self {
-        Self::new(TypeI::Forall(params, Box::new(ty)))
+        Self::new(TypeI::Forall(params, ty))
     }
     pub fn struct_(s: StructInstance) -> Self {
         Self::new(TypeI::StructInstance(s))
@@ -320,7 +301,7 @@ impl Type {
         self.compress_direct_path();
         match &mut *self.0.borrow_mut(){
             TypeI::Bool | TypeI::Float | TypeI::Int
-            | TypeI::Unit | TypeI::Var(_) | TypeI::Param(_) => {}
+            | TypeI::Unit | TypeI::Unknown| TypeI::Param(_) => {}
             TypeI::Follow(_) => unreachable!(),  // compress direct path.
             TypeI::Fn(args, ret) => {
                 for arg in args.iter_mut() {
@@ -374,9 +355,7 @@ impl Type {
         *self = end.clone();
         self
     }
-    fn contains_type_var(&self, type_var: TypeVar) -> bool {
-        self.inner().contains_type_var(type_var)
-    }
+
     fn contains_ptr(&self, other: &Type) -> bool {
         if Rc::ptr_eq(&self.0, &other.0) {
             return true;
@@ -387,7 +366,7 @@ impl Type {
             | TypeI::Float
             | TypeI::Unit
             | TypeI::Param(_)
-            | TypeI::Var(_) => false,
+            | TypeI::Unknown => false,
             TypeI::Follow(ty) => ty.contains_ptr(other),
             TypeI::Forall(_, ty) => ty.contains_ptr(other),
             TypeI::Fn(arg_types, ret_type) => {
@@ -402,7 +381,7 @@ impl Type {
     }
     fn point_to(&mut self, other: &Self) -> Result<(), Error> {
         if other.contains_ptr(self) {
-            return Err(Error::InfiniteType(TypeVar(1995), Type::unit()));
+            return Err(Error::InfiniteType(self.clone(), other.clone()));
         }
         *self.0.borrow_mut() = TypeI::Follow(other.clone());
         Ok(())
@@ -419,8 +398,8 @@ impl Type {
                     .unwrap_or_else(|| panic!("Cannot instantiate type var {b}"));
                 return;
             }
-            TypeI::Var(_) => {
-                panic!("Instantiating a type with type vars");
+            TypeI::Unknown => {
+                panic!("Instantiating a type with Unknown type variables within.");
             }
             TypeI::Fn(arg_types, ret_ty) => {
                 for ty in arg_types.iter_mut() {
@@ -441,16 +420,17 @@ impl Type {
         }
         *self = Self::new(i)
     }
+
     // Instantiates Forall types with new type variables.
-    fn instantiate(self, context: &mut TypeContext) -> Self {
+    fn instantiate(self) -> Self {
         let i = self.inner().clone();
         if let TypeI::Forall(params, mut ty) = i {
             let mut subs = HashMap::new();
             for b in params {
-                subs.insert(b, context.new_type_var());
+                subs.insert(b, Type::unknown());
             }
             ty.instantiate_with(&subs);
-            *ty
+            ty
         } else {
             self
         }
@@ -460,7 +440,7 @@ impl Type {
     }
     fn insert_type_params(&self, output: &mut HashSet<u32>) {
         match &*self.inner() {
-            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Var(_) => {}
+            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Unknown => {}
             TypeI::Param(b) => {
                 output.insert(*b);
             }
@@ -524,7 +504,7 @@ impl TypeContext {
         };
         let mut params = HashMap::new();
         for param_id in decl.params.iter() {
-            params.insert(*param_id, self.new_type_var());
+            params.insert(*param_id, Type::unknown());
         }
         Ok(StructInstance { params, decl })
     }
@@ -540,12 +520,6 @@ impl TypeContext {
             finished: false,
             shadowed_return_type: None,
         }
-    }
-    // Returns a new unknown type.
-    fn new_type_var(&mut self) -> Type {
-        let v = self.next_type_var;
-        self.next_type_var += 1;
-        Type::variable(v)
     }
 }
 
@@ -574,7 +548,7 @@ impl<'a> ShadowTypeContext<'a> {
     }
     fn insert_soft_binding(&mut self, binding: SoftBinding) {
         let SoftBinding { name, ty, mutable } = binding;
-        let ty = ty.unwrap_or_else(|| self.context().new_type_var());
+        let ty = ty.unwrap_or_else(|| Type::unknown());
         self.insert_variable(name, ty, mutable);
     }
     // Defines a struct. Returns if there was a previous definition.
@@ -635,7 +609,7 @@ enum Error {
     UnknownName(String),
     NoSuchStruct(String),
     NotUnifiable(Type, Type),
-    InfiniteType(TypeVar, Type),
+    InfiniteType(Type, Type),
     DuplicateArgNames(Expression),
     DuplicateTopLevelName(String),
     AssignToImmutableBinding(String),
@@ -655,11 +629,11 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
     // `.inner` borrows from the Refcell. That borrow must end before
     // `point_to` runs, which borrows mutably. Hence, we use a
     // matches! statement instead of handling this case in the match.
-    if matches!(&*left.inner(), TypeI::Var(_)) {
+    if matches!(&*left.inner(), TypeI::Unknown) {
         left.point_to(&right)?;
         return Ok(());
     }
-    if matches!(&*right.inner(), TypeI::Var(_)) {
+    if matches!(&*right.inner(), TypeI::Unknown) {
         right.point_to(&left)?;
         return Ok(());
     }
@@ -720,7 +694,8 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             let ty = ty.as_mut().unwrap();
             if let Some(info) = context.variable_info(name) {
                 if info.ty.is_polymorphic() {
-                    unify(ty, &info.ty.clone().instantiate(context))?;
+                    // This only applies if name is a top level polymorphic function.
+                    unify(ty, &info.ty.clone().instantiate())?;
                     Ok(())
                 } else {
                     unify(ty, &info.ty)
@@ -802,7 +777,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             if arg_name_set.len() != bindings.len() {
                 return Err(Error::DuplicateArgNames(expression.clone()));
             }
-            let lambda_return_type = context.new_type_var();
+            let lambda_return_type = Type::unknown();
             let mut shadow = context.shadow();
             shadow.set_return_type(lambda_return_type.clone());
 
@@ -1076,8 +1051,8 @@ mod tests {
 
     #[test]
     fn unify_type_vars() {
-        let mut v0 = Type::variable(0);
-        let mut v1 = Type::variable(1);
+        let mut v0 = Type::unknown();
+        let mut v1 = Type::unknown();
         unify(&v0, &v1).unwrap();
         v0.compress();
         v1.compress();
@@ -1085,7 +1060,7 @@ mod tests {
     }
     #[test]
     fn unify_fn_return_type() {
-        let type_var_0 = Type::variable(0);
+        let type_var_0 = Type::unknown();
         let  f1 = Type::func(vec![], type_var_0);
         let  f2 = Type::func(vec![], Type::int());
         unify(&f1, &f2).unwrap();
@@ -1094,8 +1069,8 @@ mod tests {
     }
     #[test]
     fn unify_fns() {
-        let type_var_0 = Type::variable(0);
-        let type_var_1 = Type::variable(1);
+        let type_var_0 = Type::unknown();
+        let type_var_1 = Type::unknown();
         let f1 = Type::func(vec![type_var_0.clone()], type_var_0.clone());
         let f2 = Type::func(vec![type_var_1], Type::int());
         unify(&f1, &f2).unwrap();
