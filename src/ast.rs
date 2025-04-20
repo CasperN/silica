@@ -82,7 +82,11 @@ impl Expression {
                     *ty = Some(context.new_type_var())
                 }
             }
-            Self::LiteralStruct { name: _, fields, ty } => {
+            Self::LiteralStruct {
+                name: _,
+                fields,
+                ty,
+            } => {
                 for field_expr in fields.values_mut() {
                     field_expr.ensure_type_initialized(context);
                 }
@@ -108,9 +112,12 @@ impl Expression {
             }
             | Self::Lambda {
                 lambda_type: ty, ..
-            } 
-            | Self::LiteralStruct { name: _, fields: _, ty }
-            => ty
+            }
+            | Self::LiteralStruct {
+                name: _,
+                fields: _,
+                ty,
+            } => ty
                 .as_ref()
                 .expect("unwrap_type called before ensure_type_initialized"),
         }
@@ -244,7 +251,7 @@ impl SoftBinding {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FnDecl {
-    pub forall: Vec<TypeVar>,
+    pub forall: Vec<u32>,
     pub name: String,
     pub args: Vec<TypedBinding>,
     pub return_type: Type,
@@ -264,32 +271,22 @@ impl FnDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
     name: String,
-    type_var_count: usize,
+    params: HashSet<u32>,
     fields: HashMap<String, Type>,
 }
 impl StructDecl {
     fn new(name: &str, fields: &[(&str, Type)]) -> Self {
-        let mut fields: HashMap<String, Type> = fields
+        let fields: HashMap<String, Type> = fields
             .iter()
             .map(|(name, ty)| (name.to_string(), ty.clone()))
             .collect();
-
-        // Replace any type variables with the lowest natural numbers.
-        let mut type_vars = HashSet::new();
+        let mut params = HashSet::new();
         for field_type in fields.values() {
-            field_type.insert_free_type_vars(&mut type_vars);
-        }
-        let mut subs = Substitutions::new();
-        for (i, tv) in type_vars.iter().enumerate() {
-            let canonical_tv = Type::Var(TypeVar(i as u32));
-            subs.insert(*tv, canonical_tv);
-        }
-        for field_type in fields.values_mut() {
-            field_type.substitute(&subs);
+            field_type.insert_type_params(&mut params);
         }
         StructDecl {
             name: name.to_string(),
-            type_var_count: type_vars.len(),
+            params,
             fields,
         }
     }
@@ -307,7 +304,7 @@ pub struct Program(pub Vec<Declaration>);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructInstance {
-    params: Vec<Type>,
+    params: HashMap<u32, Type>,
     decl: Rc<StructDecl>,
 }
 impl StructInstance {
@@ -315,19 +312,16 @@ impl StructInstance {
         if let Some(field_type) = self.decl.fields.get(field) {
             let mut field_type = field_type.clone();
             if !self.params.is_empty() {
-                let mut subs = Substitutions::new();
-                for (i, param) in self.params.iter().enumerate() {
-                    subs.insert(TypeVar(i as u32), param.clone());
-                }
-                field_type.substitute(&subs);
+                field_type.instantiate_with(&self.params);
             }
+            dbg!(field, &field_type, self);
             Ok(field_type)
         } else {
             Err(Error::UnrecognizedField(field.to_string()))
         }
     }
     fn substitute(&mut self, subs: &Substitutions) {
-        for param in self.params.iter_mut() {
+        for param in self.params.values_mut() {
             param.substitute(subs);
         }
     }
@@ -336,19 +330,20 @@ impl StructInstance {
 #[derive(Default, Debug, Clone, PartialEq)]
 pub(crate) enum Type {
     Var(TypeVar),
+    Param(u32),
     Int,
     Bool,
     Float,
     #[default]
     Unit,
     Fn(Vec<Type>, Box<Type>),
-    Forall(Vec<TypeVar>, Box<Type>),
+    Forall(Vec<u32>, Box<Type>),
     StructInstance(StructInstance),
 }
 impl Type {
     fn contains_type_var(&self, type_var: TypeVar) -> bool {
         match self {
-            Self::Int | Self::Bool | Self::Float | Self::Unit => false,
+            Self::Int | Self::Bool | Self::Float | Self::Unit | Self::Param(_) => false,
             Self::Var(self_type_var) => *self_type_var == type_var,
             Self::Fn(arg_types, ret_ty) => {
                 arg_types.iter().any(|ty| ty.contains_type_var(type_var))
@@ -356,13 +351,13 @@ impl Type {
             }
             Self::Forall(_, ty) => ty.contains_type_var(type_var),
             Self::StructInstance(StructInstance { params, decl: _ }) => {
-                params.iter().any(|p| p.contains_type_var(type_var))
+                params.values().any(|p| p.contains_type_var(type_var))
             }
         }
     }
     fn substitute(&mut self, subs: &Substitutions) {
         match self {
-            Self::Int | Self::Bool | Self::Float | Self::Unit => {}
+            Self::Int | Self::Bool | Self::Float | Self::Unit | Self::Param(_) => {}
             Self::Var(tv) => {
                 if let Some(sub) = subs.0.get(tv) {
                     *self = sub.clone();
@@ -374,8 +369,7 @@ impl Type {
                 }
                 ret_ty.substitute(subs);
             }
-            Self::Forall(forall_vars, ty) => {
-                forall_vars.retain(|forall_var| !subs.0.contains_key(forall_var));
+            Self::Forall(_, ty) => {
                 ty.substitute(subs);
             }
             Self::StructInstance(struct_instance) => {
@@ -383,14 +377,43 @@ impl Type {
             }
         }
     }
+    fn instantiate_with(&mut self, subs: &HashMap<u32, Type>) {
+        match self {
+            Self::Int | Self::Bool | Self::Float | Self::Unit => {}
+            Self::Param(b) => {
+                *self = subs
+                    .get(b)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("Cannot instantiate type var {b}"));
+            }
+            Self::Var(_) => {
+                panic!("Instantiating a type with type vars");
+            }
+            Self::Fn(arg_types, ret_ty) => {
+                for ty in arg_types.iter_mut() {
+                    ty.instantiate_with(subs);
+                }
+                ret_ty.instantiate_with(subs);
+            }
+            Self::Forall(forall_vars, ty) => {
+                forall_vars.retain(|forall_var| !subs.contains_key(forall_var));
+                ty.instantiate_with(subs);
+            }
+            Self::StructInstance(StructInstance { params, decl: _ }) => {
+                for param in params.values_mut() {
+                    param.instantiate_with(subs);
+                }
+            }
+        }
+    }
     // Instantiates Forall types with new type variables.
     fn instantiate(self, context: &mut TypeContext) -> Self {
-        if let Self::Forall(vars, mut ty) = self {
-            let mut subs = Substitutions::new();
-            for tv in vars {
-                subs.insert(tv, context.new_type_var());
+        if let Self::Forall(params, mut ty) = self {
+            let mut subs = HashMap::new();
+            for b in params {
+                subs.insert(b, context.new_type_var());
             }
-            ty.substitute(&subs);
+            ty.instantiate_with(&subs);
             *ty
         } else {
             self
@@ -399,17 +422,17 @@ impl Type {
     fn is_polymorphic(&self) -> bool {
         matches!(self, Self::Forall(_, _))
     }
-    fn insert_free_type_vars(&self, output: &mut HashSet<TypeVar>) {
+    fn insert_type_params(&self, output: &mut HashSet<u32>) {
         match self {
-            Self::Int | Self::Bool | Self::Float | Self::Unit => {}
-            Self::Var(tv) => {
-                output.insert(*tv);
+            Self::Int | Self::Bool | Self::Float | Self::Unit | Self::Var(_) => {}
+            Self::Param(b) => {
+                output.insert(*b);
             }
             Self::Fn(arg_types, ret_ty) => {
                 for arg_type in arg_types.iter() {
-                    arg_type.insert_free_type_vars(output);
+                    arg_type.insert_type_params(output);
                 }
-                ret_ty.insert_free_type_vars(output);
+                ret_ty.insert_type_params(output);
             }
             // Free type variables are only asked for by struct generalization.
             // but we don't expect generic members.
@@ -418,8 +441,8 @@ impl Type {
                 but we don't expect generic members."
             ),
             Self::StructInstance(StructInstance { params, decl: _ }) => {
-                for param in params {
-                    param.insert_free_type_vars(output)
+                for param in params.values() {
+                    param.insert_type_params(output)
                 }
             }
         }
@@ -462,9 +485,9 @@ impl TypeContext {
         } else {
             return Err(Error::NoSuchStruct(name.to_string()));
         };
-        let mut params = Vec::new();
-        for _ in 0..decl.type_var_count {
-            params.push(self.new_type_var());
+        let mut params = HashMap::new();
+        for param_id in decl.params.iter() {
+            params.insert(*param_id, self.new_type_var());
         }
         Ok(StructInstance { params, decl })
     }
@@ -656,12 +679,19 @@ fn unify(left: &Type, right: &Type) -> Result<Substitutions, Error> {
         ) if left_decl == right_decl => {
             let mut subs = Substitutions::new();
             assert_eq!(left_params.len(), right_params.len());
-            for (l, r) in left_params.iter().zip(right_params.iter()) {
-                let mut l = l.clone();
-                let mut r = r.clone();
-                l.substitute(&subs);
-                r.substitute(&subs);
-                subs.and_then(&unify(&l, &r)?);
+            for (param_id, left_ty) in left_params.iter() {
+                let right_ty = right_params.get(param_id).unwrap_or_else(|| {
+                    panic!(
+                        "Two instance of the same struct should \
+                        have the same type param ids. \
+                        Left:{left:?}, Right:{right:?}"
+                    )
+                });
+                let mut left_ty = left_ty.clone();
+                let mut right_ty = right_ty.clone();
+                left_ty.substitute(&subs);
+                right_ty.substitute(&subs);
+                subs.and_then(&unify(&left_ty, &right_ty)?);
             }
             Ok(subs)
         }
@@ -692,7 +722,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
             let ty = ty.as_mut().unwrap();
             if let Type::StructInstance(struct_instance) = expr.unwrap_type() {
                 let field_type = struct_instance.field_type(field)?;
-                subs.and_then(&unify(&field_type, &ty)?);
+                subs.and_then(&unify(&field_type, ty)?);
                 ty.substitute(&subs);
             } else {
                 return Err(Error::FieldAccessToNonStruct(*expr.clone(), field.clone()));
@@ -703,15 +733,10 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<Subst
         Expression::LiteralInt(_) => Ok(Substitutions::new()),
         Expression::LiteralBool(_) => Ok(Substitutions::new()),
         Expression::LiteralFloat(_) => Ok(Substitutions::new()),
-        Expression::LiteralStruct {
-            name,
-            fields,
-            ty,
-        } => {
+        Expression::LiteralStruct { name, fields, ty } => {
             let mut struct_instance = context.instantiate_struct(name)?;
             let mut subs = Substitutions::new();
             for (field_name, field_expr) in fields.iter_mut() {
-                
                 let decl_ty = struct_instance.field_type(field_name)?;
                 subs.and_then(&infer(context, field_expr)?);
                 field_expr.substitute(&subs);
@@ -1362,10 +1387,10 @@ mod tests {
         // id(2) + id(2)
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: vec![TypeVar(0)],
+                forall: vec![0],
                 name: "id".to_string(),
-                args: vec![TypedBinding::new("a", Type::Var(TypeVar(0)), false)],
-                return_type: Type::Var(TypeVar(0)),
+                args: vec![TypedBinding::new("a", Type::Param(0), false)],
+                return_type: Type::Param(0),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
@@ -1400,10 +1425,10 @@ mod tests {
         // id(2) + id(2)
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: vec![TypeVar(0)],
+                forall: vec![0],
                 name: "id".to_string(),
-                args: vec![TypedBinding::new("a", Type::Var(TypeVar(0)), false)],
-                return_type: Type::Var(TypeVar(0)),
+                args: vec![TypedBinding::new("a", Type::Param(0), false)],
+                return_type: Type::Param(0),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
@@ -1425,10 +1450,10 @@ mod tests {
         // id(2) + id(2)
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: vec![TypeVar(0)],
+                forall: vec![0],
                 name: "id".to_string(),
-                args: vec![TypedBinding::new("a", Type::Var(TypeVar(0)), false)],
-                return_type: Type::Var(TypeVar(0)),
+                args: vec![TypedBinding::new("a", Type::Param(0), false)],
+                return_type: Type::Param(0),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
@@ -1654,10 +1679,7 @@ mod tests {
     fn struct_field_access() {
         let pair = StructDecl::new(
             "Pair",
-            &[
-                ("left", Type::Var(TypeVar(0))),
-                ("right", Type::Var(TypeVar(1))),
-            ],
+            &[("left", Type::Param(0)), ("right", Type::Param(1))],
         );
 
         let program = &mut Program(vec![
