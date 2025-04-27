@@ -15,7 +15,7 @@ Silica's design rests on four core pillars, aiming to provide a unique blend of 
 
 3. Immovability and Fine-Grained Control: Default immovability of types combined with explicit Move semantics and specialized reference types (&out, &deinit) provides precise control over data layout, initialization, and resource handling, crucial for low-level programming and FFI. (See 1.4)
 
-4. Uniformity: Where possible, we want to minimize special compiler and standard library "magic" for standard library types, compared to user-defined types. The effects system aims to achieve this for control flow. The trait based dereferencing and assignment (2.4) aims to achieve this for smart pointers, in contrast with the special status of `Box` in Rust.
+4. Uniformity: Where possible, we want to minimize special compiler and standard library "magic" for standard library types, compared to user-defined types. The effects system aims to achieve this for control flow.
 
 ### 1.2 Algebraic Effects: Motivation and Overview
 A central goal of Silica is to provide a more composable and unified way to handle computational effects compared to traditional approaches. Imperative languages often rely on distinct, built-in mechanisms for error handling (try/catch), asynchronous operations (async/await), and generators (yield). While useful, such constructs cannot be implemented within the language. Functional languages sometimes use abstractions like Monads, which, while powerful, are complex to compose (consider, `Future<Result<Iterator<Item=T>, E>>` versus `Iterator<Item=Future<Result<T, E>>>` and ask whether either, both, or neither properly model a fallible async stream of `T`).
@@ -76,13 +76,9 @@ This combination provides developers with fine-grained control over data lifecyc
     * The set of effect operations that the coroutine may perform are in the type signature of the coroutine.
     * Functions may be polymorphic over the effects they perform.
 
-### 2.2 Linearity, Ownership, and Movability
+### 2.2 Linearity and Movability
 Silica incorporate linear types (values consumed exactly once) for compile-time resource safety, preventing leaks and double-use (e.g. in memory or file handles). This strict default is made ergonomic via the following relaxations:
-* **References & Borrowing**: Allows temporary, non-consuming access (`&'a T`, `&'a mut T`, `&'a out T`, `&'a deinit T`). Borrowing doesn't consume linear values, but lifetime rules prevent dangling references (Rust NLL-inspired, analyzed on MIR). Definite assignment analysis tracks initialization status for &out/&deinit safety.
-  * `&'a T`: Immutable shared borrow.
-  * `&'a mut T`: Mutable exclusive borrow (allows deinit/reinit within borrow).
-  * `&'a out T`: Output exclusive borrow (must be initialized).
-  * `&'a deinit T`: Deinitialization exclusive borrow (must be deinitialized).
+* **Borrowing:** Temporary, non-consuming access to values is permitted via references. Borrowing does not consume a linear value, but its usage is governed by lifetime rules (Rust NLL-inspired, analyzed on MIR) to prevent dangling references. Specific kinds of state-tracking references offer more fine-grained control during borrows (See Section 2.3).
 
 * **Opt-in implicits**: The following traits further relax linearity rules by controlling implicit destruction and copying:
   * **ImplicitDrop (Affine):** Allows values to be used at most once . If unused by scope end, its drop method is called automatically. Enables affinity.
@@ -92,12 +88,14 @@ Silica incorporate linear types (values consumed exactly once) for compile-time 
         fn drop(&deinit self);
       }
       ```
-      *Note:* `drop` cannot perform effects. Effectful cleanup requires an explicit function like `destroy(&deinit self) -> Co<() ! E>`.
+      * *Note:* `drop` cannot perform effects. Effectful cleanup requires an explicit function like `destroy(&deinit self) -> Co<() ! E>`. See `2.6` on `defer` blocks for effectful clean up.
   * **ImplicitCopy (Relevant):** Allows values to be used one or more times (relevant) or any number of times (unrestricted, if also ImplicitDrop). Implicit copies are made via the copy method when needed.
       ```
       trait Copy {
+        effects E;
         // Performs a copy. Allows user-defined logic (not just memcpy).
-        fn copy(&self, &out other: Self);
+        fn copy<'a>(&'a self, dest: &'a out Self) -> S
+        where S: 'a + Co<() ! E>;
       }
       // Allows the compiler to call `copy` implicitly.
       trait ImplicitCopy : Copy {}
@@ -115,8 +113,11 @@ Silica incorporate linear types (values consumed exactly once) for compile-time 
         fn move(&deinit self, &out other: Self);
       }
       ```
-  * **Pass-by-value requires the `Move` trait.** Attempting to pass a type that does *not* implement `Move` by value results in a **compile-time error**. This enforces the default immovability of types.
-  * For types that *do* implement `Move`, pass-by-value transfers ownership to the callee. The `Move::move` operation consumes the source (`&deinit self`) and initializes the destination (`&out other`).
+  * **Pass-by-value requires `Move` or `ImplicitCopy`.** Attempting to pass by value a type that does *not* implement either of these traits results in a **compile-time error**. This enforces the default immovability of types.
+    * The compiler will prioritize try moving values into functions with `Move`.
+    * If the value is used later and the trait is `ImplicitCopy`, then the prior pass-by-value will be a copy.
+    * In the rare scenario where `Move` is not implemented for the type, but `ImplicitCopy` is, the value will be copied.
+    * *Note: the `Move::move` operation consumes the source (`&deinit self`) and initializes the destination (`&out other`), transfering ownership of any internal resources.*
 
   * **Move/Copy Elision:** For types implementing `Move` (or `ImplicitCopy`), the compiler *may* optimize away the actual call to the `move` (or `copy`) method, directly constructing the value in the destination or reusing the source memory location, similar to Guaranteed RVO/Copy Elision in C++. Code defined in `move` and `copy` methods are not guaranteed to execute.
 
@@ -130,7 +131,44 @@ Silica incorporate linear types (values consumed exactly once) for compile-time 
 
 * **Deriving Defaults:** Mechanisms to automatically derive default implementations for `Move`, `ImplicitCopy`, `ImplicitDrop`, and `Copy` for aggregate types will be necessary for ergonomics.
 
-### 2.3 Effects and Coroutines
+### 2.3: Flow-Sensitive Typing for Initialization State
+
+Silica provides fine-grained control over memory initialization state via a system of non-owning references coupled with flow-sensitive typing. This enables safe in-place operations, with strong compile-time guarantees and better ergonomics than patterns like `MaybeUninit` or requiring intialization on the stack before moving into a heap allocation (in Rust).
+
+* **Initialization State Tracking:** The type system tracks the initialization state of memory locations accessed through exclusive references along two dimensions: the **current state** (is it initialized now?) and the **required final state** (must it be initialized or uninitialized when the reference's lifetime ends?). This yields **four** fundamental exclusive states.
+
+* **Transmutation Principle:** Operations that change the current initialization state (from initialized to uninitialized, or vice-versa) cause the reference type itself to **transmute**. This transmutation reflects the new current state while preserving the original required final state associated with the reference's lifetime. This "type transmutation" is inherently **flow-sensitive**, meaning the compiler tracks the changes in the type of the variable based on the operations performed along each control flow path.
+
+* **Triggering State Changes:**
+  * **Initialization:** Occurs via direct assignment (`x = value;`) or by lending a `&out T` sub-reference, which will initialize the location by the end of its lifetime.
+  * **Deinitialization:** Occurs via moving the value out, explicitly calling a destructor (e.g., `drop(value)` conceptually), destructuring an aggregate reference and recursively deinitializing its parts, or by lending a `&deinit T` sub-reference which will deinitialize the location by the end of its lifetime.
+
+* **Exclusive Reference Types & Contracts:** The four primary exclusive reference types embody the different state combinations:
+
+  * `&'a mut T`: **Mutable**: Current State: Initialized, Final State: Initialized.
+  * `&'a out T`: **Output**: Current State: Uninitialized, Final State: Initialized.
+  * `&'a deinit T`: **Deinitialization**: Current State: Initialized, Final State: Uninitialized.
+  * `&'a uninit T`: **Uninitialized**: Current State: Uninitialized, Final State: Uninitialized.
+
+* **Linearity**: The current initialization state of `&mut T` and `&uninit T` is their final intialization state, so these references are `ImplicitDrop`, or affine. However, `&out T` and `&deinit T` have unfulfilled obligations to initialize or deinitialize their referent and therere cannot be implicitly dropped. They are linear types.
+
+* **Transmutation Rules Enumerated** 
+  * **Initialization Occurs:**
+    * `&out T` becomes `&mut T` (Initialzed end state is preserved).
+    * `&uninit T` becomes `&deinit T` (Uninitialized end state is preserved).
+  * **Deinitialization Occurs:**
+    * `&mut T` becomes `&out T`
+    * `&deinit T` becomes `&uninit T`
+  * **Subreference rules:** A reference may be borrowed from another reference so long as the current state matches, e.g. `&mut T` may be borrowed from `&mut T` or `&deinit T`. Note that borrowing a `&out T` or `&deinit T` subreference will change the referent's initialization state, causing the outer reference to transmute. 
+
+* **Destructuring References:** A reference to an aggregate type may be destructured into references to the aggregate's components. These component references have the same current initialization state and end initialization obligation as the original reference.
+
+* **Unification Rule:** When control flow paths merge, the stateful reference type of a variable must be identical on all incoming paths. If different types (representing different states or end-obligations) merge, it is a compile-time error.
+
+* **Shared References:** The standard immutable shared reference, `&'a T`, also exists. It requires the memory to be initialized for the duration of `'a` and does not permit mutation and therefore does not transmute. It is also `ImplicitDrop`.
+
+
+### 2.4 Effects and Coroutines
 * **Core Idea:** The compiler tracks the set of operations that a function may perform. If the set is non-empty, the function will return a coroutine object. When run, any performed operations yield control and may subsequently be resumed.
 * **Effect Definitions:** Operations are defined in an `effect` block. Each operation has an identifier, a _perform type_ and a _resumption type_.
     ```silica
@@ -176,70 +214,95 @@ Silica incorporate linear types (values consumed exactly once) for compile-time 
     * **resume.into():** For scenarios like async executors needing to store and move the continuation, `resume.into()` can be used. This consumes the resume capability and yields a new, _movable_ object (conceptually `impl FnOnce(ResumeType) -> Co<T!E>`) that owns the continuation state. This requires the underlying coroutine state to implement `Move`. Calling the resulting object later will run the moved coroutine from the current suspension point.
     * **Evaluation** A `expr handle {...}`  block, that does not handle all effects from the `expr` coroutine, evaluates to a coroutine. If all effects are handled, then it evaluates to `expr`'s return type.
 * **Effect Tunneling:** Functions polymorphic over an effect parameter `E` cannot handle operations in `E`, even if those operations happen to collide with operations used in the polymoprphic function body (otherwise, the implementation of the generic function is revealed to the caller). Such operations "tunnel through" and are propagated outwards as part of the function's `E` effect parameter, bypassing local handlers for the operation. Concrete effects not matching `E` are handled normally.
+* **Movable Coroutines:** Coroutines that emit references to their activation frame whose lifetime crosses a suspension point are immovable. Coroutines that store immovable data (e.g. an immovable coroutine) in their activation frame across a suspension point, are similarly immovable.
+  * **Opt-in move:** Coroutines may opt into movability by returning an existential type that declares the `Move` trait, e.g. `exists S: Co<T!E> + Move`, however the compiler will enforce the aforementioned properties at compile time.
+  * **Move via Box or Reference:** Immovable coroutines can be made movable by placing them behind a reference or pointer. If `S: Co<T!E>` then `&mut S: Co<T!E> + Move` and `Box<S>: Co<T!E> + Move`.
 
-### 2.4 Access, Calls, and Assignment (UFCS)
-Silica aims for a uniform and explicit system for accessing members, calling methods, and handling assignment, especially concerning pointer-like types and custom smart pointers.
+* **Implicitly Droppable Coroutines:** Coroutines that store a linear resource across a suspension point cannot be `ImplicitDrop`. Functions returning coroutines can opt into implicit drop by adding it to the existential typs, `exists S: Co<T!E> + ImplicitDrop`, however the compiler will enforce that no linear resources are stored across suspension points in such coroutines.
 
-* **Uniform Function Call Syntax (UFCS):**
-  * Method calls use the dot operator: `receiver.method(args...)`.
-  * This syntax desugars to a standard function call: `method(receiver, args...)`.
-* Method resolution first checks for fields named method on the receiver's type. If no field exists, it searches for applicable functions (standalone or trait methods) named method that accept receiver as the first argument.
-* **Postfix Dereference Operators:** To provide explicit control over accessing the value or place underlying a pointer-like type `P<T>`, Silica uses postfix dereference operators defined by traits:
-  ```
-  trait Deref<'a> { type Target: 'a; fn deref(&'a self) -> Self::Target; }
-  trait DerefMut<'a>: Deref<'a> { type TargetMut: 'a; fn deref_mut(&'a mut self) -> Self::TargetMut; }
-  trait DerefOut<'a> { type TargetOut: 'a; fn deref_out(&'a mut self) -> Self::TargetOut; }
-  trait DerefDeinit<'a> { type TargetDeinit: 'a; fn deref_deinit(&'a deinit self) -> Self::TargetDeinit; }
-  ```
-  * These traits are invoked by `ptr.*`, `ptr.*mut`, `ptr.*out`, and `ptr.*deinit` respectively.
-  * These traits allow custom smart pointers and proxy types to define how they provide access to the underlying data or place. The associated types (`Target`, `TargetMut`, `TargetOut`, `TargetDeinit`) are not restricted to primitive references.
-    * **Effectful Dereference:** These dereference operations themselves can be effectful (return `Co<TargetType ! E>`). The `?` operator chains naturally: `ptr.*?` or `ptr.*mut?`.
-  * **Note on moving the referent:** `ptr.*deinit`, gives you a `&'deinit` reference or an equivalent proxy and ensures `ptr` points to uninitialized memory after the borrow, but this doesn't exactly give you the moved value. A further call to `Move::move`, or some other method, is required to move the referent to a new location.
-  
-* **Assignment (`=`):** The assignment operator `=` has distinct semantics based on the initialization state of the left-hand side (LHS), determined by definite assignment analysis. It is not overloadable via traits; custom update logic requires explicit methods.
+### 2.5 Access, Calls, and Dereferencing
+Silica distinguishes between direct member access and access through indirection (pointers/references), providing separate operators with distinct capabilities. It introduces an auto-dereferencing mechanism specifically designed to handle potential effects during chained access.
 
-  * **Initialization:** `lhs = rhs` where `lhs` is uninitialized performs in-place initialization.
-    * ` lhs` represents the uninitialized place (e.g., an uninitialized variable or the result of `ptr.*out`).
-    * If `rhs` is a constructor call or literal (e.g., `Foo { ... }`), the compiler generates code to initialize the fields of lhs directly using the rhs initializers, without creating a temporary rhs object.
-    * If `rhs` is an existing value, standard move/copy semantics (potentially using `Move::move` or `ImplicitCopy::copy`) are used to initialize lhs from rhs.
-    * The compiler marks `lhs` as initialized.
-    
-  * **Re-assignment:** `lhs = rhs` where `lhs` is already initialized:
-    1. If `lhs`'s type implements `ImplicitDrop`, the existing value in lhs is dropped with `ImplicitDrop::drop`. If lhs's type is strictly linear (no `ImplicitDrop`), re-assignment is a compile-time error as the existing value cannot be implicitly discarded.
-    2. The value `rhs` is moved or copied into the lhs location.
+* **Explicit Dereference (`^` Operator):**
+  * A postfix derference operator is used to convert references into lvalues, or "place expressions" which may be assigned to (or read from if initialized). 
 
-This system allows custom smart pointers to integrate cleanly with method calls (via UFCS and dereference traits) and initialization (via DerefOut and compiler-driven initialization), while keeping the semantics of re-assignment (=) simple and predictable.
+* **Field Access and Unified Function Call Syntax (UFCS):**
+  * The dot operator (`.`) is used for direct field access (`value.field`) on structs and for Uniform Function Call Syntax (UFCS) on methods (`value.method(args)`) desugaring to `method(value, args)`.
+  * Unlike in Rust, the `.` operator performs **no automatic dereferencing**. It operates solely on the immediate type of the receiver expression (`value`). To access members through any pointer or reference type using `.`, an explicit dereference (with `^`) must be performed first, e.g. `ptr^.method()`.
+  * To call a callable field, to avoid ambiguity with UFCS resolution, you have to parenthesize the field access, e.g., `(foo.bar)(args)`, because `foo.bar(args)` is interpreted as `bar(foo, args)`.
+  * Note that you can use arbitrary expressions in UFCS position, e.g., `foo.(bar(arg1))(arg2)` desugars to `bar(arg1)(foo, arg2)`.
 
-### 2.5 `defer` blocks
+* **Chained Derferencing Access (`->` Operator):**
+  * The arrow operator (`->`) is the mechanism for accessing data through potentially multiple levels of indirection provided by pointer, reference types, or coroutine types.
+  It performs automatic, potentially chained dereferencing through smart pointers that implement the `AutoDeref` and `AutoDerefMut` traits. 
+  * Conceptual `AutoDeref` trait (`AutoDerefMut` is analogous):
+    ```
+    trait AutoDeref {
+      type T;
+      effects E;
+      fn deref(&self) -> S where exists S: Co<&T!E>;
+    }
+    ```
+  * `foo->` desugars to some expresion matching the regex, `foo(\.deref()\?\^)+`, the compiler infers how many times to call `.deref()` and whether to invoke `?`. 
+    * When resolving `expr->`
+      1. Initialize `current = expr.deref()`
+      2. propagate effects and dereference: `current = current?^`
+      3. if the type of `current` has a `.deref` method, call it, and go to 2. 
+  * **Chained Dereferencing with method calls:** A `.` UFCS operator is still required. `foo->.bar(x)` would be how you write `bar(foo->, x)`. Unlike in Cpp, `foo->bar()` would be a syntax error.
+
+### 2.6 `defer` blocks
 * Functions and coroutines may place `defer { ... }` statements which execute when control permanently leaves this activation frame. This includes when the function or coroutine returns, or when a suspended coroutine is explicitly dropped.
   * The intended use is for potentially effectful cleanup of linear resources.
-* `defer` blocks _may not_ be placed in the `OpClause` of `handle` blocks. At least until "code after resume" (5.2) is supported. 
+  * *Note:* Control does not permenantly leaves a coroutine if it is suspended and resumed. Code in `defer` may run some time after suspension if the coroutine is implicitly dropped or explicitly destroyed.
+* `defer` blocks _may not_ be placed in the `OpClause` of `handle` blocks. At least until "code after resume" (5.2) is supported.
+* **Performing or Propagating Effects** in `defer` blocks is allowed, however it is a compile-time error to perform a nonresumable effect, e.g. `Fail<E>: E -> !`, as the intent of `defer` blocks is to enable the effectful cleanup of linear resources.
+
+### 2.7 Raw pointers
+* **Primitive Types:** Silica provides primitive raw pointer types, requiring `unsafe` blocks for dereferencing (`^`) or casting back to safe references.
+    * `Ptr<T>`: A non-nullable, potentially aliased raw pointer to `T`. Offers no compile-time aliasing guarantees.
+    * `RestrictPtr<T>`: A non-nullable, non-aliased raw pointer to `T`. Guarantees exclusive access within its scope (like C's `restrict`), enabling optimizations (`noalias` attribute).
+* **Alignment:** Both `Ptr<T>` and `RestrictPtr<T>` are assumed by the compiler, for optimization purposes to be aligned to `T`'s alignment.
+* **Nullability:** `Ptr<T>` and `RestrictPtr<T>` are assumed to be non-null, for optimization purposes. Nullable pointers use `Option<Ptr<T>>` or `Option<RestrictPtr<T>>`. Compiler NPO ensures these match C's nullable pointer ABI. 
+* **`unsafe` Responsibilities:** When converting raw pointers back to safe references, the programmer must guarantee the pointer points within a live allocation, respects aliasing rules (especially for `RestrictPtr` or when creating `&mut`), and points to memory in the correct initialization state.
+
+### 2.8 Guaranteed Return/Perform/Resume Value Optimizations (RVO/PVO/other RVO)
+* **Functions:** Functions that return a non-scalar type will be rewritten to take an `&out ReturnType` reference, so the final return value may be constructed in-place.
+* **Coroutines:** The coroutine ABI will have a `set_output_ptr` function which will be called at the start of every `handle` block so, even if the coroutine is moved, it has the return place to construct the final return value. The output pointer will contain enough space for:
+  * a discriminant
+  * the maximium size of the return value or all of the perform values
+  * a pointer to the place to put resumption values inside the coroutine's state frame.
+
+### 2.9 Library-Defined Type State Transmutation
+Building upon the flow-sensitive analysis used for reference types (Sec 2.3), Silica allows library-defined owned types to opt into compile-time state tracking, enabling safer state machines and resource management protocols. This is primarily intended for types managing a resource with binary operational states (e.g., Initialized/Uninitialized, Open/Closed, Locked/Unlocked).
+- **Declaration (`~?`):** A type definition prefixed with `~?` signals it has compiler-tracked binary state. Conventionally, `TypeName<T>` refers to the primary state (e.g., Initialized) and `~TypeName<T>` refers to the alternative state (e.g., Uninitialized).
+- **State-Specific Method Implementations:** Methods can be defined to operate only on a specific state or on either state:
+  - `impl TypeName<T> { ... }` Defines methods for the primary state.
+  - `impl ~TypeName<T> { ... }` Defines methods for the alternative state.
+  - `impl ~?TypeName<T> { ... }` Defines methods valid in either state.
+- The compiler uses flow analysis to determine the current state of a variable and resolves methods accordingly.
+- **State Transmutation (`~&mut self`):** Methods that transition the object's state use the special receiver type, `~&'a mut self` which indicates transmutation to the other state after the end of the lifetime `'a`.
+  - Calling such a method consumes the object in its current state and causes the compiler's flow analysis to track the variable as being in the other state subsequently. This is the primary mechanism for implementing state transitions (e.g., `Box::drop_inner(~&mut self)`, `~Box::init(~&mut self, T)`).
+
+### 2.10 `VTable<Trait>`
+- `VTable<Trait>` is a recognized type in the system that's thought of as a struct of run time type information, 
+including function pointers, a type id, and the type's size.
+- There will be some API for using this with a type erased pointer. 
+- TODO:
+
 
 ## 3. Design Rationale and Open Questions
 This section summarizes key design choices where Silica prioritizes certain goals over others, accepting the associated trade-offs.
 
-## 3.1 Accepted Trade offs
+### 3.1 Accepted Trade offs
 This subsection explains the _why_ behind major finalized design choices, clarifying the guiding principles and accepted consequences.
 
 * **Linearity vs. Flexibility**: Silica prioritizes strict linearity by default for maximum resource safety (exactly-once usage). Flexibility and ergonomics are then recovered through opt-in relaxations (discussed above). Trade-off: Requires explicit opt-in for common affine/unrestricted patterns vs. Silica’s linear-by-default.
 * **Immovability vs. Ergonomics**: Silica chooses immovability by default, requiring types to opt into the `Move` trait if they can be safely moved. This simplifies handling of immovable types, including coroutines that emit pointers, enables safe in-place initialization/destruction patterns (via `&out`/`&deinit`), avoids complexities like Rust's `Pin`, and may simplify self-referential types and FFI (TBD). Trade-off: More control for specifying that most things are `Move`.
 * **Effects vs. Built-ins**: Silica uses its algebraic effect system as the primary, unified mechanism for handling computational contexts like errors, concurrency, generators, etc., instead of providing separate built-in language features for each. The goal is greater composability and uniformity. Trade-off: Introduces the complexity of the effect system, and libraries may be less ergonomic than dedicated language features.
 * **Syntax vs. Convention**: Silica adopts some less conventional syntax, notably postfix `handle` and `match` blocks. This choice aims for potentially greater fluency when chaining operations on a value. Trade-off: Reduced familiarity for programmers accustomed to more standard prefix syntax.
-* **Explicitness vs. Ergonomics**: Silica's decision to use explicit postfix dereference operators (`.*`, `.*mut`, etc.) and desugar assignment to specific methods (`assign`/`reassign`) prioritizes explicitness and control over the potential ergonomic convenience of more implicit systems (like Rust's overloaded dot operator or C++'s operator=). Trade-off: More verbose for some common operations but clearer semantics and potentially easier reasoning.
-* **Generality vs. Compiler Complexity**: Making fundamental operations like dereferencing and assignment extensible via traits (to support custom proxies and smart pointers uniformly) adds generality but increases compiler complexity. The compiler needs robust trait resolution and deep integration with analyses like definite assignment. Trade-off: More powerful user-defined types vs. increased compiler implementation effort.
 
 ### 3.2 Open Questions
 This subsection outlines areas where the design is still evolving, involves known difficult interactions, or requires further investigation and decision-making.
-
-* **ImplicitDrop vs. Effectful Deallocation:**
-  * **Tension:** The current design defines `ImplicitDrop::drop` as non-effectful (to potentially enable ASAP destruction and TCO), but many resources (like `malloc` and `free` from C) require effectful cleanup.
-  * **Current Status:** Requires types needing effectful cleanup (like Box) to rely on linearity and an explicit, effectful destroy method, rather than automatic ImplicitDrop.
-  * **Open Question:** Is this separation optimal? Does it place too much burden on the programmer compared to call destructors that can have side effects? Should `drop` be allowed to perform effects, potentially allowing for  benefits?
-
-* **Type-State Analysis / Flow-Sensitive Typing for Initialization:**
-  * **Tension:** Achieving efficient and ergonomic initialization patterns (like `empty_box.*out = value;` implicitly transitioning `empty_box`'s type from `EmptyBox` to `Box`) without compiler magic specific to `Box` is desirable. One approach involves explicit conversion (`unsafe assume initialized`). An alternative involves tracking the state with flow-sensitive typing and allowing the variable's type to change after initialization.
-  * **Current Status:** True flow-sensitive type mutation significantly complicates the planned HM-hybrid type system foundation. However, the ergonomics of the type-state annotation approach are appealing.
-  * **Open Question:** Can a limited form of flow-sensitive type-state tracking for initialization be integrated cleanly into the HM-hybrid system without undue complexity? Or is the explicit conversion function the most pragmatic path despite slightly increased verbosity?
 
 * **Allocation/Deallocation as Effects:**
   * **Tension:** Should fundamental operations like heap memory allocation and deallocation be modeled as algebraic effects? Modeling them as effects makes their usage explicit and integrates them into the handler system (allowing custom allocators via handlers) but means types like `Box` cannot use `ImplicitDrop` for deallocation. Treating them as non-effectful built-ins simplifies `ImplicitDrop` for `Box` but makes allocation less explicit and harder to abstract over. `malloc` and `free` are trivially resumptive (always resume exactly once) which does not harness the power of algebraic effects (resuming multiple times, after a long suspension, or not at all). `perform/resume` may also be expensive for such common operations.
@@ -263,7 +326,7 @@ This subsection outlines areas where the design is still evolving, involves know
 
 ## 4. Implementation State & Plans
 
-## 4.1 Immediate state and Immediate next steps
+### 4.1 Immediate state and Immediate next steps
 * **Parser:** An initial `tree-sitter` grammar has been implemented in `grammar.js`. `parse.rs` accesses the generated parser via the Rust tree-sitter bindings and uses them to build the basic AST structures defined in `ast.rs`. This needs additional testing and integration.
 * **AST & Type Checker:** `ast.rs` implements basic AST nodes (literals, if, call, block, lambda, let, assign, structs). It contains a Hindley-Milner based type inference system (`infer`, `unify`).
   * During type checking, it **mutates the AST nodes in-place** to store the inferred type information within an `Type` field associated with each expression node.
@@ -281,13 +344,14 @@ This subsection outlines areas where the design is still evolving, involves know
   1.  Enhance Parser (`grammar.js`, `parse.rs`) and AST/TypeChecker (`ast.rs`) to support more language features (e.g., structs, basic references).
       1.  The parser does not yet support structs, through the AST/Typechecker does.
       2.  References and Effects are the likely next step for the type checker
-  2.  Implement Lowering from the type-annotated AST to the SSA/MIR form (`sst.rs`).
+  2.  Implement Lowering from the type-annotated AST to the SSA/MIR form (`ssa.rs`).
       1.  Implement last use inference
       2.  Implement lifetime infernece and checking
       3.  Develop LLVM backend code generation from MIR.
+* **Anticipated Implementation order of major features:** Effects should be implemented, followed by linear types, followed by references, followed by flow-sensitive transmutation, followed by defer. Initial implementation of LLVM lowering makes sense after effects and linear types are in the language. 
 
 
-## 4.2 LLVM Coroutine Backend Strategy
+### 4.2 LLVM Coroutine Backend Strategy
 * Silica targets LLVM for code generation. To implement algebraic effects (which manifest as coroutines), Silica will leverage LLVM's built-in coroutine support.
 
 * **Chosen Backend:** The implementation will use the standard, mature LLVM state machine lowering strategy (switched-resume model). This involves transforming effectful Silica functions into state machines using LLVM intrinsics (`@llvm.coro.begin`, `@llvm.coro.suspend`, `@llvm.coro.resume`, `@llvm.coro.destroy`, etc.) and associated optimization passes (`coro-split`, `coro-elide`, `coro-cleanup`).
@@ -306,17 +370,6 @@ This subsection outlines areas where the design is still evolving, involves know
   * **Front End Annotation** Operations marked appropriately (e.g., #[TriviallyResumed], TBD) may cause non-trivial handling to be a front end compile error.
   * Whole program analysis may also determine that an operation is always trivially resumed, enabling suspension point elision during LTO. If the handler can be statically determined, we could elide passing of the function pointer and perform a direct call at the `perform` site. 
 
-## 4.2 Concurrency Model: Structured Concurrency
-Silica will adopt structured concurrency as its primary model for managing concurrent tasks, leveraging the algebraic effect system for its implementation.
-
-* **Core Principle:** The lifetime of concurrent tasks ("children") is strictly bound by a lexical scope. A scope cannot exit until all tasks spawned within it have terminated. This prevents "orphan" tasks and ensures predictable resource management. This model aligns exceptionally well with Silica's features:
-  * **Lifetimes:** Parent tasks waiting for children guarantees that data borrowed from the parent scope by child tasks remains valid for the children's entire lifetime, eliminating a major class of concurrency bugs.
-  * **Linearity:** Ensures resources passed to or used by concurrent tasks are consumed correctly according to their type rules.
-  * **Effects/Handlers:** The concurrency scope is defined naturally using an effect handler. Operations like spawning tasks (`perform Concurrent.spawn(...)`) are handled within this scope.
-* **Cancellation:**
-  * Cancellation is cooperative and initiated by the parent scope/handler.
-  * Checks for cancellation occur implicitly at concurrency-related suspension points within child tasks (e.g., when performing scheduler yields, channel operations, or potentially specific effect operations designated as cancellation points).
-    * Upon detecting cancellation, the parent calls the child coroutine's explicit `destroy` method (see Section 2.3) is called by the concurrency handler to ensure graceful consumption of linear resources (effects performed during destroy/defer unwinding must be resumable).  
 
 ## 5. Alternatives Considered (Deferred or Rejected)
 
@@ -349,29 +402,29 @@ This section documents significant features or design choices that were consider
 
 * **Decision:** Defer. `resume(...)` transfers control away from the handler arm, making code after it unreachable. If the coroutine suspends again, control flow enters from the start of a handler arm.
 
-### 5.3 Arrow Syntax for UFCS Sugar (`->`, `->mut`, etc.)
-* **Alternative Considered:** Using C++/Rust-like arrow syntax (`ptr->method()`, `ptr->mut method()`) as sugar for UFCS calls involving dereferencing.
 
-* **Reasons for Rejection:** While familiar, this syntax chains poorly with multiple indirections `((*p)->method())` and does not compose cleanly with the `?` operator for effectful/fallible dereferencing (`method((*ptr)?` is less ergonomic than `ptr.*.?.method()`). Decision: Adopt postfix dereference operators (`.*`, `.*mut`, etc.) combined with the standard dot (`.`) for UFCS calls for better consistency and composability with effects.
-
-### Custom `=` Assign, Reassign, Setters
+### 5.3 Custom `=` Assign, Reassign, Setters
 * **Alternative Considered:** Desugaring the assignment operator (`=`) to methods defined by traits (`Assign` for initialization, `Reassign` for updates), allowing user-defined types/proxies to customize assignment behavior.
 * **Reasons for Rejection:** While enabling custom logic for proxies, this approach adds potential "magic" or implicit conversion feel to the fundamental assignment operator.
 * **Decision:** Keep assignment (`=`) as a built-in operation with fixed semantics (compiler-driven in-place initialization for uninitialized LHS using literals/constructors, or standard drop-then-move/copy for initialized LHS). Custom update logic requires explicit method calls.
 
 
-### 5.4 Interconnected Value Systems (Limited Self-Reference):
-* **Alternative Considered** Silica may support a pattern where functions return or accept arguments representing a temporary "system" of values with interconnected lifetimes. This simulates limited, safe self-reference, primarily for initialization or temporary access, without requiring a general 'self lifetime feature.
-* **Mechanism:** This involves passing or returning an aggregate (like a struct with named fields, or a tuple) containing an immovable container type along with one or more references borrowing from it. The type signature must express the components and their interconnected lifetimes (potentially via annotations like `(borrowed_mut('a) Box<T>, &'a out T)` - syntax TBD). Guaranteed RVO ensures correct memory placement when returning such systems from functions without invalidating internal references established during creation.
-  * **Properties & Usage:** Such an interconnected system is inherently Immovable (as a unit) and Linear (must be consumed). The caller typically destructures it immediately (`let (container, borrow) = ...;`) or passes it via `&deinit`. The borrow checker, understanding the type signature's constraints, enforces that the container part cannot be used improperly while the borrow part is live. Once the borrow ends, the restriction on the container is lifted.
-  * **Limitations:** Due to the internal borrowing relationships established at creation, obtaining a general mutable reference (`&mut`) to the entire system is disallowed, as it could invalidate internal references. Similarly, `&out` or `&deinit` references to the system cannot decay to `&mut`. Only explicitly destroying/destructuring the system (via `&deinit` or consuming moves) is permitted after its constituent borrows expire. This pattern provides safety for specific initialization/temporary access scenarios but does not enable general-purpose, persistent, mutable self-referential struct types without unsafe.
-* **Reasons for Deferral:** Seems to be of limited use. I can only think of the `fn EmptyBox::fill(self) -> (borrowed_mut('a) Box<T>, &'a out T)` use case. Maybe first class type-states can model this use case better, while also being useful in other ways.
+## 6. Library Design Patterns and Idioms
 
-### 5.5 Overloadable Assignment (Assign/Reassign Traits)
-* **Alternative Considered:** Desugaring the assignment operator (=) to methods defined by traits (Assign for initialization, Reassign for updates), allowing user-defined types/proxies to customize assignment behavior.
-* **Reasons for Rejection:** While enabling custom logic for proxies, this approach complicates type inference (trait resolution depends on both LHS and RHS types) and adds potential "magic" or implicit conversion feel to the fundamental assignment operator. Decision: Keep assignment (=) as a built-in operation with fixed semantics (compiler-driven in-place initialization for uninitialized LHS using literals/constructors, or standard drop-then-move/copy for initialized LHS). Custom update logic requires explicit method calls.
+### 6.1 Concurrency Model: Structured Concurrency
+Silica will adopt structured concurrency as its primary model for managing concurrent tasks, leveraging the algebraic effect system for its implementation.
 
-## 6. AI Assistant Instructions
+* **Core Principle:** The lifetime of concurrent tasks ("children") is strictly bound by a lexical scope. A scope cannot exit until all tasks spawned within it have terminated. This prevents "orphan" tasks and ensures predictable resource management. This model aligns exceptionally well with Silica's features:
+  * **Lifetimes:** Parent tasks waiting for children guarantees that data borrowed from the parent scope by child tasks remains valid for the children's entire lifetime, eliminating a major class of concurrency bugs.
+  * **Linearity:** Ensures resources passed to or used by concurrent tasks are consumed correctly according to their type rules.
+  * **Effects/Handlers:** The concurrency scope is defined naturally using an effect handler. Operations like spawning tasks (`perform Concurrent.spawn(...)`) are handled within this scope.
+* **Cancellation:**
+  * Cancellation is cooperative and initiated by the parent scope/handler.
+  * Checks for cancellation occur implicitly at concurrency-related suspension points within child tasks (e.g., when performing scheduler yields, channel operations, or potentially specific effect operations designated as cancellation points).
+    * Upon detecting cancellation, the parent calls the child coroutine's explicit `destroy` method.
+      * As per Section 2.6, this runs the coroutine's `defer` blocks to ensure graceful consumption of linear resources.
+
+## 7. AI Assistant Instructions
 * **Goal:** Assist in designing and implementing Silica. Be curious, ask clarifying questions, offer constructive criticism, identify inconsistencies, and propose solutions/alternatives based on PL theory and practice (especially Rust, Haskell, ML, Koka influences). The primary designer (the user) is the authority on design decisions. The design is iterative. Explain complex concepts succinctly. Prioritize consistent forwards momentum.
 * **Style:** Collaborative, inquisitive, detailed, encouraging. Reference specific sections/decisions when relevant.
 * **Assume:** The author is an expert in Rust/C++ and is familiar with PL concepts (types, inference, scope, linear types, algebraic effects), but not necessarily deep theory (e.g., category theory, advanced dependent types).
@@ -380,29 +433,28 @@ Key Design Concepts & Decisions Summary:
   * Linearity (exactly-once default), Affinity (`ImplicitDrop`), `ImplicitCopy` (independent of Drop), `Move` trait.
   * `Move` / `Copy` allow user-defined logic (NOT necessarily `memcpy`).
   * Default Immovability. Pass-by-value requires `Move` trait.
-  * Reference Types: `&out T`, `&deinit T`, `&T`, `&mut T`. `&deinit T` used for ownership transfer of immovable types.
+  * Reference Types: `&out T`, `&deinit T`, `&T`, `&mut T`, `&uninit T`. `&deinit T` used for ownership transfer of immovable types.
   * Algebraic Effects: Compositionality focus, Tunneling behavior, all effectful functions return `Co<T!E>` via existential `S`.
   * resume capability (`FnOnce`), `resume.into()` creates movable FnOnce (requires Move on state).
   * Lifetimes: Rust NLL-inspired, analyzed on MIR.
   * Type System: HM-hybrid foundation. Inference mutates AST in-place.
   * Implementation Target: MIR for analysis, LLVM backend.
-  * Syntax: Postfix `handle`/`match`, `->` pointer access, no implicit deref, `?` operator.
+  * Syntax: Postfix `handle`/`match`, postfix dereference (`^`), postfix effect propagation (`?`). Auto-dereferencing operator `->`
+  * `->` simplifies chained (potentially effectful) access, e.g. `foo->` desugaring to `foo.deref()?^.deref()^`. `foo->.bar()` is the syntax for fully dereferencing the chain and accessing a method.
   * `?` Operator: Manages `Co` execution + propagates effects via forwarding `handle`.
   * `handle`: Transfers control; `resume` can be delayed (async).
-  * `perform`: Inside handler arm always forwards outwards.
+  * `perform` inside a `handle` block is not handled by that block, but by the next enclosing `handle` block.
   * pass-by-value requires `Move`
   * efficient unification via interior mutability/Union-Find.
-  * Uniformity for smart pointers (avoid Rust's special Box/Rc/Arc behaviors)
-  * Postfix dereference operators (`.*`, `.*mut`, `.*out`, `.*deinit`) via traits
+  * Uniformity for smart pointers (avoid Rust's special Rc/Arc behaviors)
   * Assignment (`=`): Built-in operation. Performs in-place initialization if LHS uninitialized (compiler handles literals/constructors). Performs drop+move/copy if LHS initialized (error if LHS is linear). Not overloadable via traits; custom updates require explicit methods.
   * Guaranteed Cleanup: Function-scoped defer (LIFO) planned (implementation deferred). Runs on function termination or coroutine destruction. Incompatible with TCO. Effects in `defer` must be resumable to ensure linearity.
+  * Flow sensitive typing for references.
 
-* **Checklist Integration:** When asked to review or regenerate, mentally use the checklist below.
-* **Checklist:** (For AI use when reviewing/generating)
+* **Checklist:** (For AI use when reviewing/generating this document)
   * Check for Clarity: Ensure explanations are understandable to the target audience. Define terms. Provide rationale. Use examples.
   * Check Target Audience Readability (Rust/C++ Dev): Review explanations for novel concepts (effects, linearity, `&deinit`, immovability) to ensure clarity without requiring deep PL theory. Use analogies. Confirm differences from Rust/C++ are explicit.
     * Crucially, when motivating algebraic effects, avoid examples like State or IO which are often seen as trivial non-issues in imperative languages. Focus on demonstrating value through patterns like generators, async/await, exceptions, transactions/retries, etc.
-    * Be mindful when explaining the postfix dereference and assignment desugaring, as these differ significantly from C++/Rust conventions and require clear justification.
   * Check each section meets its goals: (Core Language: final state; Trade-offs: priorities; Implementation: current state + plan; Alternatives: rejected or deferred ideas; AI Instructions: guidance).
   * Check for Completeness: Ensure major features covered. Capture assumptions, definitions, decisions, TBD points for future AI context.
   * Check for DRYness: Ensure concepts explained once, introduced before use, no major repetition between sections.
@@ -410,5 +462,7 @@ Key Design Concepts & Decisions Summary:
   * Check Revision Annotations: When updating, mark changed sections with (Revised Date) and summarize edits. Remove these markers when producing a final export version if requested.
   * Check Heading Levels: Ensure `##` for major, `###` for subsections.
   * Check Export Cleanup: Ensure internal status notes or revision markers are removed before generating a final "export" version when requested.
+  * Ensure internal consistency on the distinct roles of `.`, `^`, `?`, and `->`.
+  * Require explicit instructions for generating the full document. Prefer to only generate subsections, for easier review, and to avoid risking crashes in the AI environment due to large outputs.
 
 Useful Search Terms: "algebraic effects existential types", "linear types lifetimes", "affine types resource management", "scoped effect handlers", "effect tunneling", "SSA for coroutines", "definite assignment analysis", "immovable types language design", "continuation passing style compilation", "LLVM coroutine intrinsics", "Rust MIR borrow checking", "output reference types", "guaranteed copy elision semantics", "effect handlers driving computation", "asynchronous algebraic effects".
