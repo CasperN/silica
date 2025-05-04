@@ -49,6 +49,8 @@ pub enum Expression {
         arg: Box<Expression>,
         resume_type: Type,
     },
+    Propagate(Box<Expression>, Type),
+    // TODO: Handle, CoBlock,
 }
 impl Expression {
     // Clones the type of the expression.
@@ -77,7 +79,8 @@ impl Expression {
                 op: _,
                 arg: _,
                 resume_type: ty,
-            } => {
+            }
+            | Self::Propagate(_, ty) => {
                 let mut ty = ty.clone();
                 ty.compress();
                 ty
@@ -165,7 +168,7 @@ pub struct CoDecl {
 impl CoDecl {
     fn as_type(&self) -> Type {
         let arg_types = self.args.iter().map(|b| b.ty.clone()).collect();
-        let co_type = Type::new(TypeI::Co(self.return_type.clone(), self.ops.clone()));
+        let co_type = Type::co(self.return_type.clone(), self.ops.clone());
         Type::forall(self.forall.clone(), Type::func(arg_types, co_type))
     }
 }
@@ -265,16 +268,87 @@ impl EffectInstance {
     }
 }
 
+// Union find wrapper.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpSetRefCell(Rc<RefCell<OpSetI>>);
+
+#[derive(Debug, Clone, PartialEq)]
+enum OpSetI {
+    Follow(OpSetRefCell),
+    Final(OpSet),
+}
+impl From<OpSet> for OpSetRefCell {
+    fn from(value: OpSet) -> Self {
+        Self::new(value)
+    }
+}
+impl OpSetRefCell {
+    fn new(opset: OpSet) -> Self {
+        Self(Rc::new(RefCell::new(OpSetI::Final(opset))))
+    }
+    fn compress(&mut self) -> &mut Self {
+        if matches!(&*self.0.borrow(), OpSetI::Final(_)) {
+            return self;
+        }
+        // Follow the path to the end.
+        let mut end = self.clone();
+        loop {
+            let next = if let OpSetI::Follow(other) = &*end.0.borrow() {
+                other.clone()
+            } else {
+                break;
+            };
+            end = next;
+        }
+        // Update everything along the path to point directly to the end.
+        let mut current = self.clone();
+        loop {
+            let next = if let OpSetI::Follow(other) = &*current.0.borrow() {
+                other.clone()
+            } else {
+                break;
+            };
+            *current.0.borrow_mut() = OpSetI::Follow(end.clone());
+            current = next;
+        }
+        *self = end.clone();
+        self
+    }
+    fn clone_inner(&self) -> OpSet {
+        let mut s = self.clone();
+        s.compress();
+        let b = s.0.borrow();
+        if let OpSetI::Final(ops) = &*b {
+            ops.clone()
+        } else {
+            unreachable!();
+        }
+    }
+}
+
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct OpSet {
     anonymous_ops: HashMap<String, (Type, Type)>,
-    effects: Vec<(EffectInstance, HashSet<String>)>,
     named_effects: HashMap<String, (EffectInstance, HashSet<String>)>,
+    done_extending: bool,
 }
 
 impl OpSet {
     pub fn empty() -> Self {
         Self::default()
+    }
+    pub fn empty_non_extensible() -> Self {
+        let mut x = Self::empty();
+        x.mark_done_extending();
+        x
+    }
+    fn mark_done_extending(&mut self) -> &mut Self {
+        self.done_extending = true;
+        self
+    }
+    // An Opset is concrete if it will be unchanged under unification.
+    fn is_concrete(&self) -> bool {
+        self.done_extending && self.iter_types().all(|ty| ty.is_concrete())
     }
     fn get(&self, name_or_effect: Option<&str>, op_name: &str) -> Option<(Type, Type)> {
         if name_or_effect.is_none() {
@@ -289,15 +363,6 @@ impl OpSet {
                 return None;
             }
         }
-        for (instance, ops) in self.effects.iter() {
-            if instance.decl.name == name_or_effect {
-                if ops.contains(op_name) {
-                    return Some(instance.unwrap_op_type(op_name));
-                } else {
-                    return None;
-                }
-            }
-        }
         None
     }
     fn iter_types(&self) -> impl Iterator<Item = Type> + '_ {
@@ -309,12 +374,9 @@ impl OpSet {
         for (instance, _) in self.named_effects.values() {
             types.extend(instance.params.values().cloned());
         }
-        for (instance, _) in self.effects.iter() {
-            types.extend(instance.params.values().cloned());
-        }
         types.into_iter()
     }
-    fn iter_types_mut(&mut self) -> impl Iterator<Item = &'_ mut Type>  {
+    fn iter_types_mut(&mut self) -> impl Iterator<Item = &'_ mut Type> {
         let mut types = Vec::new();
         for (p, r) in self.anonymous_ops.values_mut() {
             types.push(p);
@@ -323,89 +385,104 @@ impl OpSet {
         for (instance, _) in self.named_effects.values_mut() {
             types.extend(instance.params.values_mut());
         }
-        for (instance, _) in self.effects.iter_mut() {
-            types.extend(instance.params.values_mut());
-        }
         types.into_iter()
     }
-    fn insert_anonymous_effect(
+    fn unify_add_anonymous_effect(
         &mut self,
         name: &str,
-        perform_type: Type,
-        resume_type: Type,
-    ) -> Result<(), Error> {
+        perform_type: &Type,
+        resume_type: &Type,
+    ) -> Result<&mut Self, Error> {
         match self.anonymous_ops.entry(name.to_string()) {
-            Entry::Occupied(_) => Err(Error::DuplicateAnonymousOpName(name.to_string())),
+            Entry::Occupied(entry) => {
+                let (existing_perform_type, existing_resume_type) = entry.get();
+                unify(perform_type, existing_perform_type)?;
+                unify(resume_type, existing_resume_type)?;
+            }
             Entry::Vacant(entry) => {
-                entry.insert((perform_type, resume_type));
-                Ok(())
+                if self.done_extending {
+                    return Err(Error::OpSetNotExtendable(self.clone()));
+                }
+                entry.insert((perform_type.clone(), resume_type.clone()));
             }
         }
+        Ok(self)
     }
-    fn insert_declared_op(
+    fn unify_add_declared_op(
         &mut self,
         name: Option<&str>,
         instance: &EffectInstance,
         op_name: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<&mut Self, Error> {
         if !instance.decl.ops.contains_key(op_name) {
-            return Err(Error::NoMatchingOpInEffectDecl(op_name.to_string(), instance.decl.as_ref().clone()));
+            return Err(Error::NoMatchingOpInEffectDecl(
+                op_name.to_string(),
+                instance.decl.as_ref().clone(),
+            ));
         }
-        if name.is_none() {
-            // First, try to add it to the unnamed effects.
-            for (existing_instance, ops) in self.effects.iter_mut() {
-                if existing_instance == instance {
-                    ops.insert(op_name.to_string());
-                    return Ok(());
-                }
-                if existing_instance.decl.name == instance.decl.name && existing_instance != instance {
-                    return Err(Error::OpSetNameConflict(instance.decl.name.to_string()));
-                }
-            }
-            // Before we append the new effect instance to the unnamed effects, we ensure there is no
-            // ambiguity introduced with named effects:
-            for (named_instance, _) in self.named_effects.values() {
-                if named_instance.decl.name == instance.decl.name {
-                    return Err(Error::OpSetNameConflict(instance.decl.name.to_string()));
-                }
-            }
-            self.effects.push((instance.clone(), HashSet::from([op_name.to_string()])));
-            return Ok(());
-        }
-        let name = name.unwrap().to_string();
+        // Unnamed declared effects take their effect declaration name by default.
+        let name = name.unwrap_or(&instance.decl.name).to_string();
         match self.named_effects.entry(name) {
             Entry::Occupied(mut entry) => {
-                let existing_instance = &entry.get().0;
-                if existing_instance != instance {
-                    return Err(Error::NamedEffectInstanceMismatch(existing_instance.clone(), instance.clone()));
+                let (existing_instance, existing_ops) = entry.get_mut();
+                if existing_instance.decl != instance.decl {
+                    return Err(Error::EffectDeclMismatch(
+                        instance.decl.as_ref().clone(),
+                        existing_instance.decl.as_ref().clone(),
+                    ));
                 }
-                entry.get_mut().1.insert(op_name.to_string());
-            },
+                // Unify the params map.
+                unify_params(&existing_instance.params, &instance.params, || {
+                    panic!(
+                        "Two instances of the same effect should \
+                        have the same type param ids. \
+                        Left:{existing_instance:?}, Right:{instance:?}"
+                    )
+                })?;
+                existing_ops.insert(op_name.to_string());
+            }
             Entry::Vacant(entry) => {
-                // Need to check that there's no ambiguity introduced with the unnamed effects before inserting.
-                for (existing_instance, _) in self.effects.iter() {
-                    if existing_instance.decl.name == instance.decl.name {
-                        return Err(Error::NamedEffectInstanceMismatch(existing_instance.clone(), instance.clone()));
-                    }
+                if self.done_extending {
+                    return Err(Error::OpSetNotExtendable(self.clone()));
                 }
                 entry.insert((instance.clone(), HashSet::from_iter([op_name.to_string()])));
             }
         }
-        Ok(())
+        Ok(self)
+    }
+
+    fn try_unify_with(&self, other: &Self) -> Result<Self, Error> {
+        // Ensure if either of them are extendable, the extendable one is on the left.
+        let (left, right) = match (self.done_extending, other.done_extending) {
+            (false, true) => (other, self),
+            (_, _) => (self, other),
+        };
+        let mut result = left.clone();
+        for (op_name, (perform_type, resume_type)) in right.anonymous_ops.iter() {
+            result.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
+        }
+        for (effect_name, (instance, ops)) in right.named_effects.iter() {
+            for op_name in ops.iter() {
+                result.unify_add_declared_op(Some(effect_name), instance, op_name)?;
+            }
+        }
+        Ok(result)
     }
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
 enum TypeI {
+    #[default]
+    Unit,
     Int,
     Bool,
     Float,
-    #[default]
-    Unit,
     Fn(Vec<Type>, Type),
-    Forall(Vec<u32>, Type),
     StructInstance(StructInstance),
-    Co(Type, OpSet),
+    Co(Type, OpSetRefCell),
+
+    // TODO: Consider deleting -- only top level declarations should be polymorphic.
+    Forall(Vec<u32>, Type),
 
     // Unknown type variable. Unifies with any other type.
     // Should not appear in generic types.
@@ -450,6 +527,9 @@ impl Type {
     pub fn struct_(s: StructInstance) -> Self {
         Self::new(TypeI::StructInstance(s))
     }
+    pub fn co(ty: Type, ops: impl Into<OpSetRefCell>) -> Type {
+        Self::new(TypeI::Co(ty, ops.into()))
+    }
     fn inner(&self) -> std::cell::Ref<TypeI> {
         self.0.borrow()
     }
@@ -480,9 +560,15 @@ impl Type {
             }
             TypeI::Co(ty, ops) => {
                 ty.compress();
-                for ty in ops.iter_types_mut() {
-                    ty.compress();
-                }
+                let mut ops = ops.clone();
+                ops.compress();
+                if let OpSetI::Final(ops) = &mut *ops.0.borrow_mut() {
+                    for ty in ops.iter_types_mut() {
+                        ty.compress();
+                    }
+                } else {
+                    unreachable!()
+                };
             }
         }
         self
@@ -541,7 +627,17 @@ impl Type {
                 params.values().any(|p| p.contains_ptr(other))
             }
             TypeI::Co(ty, ops) => {
-                ty.contains_ptr(other) || ops.iter_types().any(|ty| ty.contains_ptr(other))
+                if ty.contains_ptr(other) {
+                    return true;
+                }
+                let mut ops = ops.clone();
+                ops.compress();
+                let contains_ptr = if let OpSetI::Final(ops) = &*ops.0.borrow_mut() {
+                    ops.iter_types().any(|ty| ty.contains_ptr(other))
+                } else {
+                    unreachable!()
+                };
+                contains_ptr
             }
         }
     }
@@ -585,9 +681,15 @@ impl Type {
             TypeI::Follow(_) => panic!("Instantiating a TypeI::Follow."),
             TypeI::Co(ty, ops) => {
                 ty.instantiate_with(subs);
-                for ty in ops.iter_types_mut() {
-                    ty.instantiate_with(subs);
-                }
+                let mut ops = ops.clone();
+                ops.compress();
+                if let OpSetI::Final(ops) = &mut *ops.0.borrow_mut() {
+                    for ty in ops.iter_types_mut() {
+                        ty.instantiate_with(subs);
+                    }
+                } else {
+                    unreachable!();
+                };
             }
         }
         *self = Self::new(i)
@@ -636,9 +738,43 @@ impl Type {
             TypeI::Follow(_) => panic!("TypeI::Follow used."),
             TypeI::Co(ty, ops) => {
                 ty.insert_type_params(output);
-                for ty in ops.iter_types() {
-                    ty.insert_type_params(output);
+                let mut ops = ops.clone();
+                ops.compress();
+                if let OpSetI::Final(ops) = &*ops.0.borrow() {
+                    for ty in ops.iter_types() {
+                        ty.insert_type_params(output);
+                    }
+                } else {
+                    unreachable!();
+                };
+            }
+        }
+    }
+    // A concrete type will be unchanged under unification.
+    fn is_concrete(&self) -> bool {
+        match &*self.0.borrow() {
+            TypeI::Bool | TypeI::Int | TypeI::Float | TypeI::Unit | TypeI::Param(_) => true,
+            TypeI::Unknown => false,
+            TypeI::Forall(_, ty) => ty.is_concrete(),
+            TypeI::Fn(args, ret) => ret.is_concrete() && args.iter().all(|a| a.is_concrete()),
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
+                params.values().all(|p| p.is_concrete())
+            }
+            TypeI::Follow(ty) => ty.is_concrete(),
+            TypeI::Co(ty, ops) => {
+                if ty.is_concrete() {
+                    return true;
                 }
+                let mut ops = ops.clone();
+                ops.compress();
+                if let OpSetI::Final(ops) = &*ops.0.borrow() {
+                    if ops.iter_types().any(|ty| ty.is_concrete()) {
+                        return false;
+                    }
+                } else {
+                    unreachable!();
+                };
+                true
             }
         }
     }
@@ -666,7 +802,7 @@ struct TypeContext {
     // FnDecls are checked, lambdas and such are inferred. OpSet perhas should be optional too, to distinguish
     // between "this perform is not allowed" and "this is not a coroutine."
     return_type: Type,
-    ops: Option<OpSet>,
+    ops: Option<OpSetRefCell>,
 }
 impl TypeContext {
     fn new() -> Self {
@@ -710,8 +846,9 @@ impl TypeContext {
     fn enter_activation_frame(
         &mut self,
         mut return_type: Type,
-        mut ops: Option<OpSet>,
+        ops: Option<OpSet>,
     ) -> ShadowTypeContext {
+        let mut ops = ops.map(OpSetRefCell::new);
         std::mem::swap(&mut return_type, &mut self.return_type);
         std::mem::swap(&mut ops, &mut self.ops);
         ShadowTypeContext {
@@ -729,7 +866,7 @@ struct ShadowTypeContext<'a> {
     type_context: &'a mut TypeContext,
     shadowed_variables: HashMap<String, Option<NamedItem>>,
     shadowed_return_type: Option<Type>,
-    shadowed_ops: Option<Option<OpSet>>,
+    shadowed_ops: Option<Option<OpSetRefCell>>,
     finished: bool,
 }
 impl<'a> ShadowTypeContext<'a> {
@@ -833,6 +970,37 @@ enum Error {
     OpSetNameConflict(String),
     NoMatchingOpInEffectDecl(String, EffectDecl),
     NamedEffectInstanceMismatch(EffectInstance, EffectInstance),
+    FnDeclMustHaveConcreteTypes(FnDecl),
+    CoDeclMustHaveConcreteTypes(CoDecl),
+    StructDeclMustHaveConcreteTypes(StructDecl),
+    EffectDeclMismatch(EffectDecl, EffectDecl),
+    OpSetNotUnifiable(OpSet, OpSet),
+    OpSetNotExtendable(OpSet),
+}
+
+fn unify_params(
+    left_params: &HashMap<u32, Type>,
+    right_params: &HashMap<u32, Type>,
+    panic_msg: impl Fn() -> String,
+) -> Result<(), Error> {
+    assert_eq!(left_params.len(), right_params.len());
+    for (param_id, left_ty) in left_params.iter() {
+        let right_ty = right_params
+            .get(param_id)
+            .unwrap_or_else(|| panic!("{}", panic_msg()));
+        unify(left_ty, right_ty)?
+    }
+    Ok(())
+}
+
+fn unify_opsets(left: &OpSetRefCell, right: &OpSetRefCell) -> Result<(), Error> {
+    // TODO: this is not a very efficient way to do unification.
+    let left_inner = left.clone_inner();
+    let right_inner = right.clone_inner();
+    let result = left_inner.try_unify_with(&right_inner)?;
+    *left.0.borrow_mut() = OpSetI::Final(result.clone());
+    *right.0.borrow_mut() = OpSetI::Follow(left.clone());
+    Ok(())
 }
 
 // Unifies two types via interior mutability.
@@ -880,18 +1048,16 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
                 params: right_params,
                 decl: right_decl,
             }),
-        ) if left_decl == right_decl => {
-            assert_eq!(left_params.len(), right_params.len());
-            for (param_id, left_ty) in left_params.iter() {
-                let right_ty = right_params.get(param_id).unwrap_or_else(|| {
-                    panic!(
-                        "Two instance of the same struct should \
-                        have the same type param ids. \
-                        Left:{left:?}, Right:{right:?}"
-                    )
-                });
-                unify(left_ty, right_ty)?
-            }
+        ) if left_decl == right_decl => unify_params(left_params, right_params, || {
+            panic!(
+                "Two instance of the same struct should \
+                    have the same type param ids. \
+                    Left:{left:?}, Right:{right:?}"
+            )
+        }),
+        (TypeI::Co(left_ty, left_ops), TypeI::Co(right_ty, right_ops)) => {
+            unify(left_ty, right_ty)?;
+            unify_opsets(left_ops, right_ops)?;
             Ok(())
         }
         _ => Err(Error::NotUnifiable(left.clone(), right.clone())),
@@ -1023,9 +1189,13 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                     op_name: op.clone(),
                 });
             }
-            dbg!(&name, &op, &arg);
-            if let Some((perform_ty, resume_ty)) =
-                context.ops.as_ref().unwrap().get(name.as_deref(), op)
+            // TODO: Expensive and needless clone.
+            if let Some((perform_ty, resume_ty)) = context
+                .ops
+                .as_ref()
+                .unwrap()
+                .clone_inner()
+                .get(name.as_deref(), op)
             {
                 unify(&arg.get_type(), &perform_ty)?;
                 unify(expr_ty, &resume_ty)?;
@@ -1036,6 +1206,17 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                     op_name: op.clone(),
                 })
             }
+        }
+        Expression::Propagate(expr, ty) => {
+            infer(context, expr)?;
+            // TODO: Maybe context ops shouldn't be optional and should just be empty_non_extensible...
+            let context_ops = context
+                .ops
+                .clone()
+                .unwrap_or_else(|| OpSet::empty_non_extensible().into());
+            let co_ty = Type::co(ty.clone(), context_ops);
+            unify(&co_ty, &expr.get_type())?;
+            Ok(())
         }
         Expression::Block {
             statements,
@@ -1104,6 +1285,11 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
     for declaration in program.0.iter() {
         match declaration {
             Declaration::Fn(fn_decl) => {
+                if !(fn_decl.args.iter().all(|binding| binding.ty.is_concrete())
+                    && fn_decl.return_type.is_concrete())
+                {
+                    return Err(Error::FnDeclMustHaveConcreteTypes(fn_decl.clone()));
+                }
                 if shadow.context_contains(&fn_decl.name) {
                     return Err(Error::DuplicateTopLevelName(fn_decl.name.clone()));
                 }
@@ -1111,11 +1297,16 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 for binding in fn_decl.args.iter() {
                     arg_types.push(binding.ty.clone());
                 }
-                // TODO: Verify that top level declarations have no free type variables.
                 // TODO: args need to declare mutability.
                 shadow.insert_variable(fn_decl.name.clone(), fn_decl.as_type(), false);
             }
             Declaration::Co(co_decl) => {
+                if !(co_decl.args.iter().all(|binding| binding.ty.is_concrete())
+                    && co_decl.return_type.is_concrete()
+                    && co_decl.ops.is_concrete())
+                {
+                    return Err(Error::CoDeclMustHaveConcreteTypes(co_decl.clone()));
+                }
                 if shadow.context_contains(&co_decl.name) {
                     return Err(Error::DuplicateTopLevelName(co_decl.name.clone()));
                 }
@@ -1123,7 +1314,6 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 for binding in co_decl.args.iter() {
                     arg_types.push(binding.ty.clone());
                 }
-                // TODO: Verify that top level declarations have no free type variables.
                 // TODO: args need to declare mutability.
                 shadow.insert_variable(co_decl.name.clone(), co_decl.as_type(), false);
             }
@@ -1337,6 +1527,9 @@ pub mod test_helpers {
             arg: Box::new(arg.into()),
             resume_type: Type::unknown(),
         }
+    }
+    pub fn propagate(expr: impl Into<Expression>) -> Expression {
+        Expression::Propagate(Box::new(expr.into()), Type::unknown())
     }
 }
 
@@ -1953,7 +2146,9 @@ mod tests {
     #[test]
     fn perform_anonymous_effect() {
         let mut ops = OpSet::empty();
-        ops.insert_anonymous_effect("foo", Type::int(), Type::bool_()).unwrap();
+        ops.unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap();
+        ops.mark_done_extending();
         let program = &mut Program(vec![Declaration::Co(CoDecl {
             forall: vec![],
             name: "main".to_string(),
@@ -1975,22 +2170,28 @@ mod tests {
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param(0))),
                 ("set".into(), (Type::param(0), Type::unit())),
-            ])
+            ]),
         };
         let int_state_instance = EffectInstance {
             decl: Rc::new(state_effect.clone()),
-            params: HashMap::from_iter([(0, Type::int())])
+            params: HashMap::from_iter([(0, Type::int())]),
         };
         let bool_state_instance = EffectInstance {
             decl: Rc::new(state_effect.clone()),
-            params: HashMap::from_iter([(0, Type::bool_())])
+            params: HashMap::from_iter([(0, Type::bool_())]),
         };
 
         let mut ops = OpSet::empty();
-        ops.insert_declared_op(Some("int_state"), &int_state_instance, "get").unwrap();
-        ops.insert_declared_op(Some("int_state"), &int_state_instance, "set").unwrap();
-        ops.insert_declared_op(Some("bool_state"), &bool_state_instance, "get").unwrap();
-        ops.insert_declared_op(Some("bool_state"), &bool_state_instance, "set").unwrap();
+        ops.unify_add_declared_op(Some("int_state"), &int_state_instance, "get")
+            .unwrap();
+        ops.unify_add_declared_op(Some("int_state"), &int_state_instance, "set")
+            .unwrap();
+        ops.unify_add_declared_op(Some("bool_state"), &bool_state_instance, "get")
+            .unwrap();
+        ops.unify_add_declared_op(Some("bool_state"), &bool_state_instance, "set")
+            .unwrap();
+        ops.mark_done_extending();
+        dbg!(&ops);
 
         let program = &mut Program(vec![
             Declaration::Effect(state_effect),
@@ -2005,36 +2206,37 @@ mod tests {
                     perform("int_state", "set", "x").into(),
                     let_stmt("y", Type::bool_(), false, perform("bool_state", "get", ())),
                     perform("bool_state", "set", "y").into(),
-                    "y".into()
+                    "y".into(),
                 ])),
-            })
+            }),
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
-    fn conflicting_parametric_effects_one_named() {
+    fn two_state_effects_ok_because_one_is_named() {
         let state_effect = EffectDecl {
             name: "State".to_string(),
             params: HashSet::from_iter([0]),
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param(0))),
                 ("set".into(), (Type::param(0), Type::unit())),
-            ])
+            ]),
         };
         let int_state_instance = EffectInstance {
             decl: Rc::new(state_effect.clone()),
-            params: HashMap::from_iter([(0, Type::int())])
+            params: HashMap::from_iter([(0, Type::int())]),
         };
         let bool_state_instance = EffectInstance {
             decl: Rc::new(state_effect.clone()),
-            params: HashMap::from_iter([(0, Type::bool_())])
+            params: HashMap::from_iter([(0, Type::bool_())]),
         };
         let mut ops = OpSet::empty();
-        ops.insert_declared_op(Some("int_state"), &int_state_instance, "get").unwrap();
-        assert_eq!(
-            ops.insert_declared_op(None, &bool_state_instance, "set"),
-            Err(Error::OpSetNameConflict("State".to_string())),
-        );
+        ops.unify_add_declared_op(Some("int_state"), &int_state_instance, "get")
+            .unwrap();
+        assert!(matches!(
+            ops.unify_add_declared_op(None, &bool_state_instance, "set"),
+            Ok(_)
+        ));
     }
     #[test]
     fn conflicting_parametric_effects_both_unnamed() {
@@ -2044,21 +2246,126 @@ mod tests {
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param(0))),
                 ("set".into(), (Type::param(0), Type::unit())),
-            ])
+            ]),
         };
         let int_state_instance = EffectInstance {
             decl: Rc::new(state_effect.clone()),
-            params: HashMap::from_iter([(0, Type::int())])
+            params: HashMap::from_iter([(0, Type::int())]),
         };
         let bool_state_instance = EffectInstance {
             decl: Rc::new(state_effect.clone()),
-            params: HashMap::from_iter([(0, Type::bool_())])
+            params: HashMap::from_iter([(0, Type::bool_())]),
         };
         let mut ops = OpSet::empty();
-        ops.insert_declared_op(None, &int_state_instance, "get").unwrap();
+        ops.unify_add_declared_op(None, &int_state_instance, "get")
+            .unwrap();
+        // TODO: This probably could use a more informative error.
         assert_eq!(
-            ops.insert_declared_op(None, &bool_state_instance, "set"),
-            Err(Error::OpSetNameConflict("State".to_string())),
+            dbg!(ops.unify_add_declared_op(None, &bool_state_instance, "set")),
+            Err(Error::NotUnifiable(Type::int(), Type::bool_()))
         );
     }
+    #[test]
+    fn empty_opset_is_identity_under_unification() {
+        let state_effect = EffectDecl {
+            name: "State".to_string(),
+            params: HashSet::from_iter([0]),
+            ops: HashMap::from_iter([
+                ("get".into(), (Type::unit(), Type::param(0))),
+                ("set".into(), (Type::param(0), Type::unit())),
+            ]),
+        };
+        let int_state_instance = EffectInstance {
+            decl: Rc::new(state_effect.clone()),
+            params: HashMap::from_iter([(0, Type::int())]),
+        };
+        let bool_state_instance = EffectInstance {
+            decl: Rc::new(state_effect.clone()),
+            params: HashMap::from_iter([(0, Type::bool_())]),
+        };
+        let mut ops = OpSet::empty();
+        ops.unify_add_declared_op(Some("int_state"), &int_state_instance, "get")
+            .unwrap();
+        ops.unify_add_declared_op(Some("bool_state"), &bool_state_instance, "set")
+            .unwrap();
+        ops.unify_add_anonymous_effect("foo", &Type::unit(), &Type::float())
+            .unwrap();
+        ops.mark_done_extending();
+        let original_ops = ops.clone();
+        let ops = OpSetRefCell::new(ops);
+        let was_empty = OpSetRefCell::new(OpSet::empty());
+        unify_opsets(&ops, &was_empty).unwrap();
+        assert_eq!(ops.clone_inner(), original_ops);
+        assert_eq!(was_empty.clone_inner(), original_ops);
+    }
+    #[test]
+    fn test_propagate_subset_of_effects() {
+        let mut ops = OpSet::empty();
+        ops.unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap();
+        ops.mark_done_extending();
+        let program = &mut Program(vec![
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_foo".to_string(),
+                args: vec![],
+                return_type: Type::bool_(),
+                ops: ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "propagates_foo".to_string(),
+                args: vec![],
+                return_type: Type::bool_(),
+                ops,
+                body: Some(block_expr(vec![propagate(call_expr(
+                    "performs_foo",
+                    vec![],
+                ))
+                .into()])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn test_propagate_subset_of_effects_fails_in_fn() {
+        let mut ops = OpSet::empty();
+        ops.unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap();
+        ops.mark_done_extending();
+        let program = &mut Program(vec![
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_foo".to_string(),
+                args: vec![],
+                return_type: Type::bool_(),
+                ops: ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "cannot_propagate_foo".to_string(),
+                args: vec![],
+                return_type: Type::bool_(),
+                body: Some(block_expr(vec![propagate(call_expr(
+                    "performs_foo",
+                    vec![],
+                ))
+                .into()])),
+            }),
+        ]);
+        // TODO: What would the real error be?
+        assert_eq!(
+            typecheck_program(program),
+            Err(Error::OpSetNotExtendable(OpSet::empty_non_extensible()))
+        );
+    }
+    // TODO: Test ```let x = || foo()?;``` gets the right type.
 }
