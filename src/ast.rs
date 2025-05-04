@@ -197,7 +197,7 @@ impl StructDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectDecl {
     name: String,
-    params: HashSet<u32>, // TODO: wrap effect params in a newtype
+    params: HashSet<u32>,
     ops: HashMap<String, (Type, Type)>,
 }
 impl EffectDecl {
@@ -286,7 +286,6 @@ impl OpSet {
             if ops.contains(op_name) {
                 return Some(instance.unwrap_op_type(op_name));
             } else {
-                // TODO: Error, op not in opset.
                 return None;
             }
         }
@@ -295,7 +294,6 @@ impl OpSet {
                 if ops.contains(op_name) {
                     return Some(instance.unwrap_op_type(op_name));
                 } else {
-                    // TODO: Error, op not in opset.
                     return None;
                 }
             }
@@ -458,7 +456,6 @@ impl Type {
     // Recursively compresses away any instances of `Follow` in the type.
     fn compress(&mut self) -> &mut Self {
         self.compress_direct_path();
-        // TODO: Do you really need to compress direct path recursively?
         match &mut *self.0.borrow_mut() {
             TypeI::Bool
             | TypeI::Float
