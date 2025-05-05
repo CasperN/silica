@@ -43,6 +43,7 @@ pub enum Expression {
         body: Box<Expression>,
         lambda_type: Type,
     },
+    Co(Box<Expression>, Type, OpSetRefCell),
     Perform {
         name: Option<String>,
         op: String,
@@ -50,7 +51,7 @@ pub enum Expression {
         resume_type: Type,
     },
     Propagate(Box<Expression>, Type),
-    // TODO: Handle, CoBlock,
+    // TODO: Handle,
 }
 impl Expression {
     // Clones the type of the expression.
@@ -85,6 +86,7 @@ impl Expression {
                 ty.compress();
                 ty
             }
+            Self::Co(_, return_ty, ops) => Type::co(return_ty.clone(), ops.clone()),
         }
     }
 }
@@ -282,15 +284,21 @@ impl From<OpSet> for OpSetRefCell {
         Self::new(value)
     }
 }
+impl Default for OpSetRefCell {
+    fn default() -> Self {
+        Self::new(OpSet::empty())
+    }
+}
+
 impl OpSetRefCell {
     fn new(opset: OpSet) -> Self {
         Self(Rc::new(RefCell::new(OpSetI::Final(opset))))
     }
-    fn compress(&mut self) -> &mut Self {
-        if matches!(&*self.0.borrow(), OpSetI::Final(_)) {
-            return self;
-        }
-        // Follow the path to the end.
+    fn empty_non_extensible() -> Self {
+        Self::new(OpSet::empty_non_extensible())
+    }
+    // Traverses to the end of a union-find path.
+    fn traverse_to_end(&self) -> Self {
         let mut end = self.clone();
         loop {
             let next = if let OpSetI::Follow(other) = &*end.0.borrow() {
@@ -300,6 +308,32 @@ impl OpSetRefCell {
             };
             end = next;
         }
+        end
+    }
+    fn is_empty(&self) -> bool {
+        let end = self.traverse_to_end();
+        let borrow = end.0.borrow();
+        if let OpSetI::Final(op_set) = &*borrow {
+            op_set.anonymous_ops.is_empty() && op_set.named_effects.is_empty()
+        } else {
+            unreachable!()
+        }
+    }
+    fn is_extendable(&self) -> bool {
+        let end = self.traverse_to_end();
+        let borrow = end.0.borrow();
+        if let OpSetI::Final(op_set) = &*borrow {
+            !op_set.done_extending
+        } else {
+            unreachable!()
+        }
+    }
+    fn compress(&mut self) -> &mut Self {
+        if matches!(&*self.0.borrow(), OpSetI::Final(_)) {
+            return self;
+        }
+        // Follow the path to the end.
+        let end = self.traverse_to_end();
         // Update everything along the path to point directly to the end.
         let mut current = self.clone();
         loop {
@@ -802,7 +836,7 @@ struct TypeContext {
     // FnDecls are checked, lambdas and such are inferred. OpSet perhas should be optional too, to distinguish
     // between "this perform is not allowed" and "this is not a coroutine."
     return_type: Type,
-    ops: Option<OpSetRefCell>,
+    ops: OpSetRefCell,
 }
 impl TypeContext {
     fn new() -> Self {
@@ -846,9 +880,8 @@ impl TypeContext {
     fn enter_activation_frame(
         &mut self,
         mut return_type: Type,
-        ops: Option<OpSet>,
+        mut ops: OpSetRefCell,
     ) -> ShadowTypeContext {
-        let mut ops = ops.map(OpSetRefCell::new);
         std::mem::swap(&mut return_type, &mut self.return_type);
         std::mem::swap(&mut ops, &mut self.ops);
         ShadowTypeContext {
@@ -866,7 +899,7 @@ struct ShadowTypeContext<'a> {
     type_context: &'a mut TypeContext,
     shadowed_variables: HashMap<String, Option<NamedItem>>,
     shadowed_return_type: Option<Type>,
-    shadowed_ops: Option<Option<OpSetRefCell>>,
+    shadowed_ops: Option<OpSetRefCell>,
     finished: bool,
 }
 impl<'a> ShadowTypeContext<'a> {
@@ -1155,7 +1188,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             let lambda_return_type = Type::unknown();
             let mut shadow = context.enter_activation_frame(
                 lambda_return_type.clone(),
-                None, // TODO: Lambdas can't perform effects... yet?
+                OpSetRefCell::empty_non_extensible(),
             );
             for binding in bindings.iter() {
                 shadow.insert_soft_binding(binding.clone());
@@ -1177,25 +1210,27 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             shadow.finish();
             Ok(())
         }
+        Expression::Co(expr, return_ty, ops) => {
+            let mut shadow = context.enter_activation_frame(return_ty.clone(), ops.clone());
+            infer(shadow.context(), expr)?;
+            unify(return_ty, &expr.get_type())?;
+            Ok(())
+        }
         Expression::Perform {
             name,
             op,
             arg,
             resume_type: expr_ty,
         } => {
-            if context.ops.is_none() {
+            if context.ops.is_empty() && !context.ops.is_extendable() {
                 return Err(Error::PerformedEffectsNotallowedInContext {
                     effect_or_instance: name.clone(),
                     op_name: op.clone(),
                 });
             }
             // TODO: Expensive and needless clone.
-            if let Some((perform_ty, resume_ty)) = context
-                .ops
-                .as_ref()
-                .unwrap()
-                .clone_inner()
-                .get(name.as_deref(), op)
+            if let Some((perform_ty, resume_ty)) =
+                context.ops.clone_inner().get(name.as_deref(), op)
             {
                 unify(&arg.get_type(), &perform_ty)?;
                 unify(expr_ty, &resume_ty)?;
@@ -1210,11 +1245,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
         Expression::Propagate(expr, ty) => {
             infer(context, expr)?;
             // TODO: Maybe context ops shouldn't be optional and should just be empty_non_extensible...
-            let context_ops = context
-                .ops
-                .clone()
-                .unwrap_or_else(|| OpSet::empty_non_extensible().into());
-            let co_ty = Type::co(ty.clone(), context_ops);
+            let co_ty = Type::co(ty.clone(), context.ops.clone());
             unify(&co_ty, &expr.get_type())?;
             Ok(())
         }
@@ -1351,9 +1382,10 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 let body = body.as_mut().unwrap();
 
                 // Declare a new shadow to insert fn variables.
-                let mut shadow = shadow
-                    .context()
-                    .enter_activation_frame(return_type.clone(), None);
+                let mut shadow = shadow.context().enter_activation_frame(
+                    return_type.clone(),
+                    OpSetRefCell::empty_non_extensible(),
+                );
                 for binding in args.iter() {
                     shadow.insert_binding(binding.clone()); // TODO: variables need to declare mutaiblity.
                 }
@@ -1377,7 +1409,7 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 // Declare a new shadow to insert fn variables.
                 let mut shadow = shadow
                     .context()
-                    .enter_activation_frame(return_type.clone(), Some(ops.clone()));
+                    .enter_activation_frame(return_type.clone(), ops.clone().into());
                 for binding in args.iter() {
                     shadow.insert_binding(binding.clone()); // TODO: variables need to declare mutaiblity.
                 }
@@ -1530,6 +1562,13 @@ pub mod test_helpers {
     }
     pub fn propagate(expr: impl Into<Expression>) -> Expression {
         Expression::Propagate(Box::new(expr.into()), Type::unknown())
+    }
+    pub fn co_expr(expr: impl Into<Expression>) -> Expression {
+        Expression::Co(
+            Box::new(expr.into()),
+            Type::unknown(),
+            OpSetRefCell::default(),
+        )
     }
 }
 
@@ -2367,5 +2406,47 @@ mod tests {
             Err(Error::OpSetNotExtendable(OpSet::empty_non_extensible()))
         );
     }
+    #[test]
+    fn test_lambda_coroutine() {
+        let mut ops = OpSet::empty();
+        ops.unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap();
+        ops.mark_done_extending();
+        let program = &mut Program(vec![
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_foo".to_string(),
+                args: vec![],
+                return_type: Type::bool_(),
+                ops: ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "propagates_foo".to_string(),
+                args: vec![],
+                return_type: Type::func(vec![], Type::co(Type::bool_(), ops)),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "x",
+                        None,
+                        false,
+                        lambda_expr(
+                            vec![],
+                            co_expr(block_expr(vec![
+                                return_stmt(propagate(call_expr("performs_foo", vec![])))
+                            ])),
+                        ),
+                    ),
+                    "x".into(),
+                ])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+
     // TODO: Test ```let x = || foo()?;``` gets the right type.
 }
