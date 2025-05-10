@@ -1092,7 +1092,8 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
             unify(left_ty, right_ty)?;
             unify_opsets(left_ops, right_ops)?;
             Ok(())
-        }
+        },
+        (TypeI::Param(l), TypeI::Param(r)) if l == r => Ok(()),
         _ => Err(Error::NotUnifiable(left.clone(), right.clone())),
     };
     result
@@ -2177,6 +2178,66 @@ mod tests {
                         },
                     ),
                     field("p", "left").into(),
+                ])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn curried_pair_polymorphic_fn_test() {
+        let pair = StructDecl::new(
+            "Pair",
+            &[("left", Type::param(0)), ("right", Type::param(1))],
+        );
+        let pair_type = |left_type, right_type| {
+            Type::struct_(StructInstance {
+                decl: Rc::new(pair.clone()),
+                params: HashMap::from_iter([
+                    (0, left_type),
+                    (1, right_type)
+                ])
+            })
+        };
+        let program = &mut Program(vec![
+            Declaration::Struct(pair.clone()),
+            Declaration::Fn(FnDecl {
+                forall: vec![0, 1],
+                name: "make_pair".to_string(),
+                args: vec![TypedBinding::new("a", Type::param(0), false)],
+                return_type: Type::func(vec![Type::param(1)], pair_type(Type::param(0), Type::param(1))),
+                body: Some(block_expr(vec![
+                    lambda_expr(vec![SoftBinding::new("b", None, false)], Expression::LiteralStruct {
+                        name: "Pair".to_string(),
+                        fields: HashMap::from_iter([
+                            ("left".into(), "a".into()),
+                            ("right".into(), "b".into()),
+                        ]),
+                        ty: Type::unknown(),
+                    }).into()
+                ]))
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: pair_type(
+                    pair_type(Type::bool_(), Type::int()),
+                    pair_type(Type::int(), Type::float()),
+                ),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "bool_int",
+                        None,
+                        false,
+                        call_expr(call_expr("make_pair", vec![true.into()]), vec![123.into()]),
+                    ),
+                    let_stmt(
+                        "int_float",
+                        None,
+                        false,
+                        call_expr(call_expr("make_pair", vec![123.into()]), vec![12.3.into()]),
+                    ),
+                    call_expr(call_expr("make_pair", vec!["bool_int".into()]), vec!["int_float".into()]).into(),
                 ])),
             }),
         ]);
