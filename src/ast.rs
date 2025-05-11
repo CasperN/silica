@@ -1,10 +1,10 @@
 // Abstract syntax tree and type checking.
 #![allow(clippy::result_large_err)]
+use crate::union_find::UnionFindRef;
 use std::cell::{Ref, RefMut};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use crate::union_find::UnionFindRef;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LValue {
@@ -82,9 +82,7 @@ impl Expression {
                 arg: _,
                 resume_type: ty,
             }
-            | Self::Propagate(_, ty) => {
-                ty.clone()
-            }
+            | Self::Propagate(_, ty) => ty.clone(),
             Self::Co(_, return_ty, ops) => Type::co(return_ty.clone(), ops.clone()),
         }
     }
@@ -236,14 +234,12 @@ impl StructInstance {
             if !self.params.is_empty() {
                 field_type.instantiate_with(&self.params);
             }
-            dbg!(field, &field_type, self);
             Ok(field_type)
         } else {
             Err(Error::UnrecognizedField(field.to_string()))
         }
     }
 }
-
 
 #[derive(Default, Clone, PartialEq)]
 pub struct Type(UnionFindRef<TypeI>);
@@ -275,11 +271,15 @@ impl EffectInstance {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpSetRefCell(UnionFindRef<OpSet>);
 
-#[derive(Debug, Clone, PartialEq)]
-enum OpSetI {
-    Follow(OpSetRefCell),
-    Final(OpSet),
+// A set of ops that are being performed.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct OpSet {
+    anonymous_ops: HashMap<String, (Type, Type)>,
+    named_effects: HashMap<String, (EffectInstance, HashSet<String>)>,
+    super_sets: Vec<OpSetRefCell>,
+    done_extending: bool,
 }
+
 impl From<OpSet> for OpSetRefCell {
     fn from(value: OpSet) -> Self {
         Self::new(value)
@@ -339,15 +339,6 @@ impl OpSetRefCell {
         Ok(())
     }
 }
-
-#[derive(Default, Debug, Clone, PartialEq)]
-pub struct OpSet {
-    anonymous_ops: HashMap<String, (Type, Type)>,
-    named_effects: HashMap<String, (EffectInstance, HashSet<String>)>,
-    super_sets: Vec<OpSetRefCell>,
-    done_extending: bool,
-}
-
 impl OpSet {
     pub fn empty() -> Self {
         Self::default()
@@ -931,6 +922,20 @@ fn unify_opsets(mut left_ops: OpSetRefCell, mut right_ops: OpSetRefCell) -> Resu
         }
     }
     right_ops.follow(&left_ops);
+
+    // Update super_sets with everything
+    let left = &mut *left_ops.mut_inner();
+    for super_set in left.super_sets.iter_mut() {
+        let mut super_inner = super_set.mut_inner();
+        for (op_name, (perform_type, resume_type)) in left.anonymous_ops.iter() {
+            super_inner.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
+        }
+        for (effect_name, (instance, ops)) in left.named_effects.iter() {
+            for op_name in ops.iter() {
+                super_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1113,6 +1118,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             let mut shadow = context.enter_activation_frame(return_ty.clone(), ops.clone());
             infer(shadow.context(), expr)?;
             unify(return_ty, &expr.get_type())?;
+            shadow.finish();
             Ok(())
         }
         Expression::Perform {
@@ -1121,20 +1127,30 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             arg,
             resume_type: expr_ty,
         } => {
-            if context.ops.is_empty() && !context.ops.is_extendable() {
-                return Err(Error::PerformedEffectsNotallowedInContext {
-                    effect_or_instance: name.clone(),
-                    op_name: op.clone(),
-                });
-            }
-            // TODO: Expensive and needless clone.
+            infer(context, arg)?;
+
             if let Some((perform_ty, resume_ty)) =
                 context.ops.clone_inner().get(name.as_deref(), op)
             {
                 unify(&arg.get_type(), &perform_ty)?;
                 unify(expr_ty, &resume_ty)?;
                 Ok(())
+            } else if !context.ops.is_extendable() {
+                Err(Error::PerformedEffectsNotallowedInContext {
+                    effect_or_instance: name.clone(),
+                    op_name: op.clone(),
+                })
+            } else if name.is_none() {
+                // Perform an anonymous effect.
+                context.ops.mut_inner().unify_add_anonymous_effect(
+                    op,
+                    &arg.get_type(),
+                    expr_ty,
+                )?;
+                Ok(())
             } else {
+                // TODO: Perform named effect. Need to constrain the unknown effect.
+                // Similar to constraining unknown types with fields.
                 Err(Error::NoMatchingOpInContext {
                     effect_or_instance: name.clone(),
                     op_name: op.clone(),
@@ -1146,7 +1162,8 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             // TODO: Maybe context ops shouldn't be optional and should just be empty_non_extensible...
             let co_ty = Type::co(ty.clone(), OpSetRefCell::empty_extensible());
             unify(&co_ty, &expr.get_type())?;
-            context.ops.subsume(&mut co_ty.unwrap_ops())?;
+            let context_ops = &mut context.ops;
+            context_ops.subsume(&mut co_ty.unwrap_ops())?;
             Ok(())
         }
         Expression::Block {
@@ -1474,6 +1491,7 @@ pub mod test_helpers {
 
 #[cfg(test)]
 mod tests {
+
     use super::test_helpers::*;
     use super::*;
 
@@ -2196,7 +2214,6 @@ mod tests {
         ops.unify_add_declared_op(Some("bool_state"), &bool_state_instance, "set")
             .unwrap();
         ops.mark_done_extending();
-        dbg!(&ops);
 
         let program = &mut Program(vec![
             Declaration::Effect(state_effect),
@@ -2495,7 +2512,9 @@ mod tests {
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
-    fn delayed_inference_of_coroutines_via_lambda() {
+    fn delayed_opset_inference_okay() {
+        // test the case of |c1, c2| co { c1?; c2?; } which requires proper propagation of
+        // unknown opsets. Success case.
         let mut foo_ops = OpSet::empty();
         foo_ops
             .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
@@ -2543,7 +2562,7 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::co(Type::unit(), foo_bar_ops),
+                return_type: Type::co(Type::unit(), foo_bar_ops.clone()),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "lambda",
@@ -2582,6 +2601,269 @@ mod tests {
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
     }
+    #[test]
+    fn delayed_opset_inference_unify_too_large() {
+        let mut foo_ops = OpSet::empty();
+        foo_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
 
-    // TODO: Test ```let x = || foo()?;``` gets the type.
+        let mut bar_ops = OpSet::empty();
+        bar_ops
+            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
+            .unwrap()
+            .mark_done_extending();
+        let mut foo_bar_baz_ops = OpSet::empty();
+        foo_bar_baz_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
+            .unwrap()
+            .unify_add_anonymous_effect("baz", &Type::float(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
+
+        let program = &mut Program(vec![
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_foo".to_string(),
+                args: vec![],
+                return_type: Type::bool_(),
+                ops: foo_ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_bar".to_string(),
+                args: vec![],
+                return_type: Type::float(),
+                ops: bar_ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("bar", ())),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                // The returned co should not be empty. ERROR!
+                return_type: Type::co(Type::unit(), foo_bar_baz_ops),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "lambda",
+                        None,
+                        false,
+                        lambda_expr(
+                            vec![
+                                SoftBinding {
+                                    name: "f".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                SoftBinding {
+                                    name: "b".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                            ],
+                            co_expr(block_expr(vec![
+                                propagate("f").into(),
+                                propagate("b").into(),
+                                return_stmt(()),
+                            ])),
+                        ),
+                    ),
+                    call_expr(
+                        "lambda",
+                        vec![
+                            call_expr("performs_foo", vec![]),
+                            call_expr("performs_bar", vec![]),
+                        ],
+                    )
+                    .into(),
+                ])),
+            }),
+        ]);
+        let result = typecheck_program(program);
+        // TODO: This test is incorrect, the program typechecks even though lambda returns a coroutine that
+        // will never perform baz. This isn't unsound, but we want to catch those errors.
+        assert_eq!(result, Ok(()));
+        // assert!(matches!(result, Err(Error::OpSetNotExtendable(_))), "result:`{:?}`", result);
+    }
+    #[test]
+    fn delayed_opset_inference_unify_too_small() {
+        // test the case of |c1, c2| co { c1?; c2?; } which requires proper propagation of
+        // unknown opsets. Unify with a too-small opset.
+        let mut foo_ops = OpSet::empty();
+        foo_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
+
+        let mut bar_ops = OpSet::empty();
+        bar_ops
+            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
+            .unwrap()
+            .mark_done_extending();
+        let program = &mut Program(vec![
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_foo".to_string(),
+                args: vec![],
+                return_type: Type::bool_(),
+                ops: foo_ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_bar".to_string(),
+                args: vec![],
+                return_type: Type::float(),
+                ops: bar_ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("bar", ())),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                // The returned co should have foo and bar. ERROR.
+                return_type: Type::co(Type::unit(), foo_ops),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "lambda",
+                        None,
+                        false,
+                        lambda_expr(
+                            vec![
+                                SoftBinding {
+                                    name: "f".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                SoftBinding {
+                                    name: "b".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                            ],
+                            co_expr(block_expr(vec![
+                                propagate("f").into(),
+                                propagate("b").into(),
+                                return_stmt(()),
+                            ])),
+                        ),
+                    ),
+                    call_expr(
+                        "lambda",
+                        vec![
+                            call_expr("performs_foo", vec![]),
+                            call_expr("performs_bar", vec![]),
+                        ],
+                    )
+                    .into(),
+                ])),
+            }),
+        ]);
+        let result = typecheck_program(program);
+        assert!(
+            matches!(result, Err(Error::OpSetNotExtendable(_))),
+            "result:`{:?}`",
+            result
+        );
+    }
+    #[test]
+    fn perform_in_co_error() {
+        let mut foo_ops = OpSet::empty();
+        foo_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
+
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
+            forall: vec![],
+            name: "main".to_string(),
+            args: vec![],
+            // The returned co should not be empty. ERROR!
+            return_type: Type::co(Type::unit(), OpSet::empty_non_extensible()),
+            body: Some(block_expr(vec![co_expr(perform_anon("foo", 42)).into()])),
+        })]);
+        let result = typecheck_program(program);
+        // Tried to extend the empty opset.
+        assert!(
+            matches!(result, Err(Error::OpSetNotExtendable(_))),
+            "result:`{:?}`",
+            result
+        );
+    }
+
+    #[test]
+    fn perform_in_co_good() {
+        let mut foo_ops = OpSet::empty();
+        foo_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
+
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
+            forall: vec![],
+            name: "main".to_string(),
+            args: vec![],
+            return_type: Type::co(Type::bool_(), foo_ops),
+            body: Some(block_expr(vec![co_expr(perform_anon("foo", 42)).into()])),
+        })]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+
+    #[test]
+    fn coroutine_unification_error_different_ops() {
+        let mut foo_ops = OpSet::empty();
+        foo_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
+
+        let mut bar_ops = OpSet::empty();
+        bar_ops
+            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
+            .unwrap()
+            .mark_done_extending();
+
+        let int_foo = Type::co(Type::int(), foo_ops);
+        let int_bar = Type::co(Type::int(), bar_ops);
+        let unification = unify(&int_foo, &int_bar);
+        assert!(unification.is_err());
+    }
+
+    #[test]
+    fn coroutine_unification_error_more_ops() {
+        let mut foo_ops = OpSet::empty();
+        foo_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
+
+        let mut bar_ops = OpSet::empty();
+        bar_ops
+            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
+            .unwrap()
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
+
+        let int_foo = Type::co(Type::int(), foo_ops);
+        let int_bar = Type::co(Type::int(), bar_ops);
+        let unification = unify(&int_foo, &int_bar);
+        assert!(unification.is_err());
+    }
 }

@@ -43,7 +43,6 @@ impl<T> Clone for UnionFindRef<T> {
     }
 }
 
-
 impl<T: Clone> From<T> for UnionFindRef<T> {
     fn from(value: T) -> Self {
         Self::new(value)
