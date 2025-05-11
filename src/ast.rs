@@ -1,6 +1,6 @@
 // Abstract syntax tree and type checking.
 #![allow(clippy::result_large_err)]
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -297,6 +297,9 @@ impl OpSetRefCell {
     fn empty_non_extensible() -> Self {
         Self::new(OpSet::empty_non_extensible())
     }
+    fn empty_extensible() -> Self {
+        Self::new(OpSet::empty())
+    }
     // Traverses to the end of a union-find path.
     fn traverse_to_end(&self) -> Self {
         let mut end = self.clone();
@@ -358,12 +361,40 @@ impl OpSetRefCell {
             unreachable!();
         }
     }
+    fn mut_inner(&mut self) -> std::cell::RefMut<OpSet> {
+        self.compress();
+        let borrow = self.0.borrow_mut();
+        std::cell::RefMut::map(borrow, |b| match b {
+            OpSetI::Final(op_set) => op_set,
+            OpSetI::Follow(_) => unreachable!(),
+        })
+    }
+
+    /// Adds all effects of `other` into `self` and makes `self` a super-set of `other`.
+    ///
+    /// When future ops of `other` are added, they will also be added to `self`.
+    fn subsume(&mut self, other: &mut Self) -> Result<(), Error> {
+        let mut other_inner = other.mut_inner();
+        let self_clone = self.clone();
+        let mut self_inner = self.mut_inner();
+        for (op_name, (perform_type, resume_type)) in other_inner.anonymous_ops.iter() {
+            self_inner.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
+        }
+        for (effect_name, (instance, ops)) in other_inner.named_effects.iter() {
+            for op_name in ops {
+                self_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
+            }
+        }
+        other_inner.super_sets.push(self_clone);
+        Ok(())
+    }
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct OpSet {
     anonymous_ops: HashMap<String, (Type, Type)>,
     named_effects: HashMap<String, (EffectInstance, HashSet<String>)>,
+    super_sets: Vec<OpSetRefCell>,
     done_extending: bool,
 }
 
@@ -438,6 +469,13 @@ impl OpSet {
                     return Err(Error::OpSetNotExtendable(self.clone()));
                 }
                 entry.insert((perform_type.clone(), resume_type.clone()));
+                for super_set in self.super_sets.iter() {
+                    super_set.clone().mut_inner().unify_add_anonymous_effect(
+                        name,
+                        perform_type,
+                        resume_type,
+                    )?;
+                }
             }
         }
         Ok(self)
@@ -455,8 +493,8 @@ impl OpSet {
             ));
         }
         // Unnamed declared effects take their effect declaration name by default.
-        let name = name.unwrap_or(&instance.decl.name).to_string();
-        match self.named_effects.entry(name) {
+        let name_str = name.unwrap_or(&instance.decl.name).to_string();
+        match self.named_effects.entry(name_str) {
             Entry::Occupied(mut entry) => {
                 let (existing_instance, existing_ops) = entry.get_mut();
                 if existing_instance.decl != instance.decl {
@@ -480,6 +518,12 @@ impl OpSet {
                     return Err(Error::OpSetNotExtendable(self.clone()));
                 }
                 entry.insert((instance.clone(), HashSet::from_iter([op_name.to_string()])));
+                for super_set in self.super_sets.iter() {
+                    super_set
+                        .clone()
+                        .mut_inner()
+                        .unify_add_declared_op(name, instance, op_name)?;
+                }
             }
         }
         Ok(self)
@@ -499,6 +543,9 @@ impl OpSet {
             for op_name in ops.iter() {
                 result.unify_add_declared_op(Some(effect_name), instance, op_name)?;
             }
+        }
+        for super_set in right.super_sets.iter() {
+            result.super_sets.push(super_set.clone());
         }
         Ok(result)
     }
@@ -812,6 +859,13 @@ impl Type {
             }
         }
     }
+
+    fn unwrap_ops(&self) -> OpSetRefCell {
+        if let TypeI::Co(_, ops) = &*self.0.borrow() {
+            return ops.clone();
+        }
+        panic!("unwrap_ops called on a non-coroutine.");
+    }
 }
 
 #[derive(PartialEq, Debug)]
@@ -1092,7 +1146,7 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
             unify(left_ty, right_ty)?;
             unify_opsets(left_ops, right_ops)?;
             Ok(())
-        },
+        }
         (TypeI::Param(l), TypeI::Param(r)) if l == r => Ok(()),
         _ => Err(Error::NotUnifiable(left.clone(), right.clone())),
     };
@@ -1246,8 +1300,9 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
         Expression::Propagate(expr, ty) => {
             infer(context, expr)?;
             // TODO: Maybe context ops shouldn't be optional and should just be empty_non_extensible...
-            let co_ty = Type::co(ty.clone(), context.ops.clone());
+            let co_ty = Type::co(ty.clone(), OpSetRefCell::empty_extensible());
             unify(&co_ty, &expr.get_type())?;
+            context.ops.subsume(&mut co_ty.unwrap_ops())?;
             Ok(())
         }
         Expression::Block {
@@ -2192,10 +2247,7 @@ mod tests {
         let pair_type = |left_type, right_type| {
             Type::struct_(StructInstance {
                 decl: Rc::new(pair.clone()),
-                params: HashMap::from_iter([
-                    (0, left_type),
-                    (1, right_type)
-                ])
+                params: HashMap::from_iter([(0, left_type), (1, right_type)]),
             })
         };
         let program = &mut Program(vec![
@@ -2204,17 +2256,22 @@ mod tests {
                 forall: vec![0, 1],
                 name: "make_pair".to_string(),
                 args: vec![TypedBinding::new("a", Type::param(0), false)],
-                return_type: Type::func(vec![Type::param(1)], pair_type(Type::param(0), Type::param(1))),
-                body: Some(block_expr(vec![
-                    lambda_expr(vec![SoftBinding::new("b", None, false)], Expression::LiteralStruct {
+                return_type: Type::func(
+                    vec![Type::param(1)],
+                    pair_type(Type::param(0), Type::param(1)),
+                ),
+                body: Some(block_expr(vec![lambda_expr(
+                    vec![SoftBinding::new("b", None, false)],
+                    Expression::LiteralStruct {
                         name: "Pair".to_string(),
                         fields: HashMap::from_iter([
                             ("left".into(), "a".into()),
                             ("right".into(), "b".into()),
                         ]),
                         ty: Type::unknown(),
-                    }).into()
-                ]))
+                    },
+                )
+                .into()])),
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
@@ -2237,7 +2294,11 @@ mod tests {
                         false,
                         call_expr(call_expr("make_pair", vec![123.into()]), vec![12.3.into()]),
                     ),
-                    call_expr(call_expr("make_pair", vec!["bool_int".into()]), vec!["int_float".into()]).into(),
+                    call_expr(
+                        call_expr("make_pair", vec!["bool_int".into()]),
+                        vec!["int_float".into()],
+                    )
+                    .into(),
                 ])),
             }),
         ]);
@@ -2400,17 +2461,27 @@ mod tests {
     }
     #[test]
     fn test_propagate_subset_of_effects() {
-        let mut ops = OpSet::empty();
-        ops.unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap();
-        ops.mark_done_extending();
+        let mut foo_ops = OpSet::empty();
+        foo_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
+
+        let mut foo_bar_ops = OpSet::empty();
+        foo_bar_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
+            .unwrap()
+            .mark_done_extending();
+
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
                 forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
-                ops: ops.clone(),
+                ops: foo_ops.clone(),
                 body: Some(block_expr(vec![
                     let_stmt("p", None, false, perform_anon("foo", 1)),
                     "p".into(),
@@ -2421,7 +2492,7 @@ mod tests {
                 name: "propagates_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
-                ops,
+                ops: foo_bar_ops,
                 body: Some(block_expr(vec![propagate(call_expr(
                     "performs_foo",
                     vec![],
@@ -2497,12 +2568,171 @@ mod tests {
                         false,
                         lambda_expr(
                             vec![],
-                            co_expr(block_expr(vec![
-                                return_stmt(propagate(call_expr("performs_foo", vec![])))
-                            ])),
+                            co_expr(block_expr(vec![return_stmt(propagate(call_expr(
+                                "performs_foo",
+                                vec![],
+                            )))])),
                         ),
                     ),
                     "x".into(),
+                ])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+
+    #[test]
+    fn test_propagate_two_sets_of_effects() {
+        let mut foo_ops = OpSet::empty();
+        foo_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
+
+        let mut bar_ops = OpSet::empty();
+        bar_ops
+            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
+            .unwrap()
+            .mark_done_extending();
+
+        let mut foo_bar_ops = OpSet::empty();
+        foo_bar_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
+            .unwrap()
+            .mark_done_extending();
+
+        let program = &mut Program(vec![
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_foo".to_string(),
+                args: vec![],
+                return_type: Type::bool_(),
+                ops: foo_ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_bar".to_string(),
+                args: vec![],
+                return_type: Type::float(),
+                ops: bar_ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("bar", ())),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "propagates_foo".to_string(),
+                args: vec![],
+                return_type: Type::co(Type::unit(), foo_bar_ops),
+                body: Some(block_expr(vec![co_expr(block_expr(vec![
+                    let_stmt(
+                        "f",
+                        None,
+                        false,
+                        propagate(call_expr("performs_foo", vec![])),
+                    ),
+                    let_stmt(
+                        "b",
+                        None,
+                        false,
+                        propagate(call_expr("performs_bar", vec![])),
+                    ),
+                ]))
+                .into()])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn delayed_inference_of_coroutines_via_lambda() {
+        let mut foo_ops = OpSet::empty();
+        foo_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .mark_done_extending();
+
+        let mut bar_ops = OpSet::empty();
+        bar_ops
+            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
+            .unwrap()
+            .mark_done_extending();
+
+        let mut foo_bar_ops = OpSet::empty();
+        foo_bar_ops
+            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
+            .unwrap()
+            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
+            .unwrap()
+            .mark_done_extending();
+
+        let program = &mut Program(vec![
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_foo".to_string(),
+                args: vec![],
+                return_type: Type::bool_(),
+                ops: foo_ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Co(CoDecl {
+                forall: vec![],
+                name: "performs_bar".to_string(),
+                args: vec![],
+                return_type: Type::float(),
+                ops: bar_ops.clone(),
+                body: Some(block_expr(vec![
+                    let_stmt("p", None, false, perform_anon("bar", ())),
+                    "p".into(),
+                ])),
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::co(Type::unit(), foo_bar_ops),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "lambda",
+                        None,
+                        false,
+                        lambda_expr(
+                            vec![
+                                SoftBinding {
+                                    name: "f".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                SoftBinding {
+                                    name: "b".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                            ],
+                            co_expr(block_expr(vec![
+                                propagate("f").into(),
+                                propagate("b").into(),
+                                return_stmt(()),
+                            ])),
+                        ),
+                    ),
+                    call_expr(
+                        "lambda",
+                        vec![
+                            call_expr("performs_foo", vec![]),
+                            call_expr("performs_bar", vec![]),
+                        ],
+                    )
+                    .into(),
                 ])),
             }),
         ]);
