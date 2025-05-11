@@ -18,6 +18,7 @@ TODO:
 mod ast;
 mod parse;
 mod ssa;
+mod union_find;
 
 use tree_sitter::{Language, Parser};
 

@@ -1,9 +1,10 @@
 // Abstract syntax tree and type checking.
 #![allow(clippy::result_large_err)]
-use std::cell::{Ref, RefCell};
+use std::cell::{Ref, RefMut};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use crate::union_find::UnionFindRef;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LValue {
@@ -82,9 +83,7 @@ impl Expression {
                 resume_type: ty,
             }
             | Self::Propagate(_, ty) => {
-                let mut ty = ty.clone();
-                ty.compress();
-                ty
+                ty.clone()
             }
             Self::Co(_, return_ty, ops) => Type::co(return_ty.clone(), ops.clone()),
         }
@@ -245,13 +244,15 @@ impl StructInstance {
     }
 }
 
+
 #[derive(Default, Clone, PartialEq)]
-pub struct Type(Rc<RefCell<TypeI>>);
+pub struct Type(UnionFindRef<TypeI>);
 
 // Make it transparent over the contents.
 impl std::fmt::Debug for Type {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner();
+        let mut s = self.clone();
+        let inner = s.inner();
         write!(f, "{inner:?}")
     }
 }
@@ -272,7 +273,7 @@ impl EffectInstance {
 
 // Union find wrapper.
 #[derive(Debug, Clone, PartialEq)]
-pub struct OpSetRefCell(Rc<RefCell<OpSetI>>);
+pub struct OpSetRefCell(UnionFindRef<OpSet>);
 
 #[derive(Debug, Clone, PartialEq)]
 enum OpSetI {
@@ -292,7 +293,7 @@ impl Default for OpSetRefCell {
 
 impl OpSetRefCell {
     fn new(opset: OpSet) -> Self {
-        Self(Rc::new(RefCell::new(OpSetI::Final(opset))))
+        Self(UnionFindRef::new(opset))
     }
     fn empty_non_extensible() -> Self {
         Self::new(OpSet::empty_non_extensible())
@@ -300,74 +301,23 @@ impl OpSetRefCell {
     fn empty_extensible() -> Self {
         Self::new(OpSet::empty())
     }
-    // Traverses to the end of a union-find path.
-    fn traverse_to_end(&self) -> Self {
-        let mut end = self.clone();
-        loop {
-            let next = if let OpSetI::Follow(other) = &*end.0.borrow() {
-                other.clone()
-            } else {
-                break;
-            };
-            end = next;
-        }
-        end
-    }
     fn is_empty(&self) -> bool {
-        let end = self.traverse_to_end();
-        let borrow = end.0.borrow();
-        if let OpSetI::Final(op_set) = &*borrow {
-            op_set.anonymous_ops.is_empty() && op_set.named_effects.is_empty()
-        } else {
-            unreachable!()
-        }
+        self.0.clone().inner().is_empty()
     }
     fn is_extendable(&self) -> bool {
-        let end = self.traverse_to_end();
-        let borrow = end.0.borrow();
-        if let OpSetI::Final(op_set) = &*borrow {
-            !op_set.done_extending
-        } else {
-            unreachable!()
-        }
+        !self.0.clone().inner().done_extending
     }
-    fn compress(&mut self) -> &mut Self {
-        if matches!(&*self.0.borrow(), OpSetI::Final(_)) {
-            return self;
-        }
-        // Follow the path to the end.
-        let end = self.traverse_to_end();
-        // Update everything along the path to point directly to the end.
-        let mut current = self.clone();
-        loop {
-            let next = if let OpSetI::Follow(other) = &*current.0.borrow() {
-                other.clone()
-            } else {
-                break;
-            };
-            *current.0.borrow_mut() = OpSetI::Follow(end.clone());
-            current = next;
-        }
-        *self = end.clone();
-        self
+    fn inner(&mut self) -> Ref<OpSet> {
+        self.0.inner()
+    }
+    fn mut_inner(&mut self) -> RefMut<OpSet> {
+        self.0.inner_mut()
     }
     fn clone_inner(&self) -> OpSet {
-        let mut s = self.clone();
-        s.compress();
-        let b = s.0.borrow();
-        if let OpSetI::Final(ops) = &*b {
-            ops.clone()
-        } else {
-            unreachable!();
-        }
+        self.0.clone_inner()
     }
-    fn mut_inner(&mut self) -> std::cell::RefMut<OpSet> {
-        self.compress();
-        let borrow = self.0.borrow_mut();
-        std::cell::RefMut::map(borrow, |b| match b {
-            OpSetI::Final(op_set) => op_set,
-            OpSetI::Follow(_) => unreachable!(),
-        })
+    fn follow(&self, other: &OpSetRefCell) {
+        self.0.clone().follow(&other.0);
     }
 
     /// Adds all effects of `other` into `self` and makes `self` a super-set of `other`.
@@ -411,6 +361,10 @@ impl OpSet {
         self.done_extending = true;
         self
     }
+    fn is_empty(&self) -> bool {
+        self.anonymous_ops.is_empty() && self.named_effects.is_empty()
+    }
+
     // An Opset is concrete if it will be unchanged under unification.
     fn is_concrete(&self) -> bool {
         self.done_extending && self.iter_types().all(|ty| ty.is_concrete())
@@ -508,7 +462,7 @@ impl OpSet {
                     panic!(
                         "Two instances of the same effect should \
                         have the same type param ids. \
-                        Left:{existing_instance:?}, Right:{instance:?}"
+                        Left:{existing_instance:?}, 15:{instance:?}"
                     )
                 })?;
                 existing_ops.insert(op_name.to_string());
@@ -527,27 +481,6 @@ impl OpSet {
             }
         }
         Ok(self)
-    }
-
-    fn try_unify_with(&self, other: &Self) -> Result<Self, Error> {
-        // Ensure if either of them are extendable, the extendable one is on the left.
-        let (left, right) = match (self.done_extending, other.done_extending) {
-            (false, true) => (other, self),
-            (_, _) => (self, other),
-        };
-        let mut result = left.clone();
-        for (op_name, (perform_type, resume_type)) in right.anonymous_ops.iter() {
-            result.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
-        }
-        for (effect_name, (instance, ops)) in right.named_effects.iter() {
-            for op_name in ops.iter() {
-                result.unify_add_declared_op(Some(effect_name), instance, op_name)?;
-            }
-        }
-        for super_set in right.super_sets.iter() {
-            result.super_sets.push(super_set.clone());
-        }
-        Ok(result)
     }
 }
 
@@ -572,14 +505,11 @@ enum TypeI {
     // A type parameter. It should not appear during unification as
     // types need to be instantiated before then.
     Param(u32),
-
-    // Points to another type that this is an alias for, as per the union-find algorithm.
-    Follow(Type),
 }
 
 impl Type {
     fn new(i: TypeI) -> Self {
-        Self(Rc::new(RefCell::new(i)))
+        Self(UnionFindRef::new(i))
     }
     pub fn bool_() -> Self {
         Self::new(TypeI::Bool)
@@ -611,93 +541,24 @@ impl Type {
     pub fn co(ty: Type, ops: impl Into<OpSetRefCell>) -> Type {
         Self::new(TypeI::Co(ty, ops.into()))
     }
-    fn inner(&self) -> std::cell::Ref<TypeI> {
-        self.0.borrow()
+    fn inner(&mut self) -> Ref<TypeI> {
+        self.0.inner()
     }
-    // Recursively compresses away any instances of `Follow` in the type.
-    fn compress(&mut self) -> &mut Self {
-        self.compress_direct_path();
-        match &mut *self.0.borrow_mut() {
-            TypeI::Bool
-            | TypeI::Float
-            | TypeI::Int
-            | TypeI::Unit
-            | TypeI::Unknown
-            | TypeI::Param(_) => {}
-            TypeI::Follow(_) => unreachable!(), // compress direct path.
-            TypeI::Fn(args, ret) => {
-                for arg in args.iter_mut() {
-                    arg.compress();
-                }
-                ret.compress();
-            }
-            TypeI::Forall(_, ty) => {
-                ty.compress();
-            }
-            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
-                for param_type in params.values_mut() {
-                    param_type.compress();
-                }
-            }
-            TypeI::Co(ty, ops) => {
-                ty.compress();
-                let mut ops = ops.clone();
-                ops.compress();
-                if let OpSetI::Final(ops) = &mut *ops.0.borrow_mut() {
-                    for ty in ops.iter_types_mut() {
-                        ty.compress();
-                    }
-                } else {
-                    unreachable!()
-                };
-            }
-        }
-        self
-    }
-    // Compresses Follow paths (e.g. Follow(Follow(T)) -> T ).
-    fn compress_direct_path(&mut self) -> &mut Self {
-        // Fast path, we're not following anyone.
-        if !matches!(&*self.inner(), TypeI::Follow(_)) {
-            return self;
-        }
-        // Follow the type references to the end.
-        let mut end = self.clone();
-        loop {
-            let next = if let TypeI::Follow(other) = &*end.0.borrow() {
-                other.clone()
-            } else {
-                break;
-            };
-            end = next;
-        }
-        // Traverse the path again and make everyone point to end.
-        let mut follower = self.clone();
-        loop {
-            let next = if let TypeI::Follow(other) = &*follower.0.borrow() {
-                other.clone()
-            } else {
-                break;
-            };
-            *follower.0.borrow_mut() = TypeI::Follow(end.clone());
-            follower = next;
-        }
-        // This Type can point to the end-type, omitting any Follow nodes.
-        *self = end.clone();
-        self
+    fn inner_mut(&mut self) -> RefMut<TypeI> {
+        self.0.inner_mut()
     }
 
     fn contains_ptr(&self, other: &Type) -> bool {
-        if Rc::ptr_eq(&self.0, &other.0) {
+        if self.0.ptr_eq(&other.0) {
             return true;
         }
-        match &*self.0.borrow() {
+        match &*self.clone().inner() {
             TypeI::Int
             | TypeI::Bool
             | TypeI::Float
             | TypeI::Unit
             | TypeI::Param(_)
             | TypeI::Unknown => false,
-            TypeI::Follow(ty) => ty.contains_ptr(other),
             TypeI::Forall(_, ty) => ty.contains_ptr(other),
             TypeI::Fn(arg_types, ret_type) => {
                 arg_types.iter().any(|a| a.contains_ptr(other)) || ret_type.contains_ptr(other)
@@ -708,17 +569,12 @@ impl Type {
                 params.values().any(|p| p.contains_ptr(other))
             }
             TypeI::Co(ty, ops) => {
-                if ty.contains_ptr(other) {
-                    return true;
-                }
-                let mut ops = ops.clone();
-                ops.compress();
-                let contains_ptr = if let OpSetI::Final(ops) = &*ops.0.borrow_mut() {
-                    ops.iter_types().any(|ty| ty.contains_ptr(other))
-                } else {
-                    unreachable!()
-                };
-                contains_ptr
+                ty.contains_ptr(other)
+                    || ops
+                        .clone()
+                        .inner()
+                        .iter_types()
+                        .any(|ty| ty.contains_ptr(other))
             }
         }
     }
@@ -726,7 +582,7 @@ impl Type {
         if other.contains_ptr(self) {
             return Err(Error::InfiniteType(self.clone(), other.clone()));
         }
-        *self.0.borrow_mut() = TypeI::Follow(other.clone());
+        self.0.follow(&other.0);
         Ok(())
     }
 
@@ -759,25 +615,18 @@ impl Type {
                     param.instantiate_with(subs);
                 }
             }
-            TypeI::Follow(_) => panic!("Instantiating a TypeI::Follow."),
             TypeI::Co(ty, ops) => {
                 ty.instantiate_with(subs);
-                let mut ops = ops.clone();
-                ops.compress();
-                if let OpSetI::Final(ops) = &mut *ops.0.borrow_mut() {
-                    for ty in ops.iter_types_mut() {
-                        ty.instantiate_with(subs);
-                    }
-                } else {
-                    unreachable!();
-                };
+                for ty in ops.mut_inner().iter_types_mut() {
+                    ty.instantiate_with(subs);
+                }
             }
         }
         *self = Self::new(i)
     }
 
     // Instantiates Forall types with new type variables.
-    fn instantiate(self) -> Self {
+    fn instantiate(mut self) -> Self {
         let i = self.inner().clone();
         if let TypeI::Forall(params, mut ty) = i {
             let mut subs = HashMap::new();
@@ -791,10 +640,10 @@ impl Type {
         }
     }
     fn is_polymorphic(&self) -> bool {
-        matches!(&*self.inner(), TypeI::Forall(_, _))
+        matches!(&*self.clone().inner(), TypeI::Forall(_, _))
     }
     fn insert_type_params(&self, output: &mut HashSet<u32>) {
-        match &*self.inner() {
+        match &*self.clone().inner() {
             TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Unknown => {}
             TypeI::Param(b) => {
                 output.insert(*b);
@@ -816,24 +665,17 @@ impl Type {
                     param.insert_type_params(output)
                 }
             }
-            TypeI::Follow(_) => panic!("TypeI::Follow used."),
             TypeI::Co(ty, ops) => {
                 ty.insert_type_params(output);
-                let mut ops = ops.clone();
-                ops.compress();
-                if let OpSetI::Final(ops) = &*ops.0.borrow() {
-                    for ty in ops.iter_types() {
-                        ty.insert_type_params(output);
-                    }
-                } else {
-                    unreachable!();
-                };
+                for ty in ops.clone().inner().iter_types() {
+                    ty.insert_type_params(output);
+                }
             }
         }
     }
     // A concrete type will be unchanged under unification.
     fn is_concrete(&self) -> bool {
-        match &*self.0.borrow() {
+        match &*self.clone().inner() {
             TypeI::Bool | TypeI::Int | TypeI::Float | TypeI::Unit | TypeI::Param(_) => true,
             TypeI::Unknown => false,
             TypeI::Forall(_, ty) => ty.is_concrete(),
@@ -841,27 +683,12 @@ impl Type {
             TypeI::StructInstance(StructInstance { params, decl: _ }) => {
                 params.values().all(|p| p.is_concrete())
             }
-            TypeI::Follow(ty) => ty.is_concrete(),
-            TypeI::Co(ty, ops) => {
-                if ty.is_concrete() {
-                    return true;
-                }
-                let mut ops = ops.clone();
-                ops.compress();
-                if let OpSetI::Final(ops) = &*ops.0.borrow() {
-                    if ops.iter_types().any(|ty| ty.is_concrete()) {
-                        return false;
-                    }
-                } else {
-                    unreachable!();
-                };
-                true
-            }
+            TypeI::Co(ty, ops) => ty.is_concrete() && ops.clone().inner().is_concrete(),
         }
     }
 
     fn unwrap_ops(&self) -> OpSetRefCell {
-        if let TypeI::Co(_, ops) = &*self.0.borrow() {
+        if let TypeI::Co(_, ops) = &*self.clone().inner() {
             return ops.clone();
         }
         panic!("unwrap_ops called on a non-coroutine.");
@@ -1080,23 +907,40 @@ fn unify_params(
     Ok(())
 }
 
-fn unify_opsets(left: &OpSetRefCell, right: &OpSetRefCell) -> Result<(), Error> {
-    // TODO: this is not a very efficient way to do unification.
-    let left_inner = left.clone_inner();
-    let right_inner = right.clone_inner();
-    let result = left_inner.try_unify_with(&right_inner)?;
-    *left.0.borrow_mut() = OpSetI::Final(result.clone());
-    *right.0.borrow_mut() = OpSetI::Follow(left.clone());
+fn unify_opsets(mut left_ops: OpSetRefCell, mut right_ops: OpSetRefCell) -> Result<(), Error> {
+    // Ensure if either of them are extendable, the extendable one is on the left.
+    if !left_ops.inner().done_extending && right_ops.inner().done_extending {
+        return unify_opsets(right_ops, left_ops);
+    }
+    // Use a scope so left and right are done borrowing before we call follow.
+    {
+        let mut left = left_ops.mut_inner();
+        let right = right_ops.mut_inner();
+
+        for (op_name, (perform_type, resume_type)) in right.anonymous_ops.iter() {
+            left.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
+        }
+        for (effect_name, (instance, ops)) in right.named_effects.iter() {
+            for op_name in ops.iter() {
+                left.unify_add_declared_op(Some(effect_name), instance, op_name)?;
+            }
+        }
+        // TODO: Do I need an occurs check here?
+        for super_set in right.super_sets.iter() {
+            left.super_sets.push(super_set.clone());
+        }
+    }
+    right_ops.follow(&left_ops);
     Ok(())
 }
 
 // Unifies two types via interior mutability.
 // Errors if the types ae not unifiable.
 fn unify(left: &Type, right: &Type) -> Result<(), Error> {
+    let left_clone = left.clone();
+    let right_clone = right.clone();
     let mut left = left.clone();
     let mut right = right.clone();
-    left.compress();
-    right.compress();
 
     // `.inner` borrows from the Refcell. That borrow must end before
     // `point_to` runs, which borrows mutably. Hence, we use a
@@ -1118,7 +962,7 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
         | (TypeI::Unit, TypeI::Unit) => Ok(()),
         (TypeI::Fn(left_arg_types, left_ret_ty), TypeI::Fn(right_arg_types, right_ret_ty)) => {
             if left_arg_types.len() != right_arg_types.len() {
-                return Err(Error::NotUnifiable(left.clone(), right.clone()));
+                return Err(Error::NotUnifiable(left_clone, right_clone));
             }
             unify(left_ret_ty, right_ret_ty)?;
             for (l, r) in left_arg_types.iter().zip(right_arg_types.iter()) {
@@ -1139,16 +983,16 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
             panic!(
                 "Two instance of the same struct should \
                     have the same type param ids. \
-                    Left:{left:?}, Right:{right:?}"
+                    Left:{left_clone:?}, Right:{right_clone:?}"
             )
         }),
         (TypeI::Co(left_ty, left_ops), TypeI::Co(right_ty, right_ops)) => {
             unify(left_ty, right_ty)?;
-            unify_opsets(left_ops, right_ops)?;
+            unify_opsets(left_ops.clone(), right_ops.clone())?;
             Ok(())
         }
         (TypeI::Param(l), TypeI::Param(r)) if l == r => Ok(()),
-        _ => Err(Error::NotUnifiable(left.clone(), right.clone())),
+        _ => Err(Error::NotUnifiable(left_clone, right_clone)),
     };
     result
 }
@@ -1638,7 +1482,7 @@ mod tests {
         let mut v0 = Type::unknown();
         let mut v1 = Type::unknown();
         unify(&v0, &v1).unwrap();
-        assert_eq!(v0.compress(), v1.compress());
+        assert_eq!(*v0.inner(), *v1.inner());
     }
     #[test]
     fn left_unify_many_type_vars() {
@@ -1650,7 +1494,7 @@ mod tests {
             unify(&types[i], &types[i + 1]).unwrap();
         }
         unify(&types[9], &Type::unit()).unwrap();
-        assert_eq!(*types[0].compress(), Type::unit());
+        assert_eq!(*types[0].inner(), TypeI::Unit);
     }
     #[test]
     fn right_unify_many_type_vars() {
@@ -1662,7 +1506,7 @@ mod tests {
             unify(&types[i + 1], &types[i]).unwrap();
         }
         unify(&types[9], &Type::unit()).unwrap();
-        assert_eq!(*types[0].compress(), Type::unit());
+        assert_eq!(*types[0].inner(), TypeI::Unit);
     }
     #[test]
     fn unify_fn_return_type() {
@@ -1671,7 +1515,7 @@ mod tests {
         let mut f2 = Type::func(vec![], Type::int());
         unify(&f1, &f2).unwrap();
 
-        assert_eq!(f1.compress(), f2.compress());
+        assert_eq!(*f1.inner(), *f2.inner());
     }
     #[test]
     fn unify_fns() {
@@ -1681,7 +1525,7 @@ mod tests {
         let mut f2 = Type::func(vec![type_var_1], Type::int());
         unify(&f1, &f2).unwrap();
 
-        assert_eq!(f1.compress(), f2.compress());
+        assert_eq!(*f1.inner(), *f2.inner());
     }
 
     #[test]
@@ -2455,7 +2299,7 @@ mod tests {
         let original_ops = ops.clone();
         let ops = OpSetRefCell::new(ops);
         let was_empty = OpSetRefCell::new(OpSet::empty());
-        unify_opsets(&ops, &was_empty).unwrap();
+        unify_opsets(ops.clone(), was_empty.clone()).unwrap();
         assert_eq!(ops.clone_inner(), original_ops);
         assert_eq!(was_empty.clone_inner(), original_ops);
     }
@@ -2739,5 +2583,5 @@ mod tests {
         assert_eq!(typecheck_program(program), Ok(()));
     }
 
-    // TODO: Test ```let x = || foo()?;``` gets the right type.
+    // TODO: Test ```let x = || foo()?;``` gets the type.
 }
