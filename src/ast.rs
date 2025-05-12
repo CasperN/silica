@@ -890,9 +890,9 @@ enum Error {
     InapplicableConstraint(Type, Constraint),
 }
 
-fn constrain(mut ty: Type, constraint: Constraint) -> Result<(), Error> {
-    let cloned_type = ty.clone();
-    match (&mut *ty.inner_mut(), constraint) {
+fn constrain(ty: &mut TypeI, constraint: Constraint) -> Result<(), Error> {
+    let cloned_type = Type::new(ty.clone());
+    match (ty, constraint) {
         (TypeI::Unknown(constraints), constraint) => {
             constraints.push(constraint);
             Ok(())
@@ -963,44 +963,40 @@ fn unify_opsets(mut left_ops: OpSetRefCell, mut right_ops: OpSetRefCell) -> Resu
 // Unifies two types via interior mutability.
 // Errors if the types ae not unifiable.
 fn unify(left: &Type, right: &Type) -> Result<(), Error> {
+    // Allow for unification with self and avoid double borrowing.
+    if left.0.ptr_eq(&right.0) {
+        return Ok(());
+    }
     let left_clone = left.clone();
     let right_clone = right.clone();
     let mut left = left.clone();
     let mut right = right.clone();
 
     // `.inner` borrows from the Refcell. That borrow must end before
-    // `point_to` runs, which borrows mutably. Hence, we use a
-    // matches! statement instead of handling this case in the match.
-    // TODO: This is gnarly.
-    let mut point_left_to_right = false;
-    if let TypeI::Unknown(constraints) = &*left.inner() {
-        for constraint in constraints {
-            constrain(right_clone.clone(), constraint.clone())?;
-        }
-        point_left_to_right = true;
-    }
-    if point_left_to_right {
-        left.point_to(&right)?;
-        return Ok(());
-    }
-    let mut point_right_to_left = false;
-    if let TypeI::Unknown(constraints) = &*right.inner() {
-        for constraint in constraints {
-            constrain(left_clone.clone(), constraint.clone())?;
-        }
-        point_right_to_left = true;
-    }
-    if point_right_to_left {
-        right.point_to(&left)?;
-        return Ok(());
-    }
-    // Assign the std::Rc::Ref RAII objects.
-    // They can't be temporaries in the match statement.
-    let result = match (&*left.inner(), &*right.inner()) {
+    // `point_to` runs, which borrows mutably. Hence, we record whether
+    // we will point left to right or right to left in a variable and apply
+    // it after the match statement.
+    let mut point_left_to_right: Option<bool> = None;
+
+    let result = match (&mut *left.inner_mut(), &mut *right.inner_mut()) {
         (TypeI::Int, TypeI::Int)
         | (TypeI::Float, TypeI::Float)
         | (TypeI::Bool, TypeI::Bool)
         | (TypeI::Unit, TypeI::Unit) => Ok(()),
+        (TypeI::Unknown(constraints), right_inner) => {
+            for constraint in constraints.drain(..) {
+                constrain(right_inner, constraint)?;
+            }
+            point_left_to_right = Some(true);
+            Ok(())
+        }
+        (left_inner, TypeI::Unknown(constraints)) => {
+            for constraint in constraints.drain(..) {
+                constrain(left_inner, constraint)?;
+            }
+            point_left_to_right = Some(false);
+            Ok(())
+        }
         (TypeI::Fn(left_arg_types, left_ret_ty), TypeI::Fn(right_arg_types, right_ret_ty)) => {
             if left_arg_types.len() != right_arg_types.len() {
                 return Err(Error::NotUnifiable(left_clone, right_clone));
@@ -1035,6 +1031,15 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
         (TypeI::Param(l), TypeI::Param(r)) if l == r => Ok(()),
         _ => Err(Error::NotUnifiable(left_clone, right_clone)),
     };
+    // Finish unifying unknowns (after the dynamic borrow)
+    // by making one an alias of the other.
+    if let Some(left_to_right) = point_left_to_right {
+        if left_to_right {
+            left.point_to(&right)?;
+        } else {
+            right.point_to(&left)?;
+        }
+    }
     result
 }
 
@@ -1057,9 +1062,8 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
         }
         Expression::L(LValue::Field(expr, field), ty) => {
             infer(context, expr)?;
-            // This is wrong.
             constrain(
-                expr.get_type(),
+                &mut expr.get_type().inner_mut(),
                 Constraint::HasField(field.clone(), ty.clone()),
             )
         }
