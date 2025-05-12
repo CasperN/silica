@@ -475,6 +475,12 @@ impl OpSet {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum Constraint {
+    // Field name and field type constraint.
+    HasField(String, Type),
+}
+
 #[derive(Default, Debug, Clone, PartialEq)]
 enum TypeI {
     #[default]
@@ -491,7 +497,7 @@ enum TypeI {
 
     // Unknown type variable. Unifies with any other type.
     // Should not appear in generic types.
-    Unknown,
+    Unknown(Vec<Constraint>),
 
     // A type parameter. It should not appear during unification as
     // types need to be instantiated before then.
@@ -521,7 +527,7 @@ impl Type {
         Self::new(TypeI::Param(id))
     }
     pub fn unknown() -> Self {
-        Self::new(TypeI::Unknown)
+        Self::new(TypeI::Unknown(vec![]))
     }
     pub fn forall(params: Vec<u32>, ty: Type) -> Self {
         Self::new(TypeI::Forall(params, ty))
@@ -549,7 +555,7 @@ impl Type {
             | TypeI::Float
             | TypeI::Unit
             | TypeI::Param(_)
-            | TypeI::Unknown => false,
+            | TypeI::Unknown(_) => false,
             TypeI::Forall(_, ty) => ty.contains_ptr(other),
             TypeI::Fn(arg_types, ret_type) => {
                 arg_types.iter().any(|a| a.contains_ptr(other)) || ret_type.contains_ptr(other)
@@ -588,7 +594,7 @@ impl Type {
                     .unwrap_or_else(|| panic!("Cannot instantiate type var {b}"));
                 return;
             }
-            TypeI::Unknown => {
+            TypeI::Unknown(_) => {
                 panic!("Instantiating a type with Unknown type variables within.");
             }
             TypeI::Fn(arg_types, ret_ty) => {
@@ -635,7 +641,7 @@ impl Type {
     }
     fn insert_type_params(&self, output: &mut HashSet<u32>) {
         match &*self.clone().inner() {
-            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Unknown => {}
+            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Unknown(_) => {}
             TypeI::Param(b) => {
                 output.insert(*b);
             }
@@ -668,7 +674,7 @@ impl Type {
     fn is_concrete(&self) -> bool {
         match &*self.clone().inner() {
             TypeI::Bool | TypeI::Int | TypeI::Float | TypeI::Unit | TypeI::Param(_) => true,
-            TypeI::Unknown => false,
+            TypeI::Unknown(_) => false,
             TypeI::Forall(_, ty) => ty.is_concrete(),
             TypeI::Fn(args, ret) => ret.is_concrete() && args.iter().all(|a| a.is_concrete()),
             TypeI::StructInstance(StructInstance { params, decl: _ }) => {
@@ -881,6 +887,21 @@ enum Error {
     EffectDeclMismatch(EffectDecl, EffectDecl),
     OpSetNotUnifiable(OpSet, OpSet),
     OpSetNotExtendable(OpSet),
+    InapplicableConstraint(Type, Constraint),
+}
+
+fn constrain(mut ty: Type, constraint: Constraint) -> Result<(), Error> {
+    let cloned_type = ty.clone();
+    match (&mut *ty.inner_mut(), constraint) {
+        (TypeI::Unknown(constraints), constraint) => {
+            constraints.push(constraint);
+            Ok(())
+        }
+        (TypeI::StructInstance(instance), Constraint::HasField(name, field_ty)) => {
+            unify(&instance.field_type(&name)?, &field_ty)
+        }
+        (_, constraint) => Err(Error::InapplicableConstraint(cloned_type, constraint)),
+    }
 }
 
 fn unify_params(
@@ -950,11 +971,26 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
     // `.inner` borrows from the Refcell. That borrow must end before
     // `point_to` runs, which borrows mutably. Hence, we use a
     // matches! statement instead of handling this case in the match.
-    if matches!(&*left.inner(), TypeI::Unknown) {
+    // TODO: This is gnarly.
+    let mut point_left_to_right = false;
+    if let TypeI::Unknown(constraints) = &*left.inner() {
+        for constraint in constraints {
+            constrain(right_clone.clone(), constraint.clone())?;
+        }
+        point_left_to_right = true;
+    }
+    if point_left_to_right {
         left.point_to(&right)?;
         return Ok(());
     }
-    if matches!(&*right.inner(), TypeI::Unknown) {
+    let mut point_right_to_left = false;
+    if let TypeI::Unknown(constraints) = &*right.inner() {
+        for constraint in constraints {
+            constrain(left_clone.clone(), constraint.clone())?;
+        }
+        point_right_to_left = true;
+    }
+    if point_right_to_left {
         right.point_to(&left)?;
         return Ok(());
     }
@@ -1021,13 +1057,11 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
         }
         Expression::L(LValue::Field(expr, field), ty) => {
             infer(context, expr)?;
-            if let TypeI::StructInstance(struct_instance) = &*expr.get_type().inner() {
-                let field_type = struct_instance.field_type(field)?;
-                unify(&field_type, ty)?;
-            } else {
-                return Err(Error::FieldAccessToNonStruct(*expr.clone(), field.clone()));
-            }
-            Ok(())
+            // This is wrong.
+            constrain(
+                expr.get_type(),
+                Constraint::HasField(field.clone(), ty.clone()),
+            )
         }
         Expression::LiteralUnit => Ok(()),
         Expression::LiteralInt(_) => Ok(()),
@@ -1142,11 +1176,10 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                 })
             } else if name.is_none() {
                 // Perform an anonymous effect.
-                context.ops.mut_inner().unify_add_anonymous_effect(
-                    op,
-                    &arg.get_type(),
-                    expr_ty,
-                )?;
+                context
+                    .ops
+                    .mut_inner()
+                    .unify_add_anonymous_effect(op, &arg.get_type(), expr_ty)?;
                 Ok(())
             } else {
                 // TODO: Perform named effect. Need to constrain the unknown effect.
@@ -1159,7 +1192,6 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
         }
         Expression::Propagate(expr, ty) => {
             infer(context, expr)?;
-            // TODO: Maybe context ops shouldn't be optional and should just be empty_non_extensible...
             let co_ty = Type::co(ty.clone(), OpSetRefCell::empty_extensible());
             unify(&co_ty, &expr.get_type())?;
             let context_ops = &mut context.ops;
@@ -1224,6 +1256,13 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             Ok(())
         }
     }
+}
+
+fn check_all_concrete(expression: &Expression) -> Result<(), Error> {
+    // TODO: Its not currently an error that some expressions do not have concrete types
+    // at the end of inference. This needs to be implemented and added to `typecheck_program`
+    let _ = expression;
+    todo!()
 }
 
 fn typecheck_program(program: &mut Program) -> Result<(), Error> {
@@ -2099,6 +2138,165 @@ mod tests {
             }),
         ]);
         assert_eq!(typecheck_program(program), Ok(()));
+    }
+    #[test]
+    fn struct_field_access_wrong_name() {
+        let pair = StructDecl::new(
+            "Pair",
+            &[("left", Type::param(0)), ("right", Type::param(1))],
+        );
+
+        let program = &mut Program(vec![
+            Declaration::Struct(pair),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::bool_(),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "p",
+                        None,
+                        false,
+                        Expression::LiteralStruct {
+                            name: "Pair".to_string(),
+                            fields: HashMap::from_iter([
+                                ("left".into(), true.into()),
+                                ("right".into(), 123.into()),
+                            ]),
+                            ty: Type::unknown(),
+                        },
+                    ),
+                    field("p", "whoopsie").into(),
+                ])),
+            }),
+        ]);
+        assert_eq!(
+            typecheck_program(program),
+            Err(Error::UnrecognizedField("whoopsie".into()))
+        );
+    }
+    #[test]
+    fn field_access_not_a_struct() {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
+            forall: vec![],
+            name: "main".to_string(),
+            args: vec![],
+            return_type: Type::bool_(),
+            body: Some(block_expr(vec![
+                let_stmt("p", None, false, ()),
+                field("p", "whoopsie").into(),
+            ])),
+        })]);
+        assert_eq!(
+            typecheck_program(program),
+            Err(Error::InapplicableConstraint(
+                Type::unit(),
+                Constraint::HasField("whoopsie".to_string(), Type::unknown())
+            ))
+        );
+    }
+    #[test]
+    fn delayed_field_access_correct_field_names() {
+        let pair = StructDecl::new(
+            "Pair",
+            &[("left", Type::param(0)), ("right", Type::param(1))],
+        );
+
+        let program = &mut Program(vec![
+            Declaration::Struct(pair),
+            Declaration::Fn(FnDecl {
+                forall: vec![0],
+                name: "default".to_string(),
+                args: vec![],
+                return_type: Type::param(0),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::int(),
+                body: Some(block_expr(vec![
+                    // Initialize `p` with some polymorphic default fn.
+                    let_stmt("p", None, true, call_expr("default", vec![])),
+                    // Use and constrain "p" before its type is known.
+                    let_stmt(
+                        "r",
+                        None,
+                        false,
+                        if_expr(field("p", "left"), field("p", "right"), 42),
+                    ),
+                    // Assign to "p" to give it a type.
+                    assign_stmt(
+                        "p",
+                        Expression::LiteralStruct {
+                            name: "Pair".to_string(),
+                            fields: HashMap::from_iter([
+                                ("left".into(), true.into()),
+                                ("right".into(), 123.into()),
+                            ]),
+                            ty: Type::unknown(),
+                        },
+                    ),
+                    "r".into(),
+                ])),
+            }),
+        ]);
+        assert_eq!(typecheck_program(program), Ok(()));
+    }
+
+    #[test]
+    fn delayed_field_access_incorrect_field_names() {
+        let pair = StructDecl::new(
+            "Pair",
+            &[("left", Type::param(0)), ("right", Type::param(1))],
+        );
+
+        let program = &mut Program(vec![
+            Declaration::Struct(pair),
+            Declaration::Fn(FnDecl {
+                forall: vec![0],
+                name: "default".to_string(),
+                args: vec![],
+                return_type: Type::param(0),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::int(),
+                body: Some(block_expr(vec![
+                    // Initialize `p` with some polymorphic default fn.
+                    let_stmt("p", None, true, call_expr("default", vec![])),
+                    // Use and constrain "p" before its type is known.
+                    let_stmt(
+                        "r",
+                        None,
+                        false,
+                        if_expr(field("p", "left"), field("p", "whoopsie"), 42),
+                    ),
+                    // Assign to "p" to give it a type.
+                    assign_stmt(
+                        "p",
+                        Expression::LiteralStruct {
+                            name: "Pair".to_string(),
+                            fields: HashMap::from_iter([
+                                ("left".into(), true.into()),
+                                ("right".into(), 123.into()),
+                            ]),
+                            ty: Type::unknown(),
+                        },
+                    ),
+                    "r".into(),
+                ])),
+            }),
+        ]);
+        assert_eq!(
+            typecheck_program(program),
+            Err(Error::UnrecognizedField("whoopsie".to_string()))
+        );
     }
     #[test]
     fn curried_pair_polymorphic_fn_test() {
