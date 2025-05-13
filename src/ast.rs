@@ -6,6 +6,612 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+// *************************************************************************************************
+//  Types
+// *************************************************************************************************
+
+#[derive(Default, Clone, PartialEq)]
+pub struct Type(UnionFindRef<TypeI>);
+
+// Make it transparent over the contents.
+impl std::fmt::Debug for Type {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = self.clone();
+        let inner = s.inner();
+        write!(f, "{inner:?}")
+    }
+}
+
+#[derive(Default, Debug, Clone, PartialEq)]
+enum TypeI {
+    #[default]
+    Unit,
+    Int,
+    Bool,
+    Float,
+    Fn(Vec<Type>, Type),
+    StructInstance(StructInstance),
+    Co(Type, OpSetRefCell),
+
+    // TODO: Consider deleting -- only top level decls should be polymorphic.
+    Forall(Vec<u32>, Type),
+
+    // Unknown type variable. Unifies with any other type.
+    // Should not appear in generic types.
+    Unknown(Vec<Constraint>),
+
+    // A type parameter. It should not appear during unification as
+    // types need to be instantiated before then.
+    Param(u32),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum Constraint {
+    // Field name and field type constraint.
+    HasField(String, Type),
+}
+
+impl Type {
+    fn new(i: TypeI) -> Self {
+        Self(UnionFindRef::new(i))
+    }
+    pub fn bool_() -> Self {
+        Self::new(TypeI::Bool)
+    }
+    pub fn int() -> Self {
+        Self::new(TypeI::Int)
+    }
+    pub fn float() -> Self {
+        Self::new(TypeI::Float)
+    }
+    pub fn unit() -> Self {
+        Self::new(TypeI::Unit)
+    }
+    pub fn func(args: Vec<Type>, ret: Type) -> Self {
+        Self::new(TypeI::Fn(args, ret))
+    }
+    pub fn param(id: u32) -> Self {
+        Self::new(TypeI::Param(id))
+    }
+    pub fn unknown() -> Self {
+        Self::new(TypeI::Unknown(vec![]))
+    }
+    pub fn forall(params: Vec<u32>, ty: Type) -> Self {
+        Self::new(TypeI::Forall(params, ty))
+    }
+    pub fn struct_(s: StructInstance) -> Self {
+        Self::new(TypeI::StructInstance(s))
+    }
+    pub fn co(ty: Type, ops: impl Into<OpSetRefCell>) -> Type {
+        Self::new(TypeI::Co(ty, ops.into()))
+    }
+    fn inner(&mut self) -> Ref<TypeI> {
+        self.0.inner()
+    }
+    fn inner_mut(&mut self) -> RefMut<TypeI> {
+        self.0.inner_mut()
+    }
+
+    fn contains_ptr(&self, other: &Type) -> bool {
+        if self.0.ptr_eq(&other.0) {
+            return true;
+        }
+        match &*self.clone().inner() {
+            TypeI::Int
+            | TypeI::Bool
+            | TypeI::Float
+            | TypeI::Unit
+            | TypeI::Param(_)
+            | TypeI::Unknown(_) => false,
+            TypeI::Forall(_, ty) => ty.contains_ptr(other),
+            TypeI::Fn(arg_types, ret_type) => {
+                arg_types.iter().any(|a| a.contains_ptr(other)) || ret_type.contains_ptr(other)
+            }
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
+                // We assume that declarations cannot contain unification cycles,
+                // so just check the params.
+                params.values().any(|p| p.contains_ptr(other))
+            }
+            TypeI::Co(ty, ops) => {
+                ty.contains_ptr(other)
+                    || ops
+                        .clone()
+                        .inner()
+                        .iter_types()
+                        .any(|ty| ty.contains_ptr(other))
+            }
+        }
+    }
+    fn point_to(&mut self, other: &Self) -> Result<(), Error> {
+        if other.contains_ptr(self) {
+            return Err(Error::InfiniteType(self.clone(), other.clone()));
+        }
+        self.0.follow(&other.0);
+        Ok(())
+    }
+
+    fn instantiate_with(&mut self, subs: &HashMap<u32, Type>) {
+        let mut i = self.inner().clone();
+        match &mut i {
+            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit => {}
+            TypeI::Param(b) => {
+                *self = subs
+                    .get(b)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("Cannot instantiate type var {b}"));
+                return;
+            }
+            TypeI::Unknown(_) => {
+                panic!("Instantiating a type with Unknown type variables within.");
+            }
+            TypeI::Fn(arg_types, ret_ty) => {
+                for ty in arg_types.iter_mut() {
+                    ty.instantiate_with(subs);
+                }
+                ret_ty.instantiate_with(subs);
+            }
+            TypeI::Forall(forall_vars, ty) => {
+                forall_vars.retain(|forall_var| !subs.contains_key(forall_var));
+                ty.instantiate_with(subs);
+            }
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
+                for param in params.values_mut() {
+                    param.instantiate_with(subs);
+                }
+            }
+            TypeI::Co(ty, ops) => {
+                ty.instantiate_with(subs);
+                for ty in ops.mut_inner().iter_types_mut() {
+                    ty.instantiate_with(subs);
+                }
+            }
+        }
+        *self = Self::new(i)
+    }
+
+    // Instantiates Forall types with new type variables.
+    fn instantiate(mut self) -> Self {
+        let i = self.inner().clone();
+        if let TypeI::Forall(params, mut ty) = i {
+            let mut subs = HashMap::new();
+            for b in params {
+                subs.insert(b, Type::unknown());
+            }
+            ty.instantiate_with(&subs);
+            ty
+        } else {
+            self
+        }
+    }
+    fn is_polymorphic(&self) -> bool {
+        matches!(&*self.clone().inner(), TypeI::Forall(_, _))
+    }
+    fn insert_type_params(&self, output: &mut HashSet<u32>) {
+        match &*self.clone().inner() {
+            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Unknown(_) => {}
+            TypeI::Param(b) => {
+                output.insert(*b);
+            }
+            TypeI::Fn(arg_types, ret_ty) => {
+                for arg_type in arg_types.iter() {
+                    arg_type.insert_type_params(output);
+                }
+                ret_ty.insert_type_params(output);
+            }
+            // Free type variables are only asked for by struct generalization.
+            // but we don't expect generic members.
+            TypeI::Forall(_, _) => panic!(
+                "Free type variables are only asked for by struct generalization... \
+                but we don't expect generic members."
+            ),
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
+                for param in params.values() {
+                    param.insert_type_params(output)
+                }
+            }
+            TypeI::Co(ty, ops) => {
+                ty.insert_type_params(output);
+                for ty in ops.clone().inner().iter_types() {
+                    ty.insert_type_params(output);
+                }
+            }
+        }
+    }
+    // A concrete type will be unchanged under unification.
+    fn is_concrete(&self) -> bool {
+        match &*self.clone().inner() {
+            TypeI::Bool | TypeI::Int | TypeI::Float | TypeI::Unit | TypeI::Param(_) => true,
+            TypeI::Unknown(_) => false,
+            TypeI::Forall(_, ty) => ty.is_concrete(),
+            TypeI::Fn(args, ret) => ret.is_concrete() && args.iter().all(|a| a.is_concrete()),
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
+                params.values().all(|p| p.is_concrete())
+            }
+            TypeI::Co(ty, ops) => ty.is_concrete() && ops.clone().inner().is_concrete(),
+        }
+    }
+
+    fn unwrap_ops(&self) -> OpSetRefCell {
+        if let TypeI::Co(_, ops) = &*self.clone().inner() {
+            return ops.clone();
+        }
+        panic!("unwrap_ops called on a non-coroutine.");
+    }
+}
+
+// *************************************************************************************************
+// OpSets
+// *************************************************************************************************
+
+// Union find wrapper.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpSetRefCell(UnionFindRef<OpSet>);
+
+// A set of ops that are being performed.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct OpSet {
+    anonymous_ops: HashMap<String, (Type, Type)>,
+    named_effects: HashMap<String, (EffectInstance, HashSet<String>)>,
+    super_sets: Vec<OpSetRefCell>,
+    done_extending: bool,
+}
+
+impl From<OpSet> for OpSetRefCell {
+    fn from(value: OpSet) -> Self {
+        Self::new(value)
+    }
+}
+impl Default for OpSetRefCell {
+    fn default() -> Self {
+        Self::new(OpSet::empty())
+    }
+}
+
+impl OpSetRefCell {
+    fn new(opset: OpSet) -> Self {
+        Self(UnionFindRef::new(opset))
+    }
+    fn empty_non_extensible() -> Self {
+        Self::new(OpSet::empty_non_extensible())
+    }
+    fn empty_extensible() -> Self {
+        Self::new(OpSet::empty())
+    }
+    fn is_empty(&self) -> bool {
+        self.0.clone().inner().is_empty()
+    }
+    fn is_extendable(&self) -> bool {
+        !self.0.clone().inner().done_extending
+    }
+    fn inner(&mut self) -> Ref<OpSet> {
+        self.0.inner()
+    }
+    fn mut_inner(&mut self) -> RefMut<OpSet> {
+        self.0.inner_mut()
+    }
+    fn clone_inner(&self) -> OpSet {
+        self.0.clone_inner()
+    }
+    fn follow(&self, other: &OpSetRefCell) {
+        self.0.clone().follow(&other.0);
+    }
+
+    /// Adds all effects of `other` into `self` and makes `self` a super-set of `other`.
+    ///
+    /// When future ops of `other` are added, they will also be added to `self`.
+    fn subsume(&mut self, other: &mut Self) -> Result<(), Error> {
+        let mut other_inner = other.mut_inner();
+        let self_clone = self.clone();
+        let mut self_inner = self.mut_inner();
+        for (op_name, (perform_type, resume_type)) in other_inner.anonymous_ops.iter() {
+            self_inner.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
+        }
+        for (effect_name, (instance, ops)) in other_inner.named_effects.iter() {
+            for op_name in ops {
+                self_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
+            }
+        }
+        other_inner.super_sets.push(self_clone);
+        Ok(())
+    }
+}
+impl OpSet {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+    pub fn empty_non_extensible() -> Self {
+        let mut x = Self::empty();
+        x.mark_done_extending();
+        x
+    }
+    fn mark_done_extending(&mut self) -> &mut Self {
+        self.done_extending = true;
+        self
+    }
+    fn is_empty(&self) -> bool {
+        self.anonymous_ops.is_empty() && self.named_effects.is_empty()
+    }
+
+    // An Opset is concrete if it will be unchanged under unification.
+    fn is_concrete(&self) -> bool {
+        self.done_extending && self.iter_types().all(|ty| ty.is_concrete())
+    }
+    fn get(&self, name_or_effect: Option<&str>, op_name: &str) -> Option<(Type, Type)> {
+        if name_or_effect.is_none() {
+            // It must be a decl free / anonymous op.
+            return self.anonymous_ops.get(op_name).cloned();
+        }
+        let name_or_effect = name_or_effect.unwrap();
+        if let Some((instance, ops)) = self.named_effects.get(name_or_effect) {
+            if ops.contains(op_name) {
+                return Some(instance.unwrap_op_type(op_name));
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+    fn iter_types(&self) -> impl Iterator<Item = Type> + '_ {
+        let mut types = Vec::new();
+        for (p, r) in self.anonymous_ops.values() {
+            types.push(p.clone());
+            types.push(r.clone());
+        }
+        for (instance, _) in self.named_effects.values() {
+            types.extend(instance.params.values().cloned());
+        }
+        types.into_iter()
+    }
+    fn iter_types_mut(&mut self) -> impl Iterator<Item = &'_ mut Type> {
+        let mut types = Vec::new();
+        for (p, r) in self.anonymous_ops.values_mut() {
+            types.push(p);
+            types.push(r);
+        }
+        for (instance, _) in self.named_effects.values_mut() {
+            types.extend(instance.params.values_mut());
+        }
+        types.into_iter()
+    }
+    fn unify_add_anonymous_effect(
+        &mut self,
+        name: &str,
+        perform_type: &Type,
+        resume_type: &Type,
+    ) -> Result<&mut Self, Error> {
+        match self.anonymous_ops.entry(name.to_string()) {
+            Entry::Occupied(entry) => {
+                let (existing_perform_type, existing_resume_type) = entry.get();
+                unify(perform_type, existing_perform_type)?;
+                unify(resume_type, existing_resume_type)?;
+            }
+            Entry::Vacant(entry) => {
+                if self.done_extending {
+                    return Err(Error::OpSetNotExtendable(self.clone()));
+                }
+                entry.insert((perform_type.clone(), resume_type.clone()));
+                for super_set in self.super_sets.iter() {
+                    super_set.clone().mut_inner().unify_add_anonymous_effect(
+                        name,
+                        perform_type,
+                        resume_type,
+                    )?;
+                }
+            }
+        }
+        Ok(self)
+    }
+    fn unify_add_declared_op(
+        &mut self,
+        name: Option<&str>,
+        instance: &EffectInstance,
+        op_name: &str,
+    ) -> Result<&mut Self, Error> {
+        if !instance.decl.ops.contains_key(op_name) {
+            return Err(Error::NoMatchingOpInEffectDecl(
+                op_name.to_string(),
+                instance.decl.as_ref().clone(),
+            ));
+        }
+        // Unnamed declared effects take their effect declaration name by default.
+        let name_str = name.unwrap_or(&instance.decl.name).to_string();
+        match self.named_effects.entry(name_str) {
+            Entry::Occupied(mut entry) => {
+                let (existing_instance, existing_ops) = entry.get_mut();
+                if existing_instance.decl != instance.decl {
+                    return Err(Error::EffectDeclMismatch(
+                        instance.decl.as_ref().clone(),
+                        existing_instance.decl.as_ref().clone(),
+                    ));
+                }
+                // Unify the params map.
+                unify_params(&existing_instance.params, &instance.params, || {
+                    panic!(
+                        "Two instances of the same effect should \
+                        have the same type param ids. \
+                        Left:{existing_instance:?}, 15:{instance:?}"
+                    )
+                })?;
+                existing_ops.insert(op_name.to_string());
+            }
+            Entry::Vacant(entry) => {
+                if self.done_extending {
+                    return Err(Error::OpSetNotExtendable(self.clone()));
+                }
+                entry.insert((instance.clone(), HashSet::from_iter([op_name.to_string()])));
+                for super_set in self.super_sets.iter() {
+                    super_set
+                        .clone()
+                        .mut_inner()
+                        .unify_add_declared_op(name, instance, op_name)?;
+                }
+            }
+        }
+        Ok(self)
+    }
+}
+
+// *************************************************************************************************
+//  Unification
+// *************************************************************************************************
+
+fn constrain(ty: &mut TypeI, constraint: Constraint) -> Result<(), Error> {
+    let cloned_type = Type::new(ty.clone());
+    match (ty, constraint) {
+        (TypeI::Unknown(constraints), constraint) => {
+            constraints.push(constraint);
+            Ok(())
+        }
+        (TypeI::StructInstance(instance), Constraint::HasField(name, field_ty)) => {
+            unify(&instance.field_type(&name)?, &field_ty)
+        }
+        (_, constraint) => Err(Error::InapplicableConstraint(cloned_type, constraint)),
+    }
+}
+
+fn unify_params(
+    left_params: &HashMap<u32, Type>,
+    right_params: &HashMap<u32, Type>,
+    panic_msg: impl Fn() -> String,
+) -> Result<(), Error> {
+    assert_eq!(left_params.len(), right_params.len());
+    for (param_id, left_ty) in left_params.iter() {
+        let right_ty = right_params
+            .get(param_id)
+            .unwrap_or_else(|| panic!("{}", panic_msg()));
+        unify(left_ty, right_ty)?
+    }
+    Ok(())
+}
+
+fn unify_opsets(mut left_ops: OpSetRefCell, mut right_ops: OpSetRefCell) -> Result<(), Error> {
+    // Ensure if either of them are extendable, the extendable one is on the left.
+    if !left_ops.inner().done_extending && right_ops.inner().done_extending {
+        return unify_opsets(right_ops, left_ops);
+    }
+    // Use a scope so left and right are done borrowing before we call follow.
+    {
+        let mut left = left_ops.mut_inner();
+        let right = right_ops.mut_inner();
+
+        for (op_name, (perform_type, resume_type)) in right.anonymous_ops.iter() {
+            left.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
+        }
+        for (effect_name, (instance, ops)) in right.named_effects.iter() {
+            for op_name in ops.iter() {
+                left.unify_add_declared_op(Some(effect_name), instance, op_name)?;
+            }
+        }
+        // TODO: Do I need an occurs check here?
+        for super_set in right.super_sets.iter() {
+            left.super_sets.push(super_set.clone());
+        }
+    }
+    right_ops.follow(&left_ops);
+
+    // Update super_sets with everything
+    let left = &mut *left_ops.mut_inner();
+    for super_set in left.super_sets.iter_mut() {
+        let mut super_inner = super_set.mut_inner();
+        for (op_name, (perform_type, resume_type)) in left.anonymous_ops.iter() {
+            super_inner.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
+        }
+        for (effect_name, (instance, ops)) in left.named_effects.iter() {
+            for op_name in ops.iter() {
+                super_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+// Unifies two types via interior mutability.
+// Errors if the types ae not unifiable.
+fn unify(left: &Type, right: &Type) -> Result<(), Error> {
+    // Allow for unification with self and avoid double borrowing.
+    if left.0.ptr_eq(&right.0) {
+        return Ok(());
+    }
+    let left_clone = left.clone();
+    let right_clone = right.clone();
+    let mut left = left.clone();
+    let mut right = right.clone();
+
+    // `.inner` borrows from the Refcell. That borrow must end before
+    // `point_to` runs, which borrows mutably. Hence, we record whether
+    // we will point left to right or right to left in a variable and apply
+    // it after the match statement.
+    let mut point_left_to_right: Option<bool> = None;
+
+    let result = match (&mut *left.inner_mut(), &mut *right.inner_mut()) {
+        (TypeI::Int, TypeI::Int)
+        | (TypeI::Float, TypeI::Float)
+        | (TypeI::Bool, TypeI::Bool)
+        | (TypeI::Unit, TypeI::Unit) => Ok(()),
+        (TypeI::Unknown(constraints), right_inner) => {
+            for constraint in constraints.drain(..) {
+                constrain(right_inner, constraint)?;
+            }
+            point_left_to_right = Some(true);
+            Ok(())
+        }
+        (left_inner, TypeI::Unknown(constraints)) => {
+            for constraint in constraints.drain(..) {
+                constrain(left_inner, constraint)?;
+            }
+            point_left_to_right = Some(false);
+            Ok(())
+        }
+        (TypeI::Fn(left_arg_types, left_ret_ty), TypeI::Fn(right_arg_types, right_ret_ty)) => {
+            if left_arg_types.len() != right_arg_types.len() {
+                return Err(Error::NotUnifiable(left_clone, right_clone));
+            }
+            unify(left_ret_ty, right_ret_ty)?;
+            for (l, r) in left_arg_types.iter().zip(right_arg_types.iter()) {
+                unify(l, r)?;
+            }
+            Ok(())
+        }
+        (
+            TypeI::StructInstance(StructInstance {
+                params: left_params,
+                decl: left_decl,
+            }),
+            TypeI::StructInstance(StructInstance {
+                params: right_params,
+                decl: right_decl,
+            }),
+        ) if left_decl == right_decl => unify_params(left_params, right_params, || {
+            panic!(
+                "Two instance of the same struct should \
+                    have the same type param ids. \
+                    Left:{left_clone:?}, Right:{right_clone:?}"
+            )
+        }),
+        (TypeI::Co(left_ty, left_ops), TypeI::Co(right_ty, right_ops)) => {
+            unify(left_ty, right_ty)?;
+            unify_opsets(left_ops.clone(), right_ops.clone())?;
+            Ok(())
+        }
+        (TypeI::Param(l), TypeI::Param(r)) if l == r => Ok(()),
+        _ => Err(Error::NotUnifiable(left_clone, right_clone)),
+    };
+    // Finish unifying unknowns (after the dynamic borrow)
+    // by making one an alias of the other.
+    if let Some(left_to_right) = point_left_to_right {
+        if left_to_right {
+            left.point_to(&right)?;
+        } else {
+            right.point_to(&left)?;
+        }
+    }
+    result
+}
+
+// *************************************************************************************************
+//  Expressions
+// *************************************************************************************************
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LValue {
     Variable(String),
@@ -240,19 +846,6 @@ impl StructInstance {
         }
     }
 }
-
-#[derive(Default, Clone, PartialEq)]
-pub struct Type(UnionFindRef<TypeI>);
-
-// Make it transparent over the contents.
-impl std::fmt::Debug for Type {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut s = self.clone();
-        let inner = s.inner();
-        write!(f, "{inner:?}")
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 struct EffectInstance {
     params: HashMap<u32, Type>,
@@ -264,431 +857,6 @@ impl EffectInstance {
         p.instantiate_with(&self.params);
         r.instantiate_with(&self.params);
         (p, r)
-    }
-}
-
-// Union find wrapper.
-#[derive(Debug, Clone, PartialEq)]
-pub struct OpSetRefCell(UnionFindRef<OpSet>);
-
-// A set of ops that are being performed.
-#[derive(Default, Debug, Clone, PartialEq)]
-pub struct OpSet {
-    anonymous_ops: HashMap<String, (Type, Type)>,
-    named_effects: HashMap<String, (EffectInstance, HashSet<String>)>,
-    super_sets: Vec<OpSetRefCell>,
-    done_extending: bool,
-}
-
-impl From<OpSet> for OpSetRefCell {
-    fn from(value: OpSet) -> Self {
-        Self::new(value)
-    }
-}
-impl Default for OpSetRefCell {
-    fn default() -> Self {
-        Self::new(OpSet::empty())
-    }
-}
-
-impl OpSetRefCell {
-    fn new(opset: OpSet) -> Self {
-        Self(UnionFindRef::new(opset))
-    }
-    fn empty_non_extensible() -> Self {
-        Self::new(OpSet::empty_non_extensible())
-    }
-    fn empty_extensible() -> Self {
-        Self::new(OpSet::empty())
-    }
-    fn is_empty(&self) -> bool {
-        self.0.clone().inner().is_empty()
-    }
-    fn is_extendable(&self) -> bool {
-        !self.0.clone().inner().done_extending
-    }
-    fn inner(&mut self) -> Ref<OpSet> {
-        self.0.inner()
-    }
-    fn mut_inner(&mut self) -> RefMut<OpSet> {
-        self.0.inner_mut()
-    }
-    fn clone_inner(&self) -> OpSet {
-        self.0.clone_inner()
-    }
-    fn follow(&self, other: &OpSetRefCell) {
-        self.0.clone().follow(&other.0);
-    }
-
-    /// Adds all effects of `other` into `self` and makes `self` a super-set of `other`.
-    ///
-    /// When future ops of `other` are added, they will also be added to `self`.
-    fn subsume(&mut self, other: &mut Self) -> Result<(), Error> {
-        let mut other_inner = other.mut_inner();
-        let self_clone = self.clone();
-        let mut self_inner = self.mut_inner();
-        for (op_name, (perform_type, resume_type)) in other_inner.anonymous_ops.iter() {
-            self_inner.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
-        }
-        for (effect_name, (instance, ops)) in other_inner.named_effects.iter() {
-            for op_name in ops {
-                self_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
-            }
-        }
-        other_inner.super_sets.push(self_clone);
-        Ok(())
-    }
-}
-impl OpSet {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-    pub fn empty_non_extensible() -> Self {
-        let mut x = Self::empty();
-        x.mark_done_extending();
-        x
-    }
-    fn mark_done_extending(&mut self) -> &mut Self {
-        self.done_extending = true;
-        self
-    }
-    fn is_empty(&self) -> bool {
-        self.anonymous_ops.is_empty() && self.named_effects.is_empty()
-    }
-
-    // An Opset is concrete if it will be unchanged under unification.
-    fn is_concrete(&self) -> bool {
-        self.done_extending && self.iter_types().all(|ty| ty.is_concrete())
-    }
-    fn get(&self, name_or_effect: Option<&str>, op_name: &str) -> Option<(Type, Type)> {
-        if name_or_effect.is_none() {
-            // It must be a decl free / anonymous op.
-            return self.anonymous_ops.get(op_name).cloned();
-        }
-        let name_or_effect = name_or_effect.unwrap();
-        if let Some((instance, ops)) = self.named_effects.get(name_or_effect) {
-            if ops.contains(op_name) {
-                return Some(instance.unwrap_op_type(op_name));
-            } else {
-                return None;
-            }
-        }
-        None
-    }
-    fn iter_types(&self) -> impl Iterator<Item = Type> + '_ {
-        let mut types = Vec::new();
-        for (p, r) in self.anonymous_ops.values() {
-            types.push(p.clone());
-            types.push(r.clone());
-        }
-        for (instance, _) in self.named_effects.values() {
-            types.extend(instance.params.values().cloned());
-        }
-        types.into_iter()
-    }
-    fn iter_types_mut(&mut self) -> impl Iterator<Item = &'_ mut Type> {
-        let mut types = Vec::new();
-        for (p, r) in self.anonymous_ops.values_mut() {
-            types.push(p);
-            types.push(r);
-        }
-        for (instance, _) in self.named_effects.values_mut() {
-            types.extend(instance.params.values_mut());
-        }
-        types.into_iter()
-    }
-    fn unify_add_anonymous_effect(
-        &mut self,
-        name: &str,
-        perform_type: &Type,
-        resume_type: &Type,
-    ) -> Result<&mut Self, Error> {
-        match self.anonymous_ops.entry(name.to_string()) {
-            Entry::Occupied(entry) => {
-                let (existing_perform_type, existing_resume_type) = entry.get();
-                unify(perform_type, existing_perform_type)?;
-                unify(resume_type, existing_resume_type)?;
-            }
-            Entry::Vacant(entry) => {
-                if self.done_extending {
-                    return Err(Error::OpSetNotExtendable(self.clone()));
-                }
-                entry.insert((perform_type.clone(), resume_type.clone()));
-                for super_set in self.super_sets.iter() {
-                    super_set.clone().mut_inner().unify_add_anonymous_effect(
-                        name,
-                        perform_type,
-                        resume_type,
-                    )?;
-                }
-            }
-        }
-        Ok(self)
-    }
-    fn unify_add_declared_op(
-        &mut self,
-        name: Option<&str>,
-        instance: &EffectInstance,
-        op_name: &str,
-    ) -> Result<&mut Self, Error> {
-        if !instance.decl.ops.contains_key(op_name) {
-            return Err(Error::NoMatchingOpInEffectDecl(
-                op_name.to_string(),
-                instance.decl.as_ref().clone(),
-            ));
-        }
-        // Unnamed declared effects take their effect declaration name by default.
-        let name_str = name.unwrap_or(&instance.decl.name).to_string();
-        match self.named_effects.entry(name_str) {
-            Entry::Occupied(mut entry) => {
-                let (existing_instance, existing_ops) = entry.get_mut();
-                if existing_instance.decl != instance.decl {
-                    return Err(Error::EffectDeclMismatch(
-                        instance.decl.as_ref().clone(),
-                        existing_instance.decl.as_ref().clone(),
-                    ));
-                }
-                // Unify the params map.
-                unify_params(&existing_instance.params, &instance.params, || {
-                    panic!(
-                        "Two instances of the same effect should \
-                        have the same type param ids. \
-                        Left:{existing_instance:?}, 15:{instance:?}"
-                    )
-                })?;
-                existing_ops.insert(op_name.to_string());
-            }
-            Entry::Vacant(entry) => {
-                if self.done_extending {
-                    return Err(Error::OpSetNotExtendable(self.clone()));
-                }
-                entry.insert((instance.clone(), HashSet::from_iter([op_name.to_string()])));
-                for super_set in self.super_sets.iter() {
-                    super_set
-                        .clone()
-                        .mut_inner()
-                        .unify_add_declared_op(name, instance, op_name)?;
-                }
-            }
-        }
-        Ok(self)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Constraint {
-    // Field name and field type constraint.
-    HasField(String, Type),
-}
-
-#[derive(Default, Debug, Clone, PartialEq)]
-enum TypeI {
-    #[default]
-    Unit,
-    Int,
-    Bool,
-    Float,
-    Fn(Vec<Type>, Type),
-    StructInstance(StructInstance),
-    Co(Type, OpSetRefCell),
-
-    // TODO: Consider deleting -- only top level declarations should be polymorphic.
-    Forall(Vec<u32>, Type),
-
-    // Unknown type variable. Unifies with any other type.
-    // Should not appear in generic types.
-    Unknown(Vec<Constraint>),
-
-    // A type parameter. It should not appear during unification as
-    // types need to be instantiated before then.
-    Param(u32),
-}
-
-impl Type {
-    fn new(i: TypeI) -> Self {
-        Self(UnionFindRef::new(i))
-    }
-    pub fn bool_() -> Self {
-        Self::new(TypeI::Bool)
-    }
-    pub fn int() -> Self {
-        Self::new(TypeI::Int)
-    }
-    pub fn float() -> Self {
-        Self::new(TypeI::Float)
-    }
-    pub fn unit() -> Self {
-        Self::new(TypeI::Unit)
-    }
-    pub fn func(args: Vec<Type>, ret: Type) -> Self {
-        Self::new(TypeI::Fn(args, ret))
-    }
-    pub fn param(id: u32) -> Self {
-        Self::new(TypeI::Param(id))
-    }
-    pub fn unknown() -> Self {
-        Self::new(TypeI::Unknown(vec![]))
-    }
-    pub fn forall(params: Vec<u32>, ty: Type) -> Self {
-        Self::new(TypeI::Forall(params, ty))
-    }
-    pub fn struct_(s: StructInstance) -> Self {
-        Self::new(TypeI::StructInstance(s))
-    }
-    pub fn co(ty: Type, ops: impl Into<OpSetRefCell>) -> Type {
-        Self::new(TypeI::Co(ty, ops.into()))
-    }
-    fn inner(&mut self) -> Ref<TypeI> {
-        self.0.inner()
-    }
-    fn inner_mut(&mut self) -> RefMut<TypeI> {
-        self.0.inner_mut()
-    }
-
-    fn contains_ptr(&self, other: &Type) -> bool {
-        if self.0.ptr_eq(&other.0) {
-            return true;
-        }
-        match &*self.clone().inner() {
-            TypeI::Int
-            | TypeI::Bool
-            | TypeI::Float
-            | TypeI::Unit
-            | TypeI::Param(_)
-            | TypeI::Unknown(_) => false,
-            TypeI::Forall(_, ty) => ty.contains_ptr(other),
-            TypeI::Fn(arg_types, ret_type) => {
-                arg_types.iter().any(|a| a.contains_ptr(other)) || ret_type.contains_ptr(other)
-            }
-            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
-                // We assume that declarations cannot contain unification cycles,
-                // so just check the params.
-                params.values().any(|p| p.contains_ptr(other))
-            }
-            TypeI::Co(ty, ops) => {
-                ty.contains_ptr(other)
-                    || ops
-                        .clone()
-                        .inner()
-                        .iter_types()
-                        .any(|ty| ty.contains_ptr(other))
-            }
-        }
-    }
-    fn point_to(&mut self, other: &Self) -> Result<(), Error> {
-        if other.contains_ptr(self) {
-            return Err(Error::InfiniteType(self.clone(), other.clone()));
-        }
-        self.0.follow(&other.0);
-        Ok(())
-    }
-
-    fn instantiate_with(&mut self, subs: &HashMap<u32, Type>) {
-        let mut i = self.inner().clone();
-        match &mut i {
-            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit => {}
-            TypeI::Param(b) => {
-                *self = subs
-                    .get(b)
-                    .cloned()
-                    .unwrap_or_else(|| panic!("Cannot instantiate type var {b}"));
-                return;
-            }
-            TypeI::Unknown(_) => {
-                panic!("Instantiating a type with Unknown type variables within.");
-            }
-            TypeI::Fn(arg_types, ret_ty) => {
-                for ty in arg_types.iter_mut() {
-                    ty.instantiate_with(subs);
-                }
-                ret_ty.instantiate_with(subs);
-            }
-            TypeI::Forall(forall_vars, ty) => {
-                forall_vars.retain(|forall_var| !subs.contains_key(forall_var));
-                ty.instantiate_with(subs);
-            }
-            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
-                for param in params.values_mut() {
-                    param.instantiate_with(subs);
-                }
-            }
-            TypeI::Co(ty, ops) => {
-                ty.instantiate_with(subs);
-                for ty in ops.mut_inner().iter_types_mut() {
-                    ty.instantiate_with(subs);
-                }
-            }
-        }
-        *self = Self::new(i)
-    }
-
-    // Instantiates Forall types with new type variables.
-    fn instantiate(mut self) -> Self {
-        let i = self.inner().clone();
-        if let TypeI::Forall(params, mut ty) = i {
-            let mut subs = HashMap::new();
-            for b in params {
-                subs.insert(b, Type::unknown());
-            }
-            ty.instantiate_with(&subs);
-            ty
-        } else {
-            self
-        }
-    }
-    fn is_polymorphic(&self) -> bool {
-        matches!(&*self.clone().inner(), TypeI::Forall(_, _))
-    }
-    fn insert_type_params(&self, output: &mut HashSet<u32>) {
-        match &*self.clone().inner() {
-            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Unknown(_) => {}
-            TypeI::Param(b) => {
-                output.insert(*b);
-            }
-            TypeI::Fn(arg_types, ret_ty) => {
-                for arg_type in arg_types.iter() {
-                    arg_type.insert_type_params(output);
-                }
-                ret_ty.insert_type_params(output);
-            }
-            // Free type variables are only asked for by struct generalization.
-            // but we don't expect generic members.
-            TypeI::Forall(_, _) => panic!(
-                "Free type variables are only asked for by struct generalization... \
-                but we don't expect generic members."
-            ),
-            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
-                for param in params.values() {
-                    param.insert_type_params(output)
-                }
-            }
-            TypeI::Co(ty, ops) => {
-                ty.insert_type_params(output);
-                for ty in ops.clone().inner().iter_types() {
-                    ty.insert_type_params(output);
-                }
-            }
-        }
-    }
-    // A concrete type will be unchanged under unification.
-    fn is_concrete(&self) -> bool {
-        match &*self.clone().inner() {
-            TypeI::Bool | TypeI::Int | TypeI::Float | TypeI::Unit | TypeI::Param(_) => true,
-            TypeI::Unknown(_) => false,
-            TypeI::Forall(_, ty) => ty.is_concrete(),
-            TypeI::Fn(args, ret) => ret.is_concrete() && args.iter().all(|a| a.is_concrete()),
-            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
-                params.values().all(|p| p.is_concrete())
-            }
-            TypeI::Co(ty, ops) => ty.is_concrete() && ops.clone().inner().is_concrete(),
-        }
-    }
-
-    fn unwrap_ops(&self) -> OpSetRefCell {
-        if let TypeI::Co(_, ops) = &*self.clone().inner() {
-            return ops.clone();
-        }
-        panic!("unwrap_ops called on a non-coroutine.");
     }
 }
 
@@ -705,14 +873,18 @@ struct VariableInfo {
     mutable: bool,
 }
 
+// *************************************************************************************************
+//  Type Context
+// *************************************************************************************************
+
 // TODO: Move TypeContext, ShadowTypeContext, and friends into a sub-module to protect field access.
 #[derive(Debug, Default, PartialEq)]
 struct TypeContext {
     names: HashMap<String, NamedItem>,
     next_type_var: u32,
-    // TODO: the return type and op-set need indicators to say whether they are being inferred or checked.
-    // FnDecls are checked, lambdas and such are inferred. OpSet perhas should be optional too, to distinguish
-    // between "this perform is not allowed" and "this is not a coroutine."
+    // TODO: the return type and op-set need indicators to say whether they are being inferred or
+    // checked. FnDecls are checked, lambdas and such are inferred. OpSet perhas should be optional
+    // too, to distinguish between "this perform is not allowed" and "this is not a coroutine."
     return_type: Type,
     ops: OpSetRefCell,
 }
@@ -890,158 +1062,9 @@ enum Error {
     InapplicableConstraint(Type, Constraint),
 }
 
-fn constrain(ty: &mut TypeI, constraint: Constraint) -> Result<(), Error> {
-    let cloned_type = Type::new(ty.clone());
-    match (ty, constraint) {
-        (TypeI::Unknown(constraints), constraint) => {
-            constraints.push(constraint);
-            Ok(())
-        }
-        (TypeI::StructInstance(instance), Constraint::HasField(name, field_ty)) => {
-            unify(&instance.field_type(&name)?, &field_ty)
-        }
-        (_, constraint) => Err(Error::InapplicableConstraint(cloned_type, constraint)),
-    }
-}
-
-fn unify_params(
-    left_params: &HashMap<u32, Type>,
-    right_params: &HashMap<u32, Type>,
-    panic_msg: impl Fn() -> String,
-) -> Result<(), Error> {
-    assert_eq!(left_params.len(), right_params.len());
-    for (param_id, left_ty) in left_params.iter() {
-        let right_ty = right_params
-            .get(param_id)
-            .unwrap_or_else(|| panic!("{}", panic_msg()));
-        unify(left_ty, right_ty)?
-    }
-    Ok(())
-}
-
-fn unify_opsets(mut left_ops: OpSetRefCell, mut right_ops: OpSetRefCell) -> Result<(), Error> {
-    // Ensure if either of them are extendable, the extendable one is on the left.
-    if !left_ops.inner().done_extending && right_ops.inner().done_extending {
-        return unify_opsets(right_ops, left_ops);
-    }
-    // Use a scope so left and right are done borrowing before we call follow.
-    {
-        let mut left = left_ops.mut_inner();
-        let right = right_ops.mut_inner();
-
-        for (op_name, (perform_type, resume_type)) in right.anonymous_ops.iter() {
-            left.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
-        }
-        for (effect_name, (instance, ops)) in right.named_effects.iter() {
-            for op_name in ops.iter() {
-                left.unify_add_declared_op(Some(effect_name), instance, op_name)?;
-            }
-        }
-        // TODO: Do I need an occurs check here?
-        for super_set in right.super_sets.iter() {
-            left.super_sets.push(super_set.clone());
-        }
-    }
-    right_ops.follow(&left_ops);
-
-    // Update super_sets with everything
-    let left = &mut *left_ops.mut_inner();
-    for super_set in left.super_sets.iter_mut() {
-        let mut super_inner = super_set.mut_inner();
-        for (op_name, (perform_type, resume_type)) in left.anonymous_ops.iter() {
-            super_inner.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
-        }
-        for (effect_name, (instance, ops)) in left.named_effects.iter() {
-            for op_name in ops.iter() {
-                super_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-// Unifies two types via interior mutability.
-// Errors if the types ae not unifiable.
-fn unify(left: &Type, right: &Type) -> Result<(), Error> {
-    // Allow for unification with self and avoid double borrowing.
-    if left.0.ptr_eq(&right.0) {
-        return Ok(());
-    }
-    let left_clone = left.clone();
-    let right_clone = right.clone();
-    let mut left = left.clone();
-    let mut right = right.clone();
-
-    // `.inner` borrows from the Refcell. That borrow must end before
-    // `point_to` runs, which borrows mutably. Hence, we record whether
-    // we will point left to right or right to left in a variable and apply
-    // it after the match statement.
-    let mut point_left_to_right: Option<bool> = None;
-
-    let result = match (&mut *left.inner_mut(), &mut *right.inner_mut()) {
-        (TypeI::Int, TypeI::Int)
-        | (TypeI::Float, TypeI::Float)
-        | (TypeI::Bool, TypeI::Bool)
-        | (TypeI::Unit, TypeI::Unit) => Ok(()),
-        (TypeI::Unknown(constraints), right_inner) => {
-            for constraint in constraints.drain(..) {
-                constrain(right_inner, constraint)?;
-            }
-            point_left_to_right = Some(true);
-            Ok(())
-        }
-        (left_inner, TypeI::Unknown(constraints)) => {
-            for constraint in constraints.drain(..) {
-                constrain(left_inner, constraint)?;
-            }
-            point_left_to_right = Some(false);
-            Ok(())
-        }
-        (TypeI::Fn(left_arg_types, left_ret_ty), TypeI::Fn(right_arg_types, right_ret_ty)) => {
-            if left_arg_types.len() != right_arg_types.len() {
-                return Err(Error::NotUnifiable(left_clone, right_clone));
-            }
-            unify(left_ret_ty, right_ret_ty)?;
-            for (l, r) in left_arg_types.iter().zip(right_arg_types.iter()) {
-                unify(l, r)?;
-            }
-            Ok(())
-        }
-        (
-            TypeI::StructInstance(StructInstance {
-                params: left_params,
-                decl: left_decl,
-            }),
-            TypeI::StructInstance(StructInstance {
-                params: right_params,
-                decl: right_decl,
-            }),
-        ) if left_decl == right_decl => unify_params(left_params, right_params, || {
-            panic!(
-                "Two instance of the same struct should \
-                    have the same type param ids. \
-                    Left:{left_clone:?}, Right:{right_clone:?}"
-            )
-        }),
-        (TypeI::Co(left_ty, left_ops), TypeI::Co(right_ty, right_ops)) => {
-            unify(left_ty, right_ty)?;
-            unify_opsets(left_ops.clone(), right_ops.clone())?;
-            Ok(())
-        }
-        (TypeI::Param(l), TypeI::Param(r)) if l == r => Ok(()),
-        _ => Err(Error::NotUnifiable(left_clone, right_clone)),
-    };
-    // Finish unifying unknowns (after the dynamic borrow)
-    // by making one an alias of the other.
-    if let Some(left_to_right) = point_left_to_right {
-        if left_to_right {
-            left.point_to(&right)?;
-        } else {
-            right.point_to(&left)?;
-        }
-    }
-    result
-}
+// *************************************************************************************************
+//  Inference
+// *************************************************************************************************
 
 // Infers the type of the given expression in the given context.
 // Mutates the expression to set the type.
@@ -1347,7 +1370,8 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                     OpSetRefCell::empty_non_extensible(),
                 );
                 for binding in args.iter() {
-                    shadow.insert_binding(binding.clone()); // TODO: variables need to declare mutaiblity.
+                    // TODO: test arg mutability?
+                    shadow.insert_binding(binding.clone());
                 }
                 infer(shadow.context(), body)?;
                 unify(return_type, &body.get_type())?;
@@ -1371,7 +1395,8 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                     .context()
                     .enter_activation_frame(return_type.clone(), ops.clone().into());
                 for binding in args.iter() {
-                    shadow.insert_binding(binding.clone()); // TODO: variables need to declare mutaiblity.
+                    // TODO: variables need to declare mutaiblity.
+                    shadow.insert_binding(binding.clone());
                 }
                 infer(shadow.context(), body)?;
                 unify(return_type, &body.get_type())?;
@@ -2892,8 +2917,9 @@ mod tests {
             }),
         ]);
         let result = typecheck_program(program);
-        // TODO: This test is incorrect, the program typechecks even though lambda returns a coroutine that
-        // will never perform baz. This isn't unsound, but we want to catch those errors.
+        // TODO: This test is incorrect, the program typechecks even though lambda returns a
+        // coroutine that will never perform baz. This isn't unsound, but we want to catch those
+        // errors.
         assert_eq!(result, Ok(()));
         // assert!(matches!(result, Err(Error::OpSetNotExtendable(_))), "result:`{:?}`", result);
     }
