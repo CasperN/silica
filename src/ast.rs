@@ -1060,6 +1060,7 @@ enum Error {
     OpSetNotUnifiable(OpSet, OpSet),
     OpSetNotExtendable(OpSet),
     InapplicableConstraint(Type, Constraint),
+    ExpressisonTypeNotInferred(Expression),
 }
 
 // *************************************************************************************************
@@ -1285,11 +1286,79 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
     }
 }
 
-fn check_all_concrete(expression: &Expression) -> Result<(), Error> {
+fn check_expression_concrete(expression: &Expression) -> Result<(), Error> {
     // TODO: Its not currently an error that some expressions do not have concrete types
-    // at the end of inference. This needs to be implemented and added to `typecheck_program`
-    let _ = expression;
-    todo!()
+    // at the end of inference. This needs to be implemented and added to `typecheck_program`.
+    if !expression.get_type().is_concrete() {
+        return Err(Error::ExpressisonTypeNotInferred(expression.clone()));
+    }
+    match expression {
+        Expression::LiteralUnit
+        | Expression::LiteralBool(_)
+        | Expression::LiteralInt(_)
+        | Expression::LiteralFloat(_)
+        | Expression::L(_, _) => {}
+        Expression::If {
+            condition,
+            true_expr,
+            false_expr,
+            ty: _,
+        } => {
+            check_expression_concrete(&condition)?;
+            check_expression_concrete(&true_expr)?;
+            check_expression_concrete(&false_expr)?;
+        }
+        Expression::Call {
+            fn_expr,
+            arg_exprs,
+            return_type: _,
+        } => {
+            check_expression_concrete(&fn_expr)?;
+            for arg_expr in arg_exprs {
+                check_expression_concrete(arg_expr)?
+            }
+        }
+        Expression::Lambda { body, .. } => {
+            check_expression_concrete(&body)?;
+        }
+        Expression::LiteralStruct { fields, .. } => {
+            for field_expr in fields.values() {
+                check_expression_concrete(field_expr)?;
+            }
+        }
+        Expression::Perform { arg, .. } => {
+            check_expression_concrete(&arg)?;
+        }
+        Expression::Propagate(expr, _) => {
+            check_expression_concrete(expr)?;
+        }
+        Expression::Co(expr, _, _) => {
+            check_expression_concrete(expr)?;
+        }
+        Expression::Block { statements, .. } => {
+            for statement in statements {
+                check_statement_concrete(statement)?;
+            }
+        }
+    };
+    Ok(())
+}
+fn check_statement_concrete(statement: &Statement) -> Result<(), Error> {
+    match statement {
+        Statement::Assign(_, expr) => {
+            check_expression_concrete(expr)?;
+        }
+        Statement::Expression(expr) => {
+            check_expression_concrete(expr)?;
+        }
+        Statement::Let { binding: _, value } => {
+            check_expression_concrete(value)?;
+        }
+        Statement::Return(expr) => {
+            check_expression_concrete(expr)?;
+        }
+    }
+    Ok(())
 }
 
 fn typecheck_program(program: &mut Program) -> Result<(), Error> {
@@ -1376,6 +1445,7 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 infer(shadow.context(), body)?;
                 unify(return_type, &body.get_type())?;
                 shadow.finish();
+                check_expression_concrete(&body)?;
             }
             Declaration::Co(CoDecl {
                 forall: _,
@@ -1401,6 +1471,7 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 infer(shadow.context(), body)?;
                 unify(return_type, &body.get_type())?;
                 shadow.finish();
+                check_expression_concrete(&body)?;
             }
             Declaration::Struct(_) | Declaration::Effect(_) => {}
         }
@@ -3093,5 +3164,31 @@ mod tests {
         let int_bar = Type::co(Type::int(), bar_ops);
         let unification = unify(&int_foo, &int_bar);
         assert!(unification.is_err());
+    }
+    #[test]
+    fn error_expression_type_not_inferred() {
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                forall: vec![0],
+                name: "default".to_string(),
+                args: vec![],
+                return_type: Type::param(0),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::unit(),
+                body: Some(block_expr(vec![
+                    let_stmt("foo", None, false, call_expr("default", vec![])),
+                    return_stmt(()),
+                ])),
+            }),
+        ]);
+        assert!(matches!(
+            typecheck_program(program),
+            Err(Error::ExpressisonTypeNotInferred(Expression::Call { .. }))
+        ));
     }
 }
