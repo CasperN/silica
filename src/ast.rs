@@ -618,6 +618,8 @@ pub enum LValue {
     Field(Box<Expression>, String), // Deref, Field access, etc
 }
 
+// TODO: Consider struct TypedExpression(Expression, Type) and remove the type fields.
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
     L(LValue, Type),
@@ -658,7 +660,7 @@ pub enum Expression {
         resume_type: Type,
     },
     Propagate(Box<Expression>, Type),
-    // TODO: Handle,
+    // TODO: Handle, UFCS/method-call, ref/deref.
 }
 impl Expression {
     // Clones the type of the expression.
@@ -703,8 +705,6 @@ pub enum Statement {
     },
     Expression(Expression),
     Return(Expression),
-    // Perform / handle
-    // Ref / Deref
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1286,6 +1286,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
     }
 }
 
+// TODO: Accumulate errors in a list rather than returning the first one.
 fn check_expression_concrete(expression: &Expression) -> Result<(), Error> {
     // TODO: Its not currently an error that some expressions do not have concrete types
     // at the end of inference. This needs to be implemented and added to `typecheck_program`.
@@ -1380,7 +1381,6 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 for binding in fn_decl.args.iter() {
                     arg_types.push(binding.ty.clone());
                 }
-                // TODO: args need to declare mutability.
                 shadow.insert_variable(fn_decl.name.clone(), fn_decl.as_type(), false);
             }
             Declaration::Co(co_decl) => {
@@ -1397,7 +1397,6 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 for binding in co_decl.args.iter() {
                     arg_types.push(binding.ty.clone());
                 }
-                // TODO: args need to declare mutability.
                 shadow.insert_variable(co_decl.name.clone(), co_decl.as_type(), false);
             }
             Declaration::Struct(struct_declaration) => {
@@ -1439,7 +1438,6 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                     OpSetRefCell::empty_non_extensible(),
                 );
                 for binding in args.iter() {
-                    // TODO: test arg mutability?
                     shadow.insert_binding(binding.clone());
                 }
                 infer(shadow.context(), body)?;
@@ -1465,7 +1463,6 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                     .context()
                     .enter_activation_frame(return_type.clone(), ops.clone().into());
                 for binding in args.iter() {
-                    // TODO: variables need to declare mutaiblity.
                     shadow.insert_binding(binding.clone());
                 }
                 infer(shadow.context(), body)?;
