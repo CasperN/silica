@@ -231,9 +231,9 @@ Silica provides fine-grained control over memory initialization state via a syst
     * It runs the coroutine. If the coroutine performs an effect `E_op`, `?` propagates `E_op` outwards.
       * This requires `E_op` to be in the current function scope's operation set.
       * If the coroutine eventually completes with value `T`, then `expr?` evaluates to `T`.
+    * **Relationship to `handle`:** `expr?` may be considered syntatic sugar for `expr handle {}`.
 * **Coroutine Values:** Functions whose execution involves `perform` (or `?`) yield control, so they return a **Coroutine** value. This value encapsulates the suspended computation, its eventual result type (`T`), and the set of effects (`E`) it might perform when resumed.
 * **Handling Effects (`handle` Block):**
-    * A unified handler syntax intercepts and provides semantics for specific operations.
     * **Conceptual Syntax:** `coroutine_expr handle { InitialClause?, ReturnClause?, OpClause*?, FinallyClause? }`
     * `OpClause` form: `Effect.Operation(args), resume => { /* handler body */ }`. It matches a specific performed operation.
     * `resume(value)`: Resumes the original computation, passing `value` back as the result of the `perform`. `value` must match the operation's resumption type.
@@ -242,9 +242,10 @@ Silica provides fine-grained control over memory initialization state via a syst
     * The `FinallyClause`, e.g. `finally => ...`, this code is executed if control leaves this `handle` block, never to return, due to a propaged effect operation that is not resumed. The coroutine this `handle` block evalutes to will have a `destroy` method that will run this code.
     * **resume:** Within the handler arm, `resume` represents the unique, linear continuation capability (FnOnce) for resuming from this specific suspension point. Calling `resume(value)` consumes the `resume` and passes `value` back to the perform site, and transfers control away from the handler arm. Code immediately following a `resume()` call within the same block is unreachable.
     * **resume.into():** For scenarios like async executors needing to store and move the continuation, `resume.into()` can be used. This consumes the resume capability and yields a new, _movable_ object (conceptually `impl FnOnce(ResumeType) -> Co<T!E>`) that owns the continuation state. This requires the underlying coroutine state to implement `Move`. Calling the resulting object later will run the moved coroutine from the current suspension point.
-    * **Evaluation** A `expr handle {...}`  block, that does not handle all effects from the `expr` coroutine, evaluates to a coroutine. If all effects are handled, then it evaluates to `expr`'s return type.
+    * **Evaluation** A `expr handle {...}`  block evaluates to the type of the return arm, or if that return arm is not specified, the return type of the coroutine that `expr` evalautes to. Any unhandled operations are propagated into the local context. If any operations are propagated, the `handle` expression must be in a coroutine.
 * **Effect Tunneling:** Functions polymorphic over an effect parameter `E` cannot handle operations in `E`, even if those operations happen to collide with operations used in the polymoprphic function body (otherwise, the implementation of the generic function is revealed to the caller). Such operations "tunnel through" and are propagated outwards as part of the function's `E` effect parameter, bypassing local handlers for the operation. Concrete effects not matching `E` are handled normally.
 * **Coroutine Literals:** `co $expression`, e.g. `co foo()? + bar()?`, is an expression that evaluates to a coroutine. In the example, the coroutine returns the result of the addition and proapagtes effects from `foo()` and `bar()`.
+* **Effectless coroutines:** It is technically possible for a coroutine to have no effects, `co 1 + 1`. Such coroutines behave like lazily evalauted "thunks" in the Haskell sense.
 * **Coroutines are Existential Types:** That is, each coroutine in the source code has a unique (unnamable) type with a possibly uniquely sized state machine.
   * `Co<T!E>` is a trait (aka typeclass) that abstracts all coroutines that eventually return `T` and perform `E`.
 * **Coroutine traits:**
@@ -385,13 +386,10 @@ This subsection outlines areas where the design is still evolving, involves know
 
 ### 4.1 Immediate state and Immediate next steps
 * **Parser:** An initial `tree-sitter` grammar has been implemented in `grammar.js`. `parse.rs` accesses the generated parser via the Rust tree-sitter bindings and uses them to build the basic AST structures defined in `ast.rs`. This needs additional testing and integration.
-* **AST & Type Checker:** `ast.rs` implements basic AST nodes (literals, if, call, block, lambda, let, assign, structs). It contains a Hindley-Milner based type inference system (`infer`, `unify`).
-  * During type checking, it **mutates the AST nodes in-place** to store the inferred type information within an `Type` field associated with each expression node.
-  * Efficient type unification is achieved using interior mutability and shared pointers.
+* **AST & Type Checker:** `ast.rs` implements basic AST nodes (literals, if, call, block, lambda, let, assign, structs, handle). It contains a Hindley-Milner based type inference system (`infer`, `unify`).
   * It successfully handles basic type checking, variable scoping, and mutability checks for assignments on the current language subset. Lacks AST representation and type checking logic for core Silica features: references, effects/coroutines, enums, traits, and explicit generics.
-  * Next step: Supporting effects.
-    * `TypeContext` currently supports tracking the current function's return type. We'll rename this to the `final_return_type` for disambiguation. A similar approach can be used to track which operations may be introduced or propagated from the function. If a function has a non-empty op-set the return type must be a coroutine like `Co<final_return_type ! op-set >`. If the opset is empty, the function then `return_type = final_return_type`.
-    * The other situation where a coroutine may appear are after `handle` blocks. This seems complex, so the implementation should start with effect declarations and `?` before working on `handle` blocks.
+  * Assignments to fields is not yet implemented because I'm not sure how to determine whether an expression is mutable.
+  * Handle blocks don't have initially/finally arms.
 * **Mid Level SSA IR**
   * `ssa.rs` defines basic data structures for an SSA IR (`SsaVar`, `Instruction`, `BasicBlock`, etc.) and includes an SSA validation pass (`typecheck_ssa`) for this basic structure.
   * Development on this file is paused until the type checker supports effects and references.
