@@ -29,7 +29,7 @@ enum TypeI {
     Int,
     Bool,
     Float,
-    Never,  // Never aka Bottom aka the empty type.
+    Never, // Never aka Bottom aka the empty type.
     Fn(Vec<Type>, Type),
     StructInstance(StructInstance),
     Co(Type, OpSet),
@@ -720,7 +720,9 @@ pub enum Expression {
     Propagate(Box<Expression>, Type),
     Handle {
         co: Box<Expression>,
-        ops: Vec<HandleOpArm>,
+        // Initially arm, finally arm.
+        return_arm: Option<(SoftBinding, Box<Expression>)>,
+        op_arms: Vec<HandleOpArm>,
         ty: Type,
     }, // TODO: UFCS/method-call, ref/deref.
 }
@@ -1046,10 +1048,11 @@ impl<'a> ShadowTypeContext<'a> {
         let TypedBinding { name, ty, mutable } = binding;
         self.insert_variable(name, ty, mutable);
     }
-    fn insert_soft_binding(&mut self, binding: SoftBinding) {
+    fn insert_soft_binding(&mut self, binding: SoftBinding) -> Type {
         let SoftBinding { name, ty, mutable } = binding;
         let ty = ty.unwrap_or_else(Type::unknown);
-        self.insert_variable(name, ty, mutable);
+        self.insert_variable(name, ty.clone(), mutable);
+        ty
     }
     fn set_resume_type(&mut self, ty: &Type) {
         if self.shadowed_return_type.is_some() {
@@ -1317,42 +1320,57 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             co_ops.when_extended_update(&context.ops);
             Ok(())
         }
-        Expression::Handle { co, ops, ty } => {
+        Expression::Handle {
+            co,
+            return_arm,
+            op_arms,
+            ty: handle_expr_ty,
+        } => {
             infer(context, co)?;
-
-            // Add the handled ops to co_ops and then unify.
+            // Get a name for `co`'s type and ops, adding the handled ops to co_ops.
+            let co_return_ty = Type::unknown();
             let mut co_ops = OpSet::empty_extensible();
-            for arm in ops.iter() {
+            for arm in op_arms.iter() {
                 co_ops.mut_inner().unify_add_anonymous_effect(
                     &arm.op_name,
                     &Type::unknown(),
                     &Type::unknown(),
                 )?;
             }
-            unify(&co.get_type(), &Type::co(ty.clone(), co_ops.clone()))?;
+            unify(
+                &co.get_type(),
+                &Type::co(co_return_ty.clone(), co_ops.clone()),
+            )?;
 
-            // Infer the arms.
-            for arm in ops.iter_mut() {
+            // Infer the return arm.
+            if let Some((binding, expr)) = return_arm {
                 let mut shadow = context.shadow();
-                shadow.insert_soft_binding(arm.performed_variable.clone());
-                // TODO: Is there a less ugly way to set p_var_ty?
-                let p_var_ty = shadow
-                    .context()
-                    .variable_info(&arm.performed_variable.name)
-                    .unwrap()
-                    .ty
-                    .clone();
+                let original_return_ty = shadow.insert_soft_binding(binding.clone());
+                unify(&original_return_ty, &co_return_ty)?;
+
+                infer(shadow.context(), expr)?;
+                unify(&expr.get_type(), handle_expr_ty)?;
+            } else {
+                // An unspecified return arm is the identity function, so `co`'s returned value
+                // becomes the handle's evaluated value.
+                unify(&co_return_ty, handle_expr_ty)?;
+            }
+
+            // Infer the op arms.
+            for arm in op_arms.iter_mut() {
+                let mut shadow = context.shadow();
+                let p_var_ty = shadow.insert_soft_binding(arm.performed_variable.clone());
                 let (p_ty, r_ty) = co_ops.inner().get_anonymous_op(&arm.op_name).unwrap();
                 unify(&p_ty, &p_var_ty)?;
                 shadow.set_resume_type(&r_ty);
                 infer(shadow.context(), &mut arm.body)?;
                 // TODO: If the arm ends in a resume, then it does not need to unify here.
-                unify(&arm.body.get_type(), ty)?;
+                unify(&arm.body.get_type(), handle_expr_ty)?;
             }
             // Clone the handled ops and removed the handled ones to get the remaining ops.
             // Guaranteed not to die because they were just added.
             let mut remaining_ops = co_ops.mut_inner().clone();
-            for arm in ops.iter() {
+            for arm in op_arms.iter() {
                 remaining_ops.remove_anonymous_effect_or_die(&arm.op_name);
             }
             context.ops.subsume(&remaining_ops)?;
@@ -1476,9 +1494,17 @@ fn check_expression_concrete(expression: &Expression) -> Result<(), Error> {
         Expression::Propagate(expr, _) => {
             check_expression_concrete(expr)?;
         }
-        Expression::Handle { co, ops, ty: _ } => {
+        Expression::Handle {
+            co,
+            return_arm,
+            op_arms,
+            ty: _,
+        } => {
             check_expression_concrete(co)?;
-            for arm in ops {
+            if let Some((_, expr)) = return_arm {
+                check_expression_concrete(expr)?;
+            }
+            for arm in op_arms {
                 check_expression_concrete(&arm.body)?;
             }
         }
@@ -1661,6 +1687,11 @@ impl From<&str> for Statement {
 impl From<i64> for Statement {
     fn from(value: i64) -> Self {
         Statement::Expression(Expression::LiteralInt(value))
+    }
+}
+impl From<f64> for Statement {
+    fn from(value: f64) -> Self {
+        Statement::Expression(Expression::LiteralFloat(value))
     }
 }
 impl From<&str> for Expression {
@@ -3397,7 +3428,8 @@ mod tests {
                     Expression::Handle {
                         co: Box::new("both".into()),
                         ty: Type::unknown(),
-                        ops: vec![
+                        return_arm: None,
+                        op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
                                 performed_variable: SoftBinding {
@@ -3405,7 +3437,7 @@ mod tests {
                                     ty: None,
                                     mutable: false,
                                 },
-                                body: 42.into(),  // Ignore the effect.
+                                body: 42.into(), // Ignore the effect.
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
@@ -3414,7 +3446,7 @@ mod tests {
                                     ty: None,
                                     mutable: false,
                                 },
-                                body: 42.into(),  // Ignore the effect.
+                                body: 42.into(), // Ignore the effect.
                             },
                         ],
                     }
@@ -3468,7 +3500,8 @@ mod tests {
                     Expression::Handle {
                         co: Box::new("calls_something".into()),
                         ty: Type::unknown(),
-                        ops: vec![
+                        return_arm: None,
+                        op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
                                 performed_variable: SoftBinding {
@@ -3527,7 +3560,8 @@ mod tests {
                     Expression::Handle {
                         co: Box::new("performs_foo_and_bar".into()),
                         ty: Type::unknown(),
-                        ops: vec![HandleOpArm {
+                        return_arm: None,
+                        op_arms: vec![HandleOpArm {
                             op_name: "foo".to_string(),
                             performed_variable: SoftBinding {
                                 name: "x".to_string(),
@@ -3575,7 +3609,8 @@ mod tests {
                     Expression::Handle {
                         co: Box::new("performs_foo_and_bar".into()),
                         ty: Type::unknown(),
-                        ops: vec![
+                        return_arm: None,
+                        op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
                                 performed_variable: SoftBinding {
@@ -3631,7 +3666,8 @@ mod tests {
                     Expression::Handle {
                         co: Box::new("performs_foo".into()),
                         ty: Type::unknown(),
-                        ops: vec![
+                        return_arm: None,
+                        op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
                                 performed_variable: SoftBinding {
@@ -3664,5 +3700,166 @@ mod tests {
         // the "irrelevant" arm is handling an effect that will never be performed. This should be
         // at least a warning, if not an error.
         assert_eq!(result, Ok(()));
+    }
+    #[test]
+    fn handle_return_arm_unifies() {
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "something".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::float(), false),
+                ],
+                return_type: Type::bool_(),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::int(),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "performs_foo",
+                        None,
+                        false,
+                        co_expr(perform_anon("foo", 53.42)),
+                    ),
+                    let_stmt(
+                        "performs_bar",
+                        None,
+                        false,
+                        co_expr(perform_anon("bar", 53)),
+                    ),
+                    let_stmt(
+                        "calls_something",
+                        None,
+                        false,
+                        co_expr(call_expr(
+                            "something",
+                            vec![propagate("performs_bar"), propagate("performs_foo")],
+                        )),
+                    ),
+                    Expression::Handle {
+                        co: Box::new("calls_something".into()),
+                        ty: Type::unknown(),
+                        return_arm: Some((
+                            SoftBinding {
+                                name: "r".to_string(),
+                                ty: None,
+                                mutable: false,
+                            },
+                            Box::new(12.into()),
+                        )),
+                        op_arms: vec![
+                            HandleOpArm {
+                                op_name: "foo".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: block_expr(vec![resume_stmt("x")]),
+                            },
+                            HandleOpArm {
+                                op_name: "bar".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: block_expr(vec![42.into()]),
+                            },
+                        ],
+                    }
+                    .into(),
+                ])),
+            }),
+        ]);
+        let result = typecheck_program(program);
+        assert_eq!(result, Ok(()));
+    }
+    #[test]
+    fn handle_return_arm_does_not_unify() {
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "something".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::float(), false),
+                ],
+                return_type: Type::bool_(),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::int(),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "performs_foo",
+                        None,
+                        false,
+                        co_expr(perform_anon("foo", 53.42)),
+                    ),
+                    let_stmt(
+                        "performs_bar",
+                        None,
+                        false,
+                        co_expr(perform_anon("bar", 53)),
+                    ),
+                    let_stmt(
+                        "calls_something",
+                        None,
+                        false,
+                        co_expr(call_expr(
+                            "something",
+                            vec![propagate("performs_bar"), propagate("performs_foo")],
+                        )),
+                    ),
+                    Expression::Handle {
+                        co: Box::new("calls_something".into()),
+                        ty: Type::unknown(),
+                        return_arm: Some((
+                            SoftBinding {
+                                name: "r".to_string(),
+                                ty: None,
+                                mutable: false,
+                            },
+                            Box::new(12.into()),
+                        )),
+                        op_arms: vec![
+                            HandleOpArm {
+                                op_name: "foo".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                // Never type.
+                                body: block_expr(vec![resume_stmt("x")]),
+                            },
+                            HandleOpArm {
+                                op_name: "bar".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: block_expr(vec![
+                                    42.32.into(), // Not an int!
+                                ]),
+                            },
+                        ],
+                    }
+                    .into(),
+                ])),
+            }),
+        ]);
+        let result = typecheck_program(program);
+        assert_eq!(result, Err(Error::NotUnifiable(Type::float(), Type::int())));
     }
 }
