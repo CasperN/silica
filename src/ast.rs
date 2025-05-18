@@ -29,6 +29,7 @@ enum TypeI {
     Int,
     Bool,
     Float,
+    Never,  // Never aka Bottom aka the empty type.
     Fn(Vec<Type>, Type),
     StructInstance(StructInstance),
     Co(Type, OpSet),
@@ -67,6 +68,9 @@ impl Type {
     pub fn unit() -> Self {
         Self::new(TypeI::Unit)
     }
+    pub fn never() -> Self {
+        Self::new(TypeI::Never)
+    }
     pub fn func(args: Vec<Type>, ret: Type) -> Self {
         Self::new(TypeI::Fn(args, ret))
     }
@@ -101,6 +105,7 @@ impl Type {
             | TypeI::Bool
             | TypeI::Float
             | TypeI::Unit
+            | TypeI::Never
             | TypeI::Param(_)
             | TypeI::Unknown(_) => false,
             TypeI::Forall(_, ty) => ty.contains_type(other),
@@ -129,6 +134,7 @@ impl Type {
             | TypeI::Float
             | TypeI::Unit
             | TypeI::Param(_)
+            | TypeI::Never
             | TypeI::Unknown(_) => false,
             TypeI::Forall(_, ty) => ty.contains_opset(other),
             TypeI::Fn(arg_types, ret_type) => {
@@ -154,7 +160,7 @@ impl Type {
     fn instantiate_with(&mut self, subs: &HashMap<u32, Type>) {
         let mut i = self.inner().clone();
         match &mut i {
-            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit => {}
+            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Never => {}
             TypeI::Param(b) => {
                 *self = subs
                     .get(b)
@@ -209,7 +215,12 @@ impl Type {
     }
     fn insert_type_params(&self, output: &mut HashSet<u32>) {
         match &*self.clone().inner() {
-            TypeI::Int | TypeI::Bool | TypeI::Float | TypeI::Unit | TypeI::Unknown(_) => {}
+            TypeI::Int
+            | TypeI::Bool
+            | TypeI::Float
+            | TypeI::Unit
+            | TypeI::Never
+            | TypeI::Unknown(_) => {}
             TypeI::Param(b) => {
                 output.insert(*b);
             }
@@ -241,7 +252,12 @@ impl Type {
     // A concrete type will be unchanged under unification.
     fn is_concrete(&self) -> bool {
         match &*self.clone().inner() {
-            TypeI::Bool | TypeI::Int | TypeI::Float | TypeI::Unit | TypeI::Param(_) => true,
+            TypeI::Bool
+            | TypeI::Int
+            | TypeI::Float
+            | TypeI::Unit
+            | TypeI::Param(_)
+            | TypeI::Never => true,
             TypeI::Unknown(_) => false,
             TypeI::Forall(_, ty) => ty.is_concrete(),
             TypeI::Fn(args, ret) => ret.is_concrete() && args.iter().all(|a| a.is_concrete()),
@@ -560,7 +576,7 @@ fn unify_opsets(mut left_ops: OpSet, mut right_ops: OpSet) -> Result<(), Error> 
 // Unifies two types via interior mutability.
 // Errors if the types ae not unifiable.
 fn unify(left: &Type, right: &Type) -> Result<(), Error> {
-    // Allow for unification with self and avoid double borrowing.
+    // Allow for unification with self while avoiding double borrowing.
     if left.0.ptr_eq(&right.0) {
         return Ok(());
     }
@@ -580,6 +596,16 @@ fn unify(left: &Type, right: &Type) -> Result<(), Error> {
         | (TypeI::Float, TypeI::Float)
         | (TypeI::Bool, TypeI::Bool)
         | (TypeI::Unit, TypeI::Unit) => Ok(()),
+        // The empty type unifies with everything.
+        (_, TypeI::Never) => {
+            point_left_to_right = Some(false);
+            Ok(())
+        }
+        (TypeI::Never, _) => {
+            point_left_to_right = Some(true);
+            Ok(())
+        }
+        // Unify unknown types, respecting constraints.
         (TypeI::Unknown(constraints), right_inner) => {
             for constraint in constraints.drain(..) {
                 constrain(right_inner, constraint)?;
@@ -702,6 +728,7 @@ pub enum Expression {
 #[derive(Debug, Clone, PartialEq)]
 pub struct HandleOpArm {
     pub op_name: String,
+    // TODO: This only handles anonymous effects. What about named effects?
     pub performed_variable: SoftBinding,
     pub body: Expression,
 }
@@ -1380,7 +1407,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                     Statement::Return(expr) => {
                         infer(shadow.context(), expr)?;
                         unify(&expr.get_type(), &shadow.context().return_type)?;
-                        last_statement_type = expr.get_type().clone();
+                        last_statement_type = Type::never();
                         // TODO: Probably should issue a warning for unreachable statements.
                     }
                     Statement::Resume(expr) => {
@@ -1390,7 +1417,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                         } else {
                             return Err(Error::UnexpectedResume(expression.clone()));
                         }
-                        last_statement_type = expr.get_type().clone();
+                        last_statement_type = Type::never();
                         // TODO: Probably should issue a warning for unreachable statements.
                     }
                 }
@@ -3378,7 +3405,7 @@ mod tests {
                                     ty: None,
                                     mutable: false,
                                 },
-                                body: "x".into(),
+                                body: 42.into(),  // Ignore the effect.
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
@@ -3387,7 +3414,7 @@ mod tests {
                                     ty: None,
                                     mutable: false,
                                 },
-                                body: "x".into(),
+                                body: 42.into(),  // Ignore the effect.
                             },
                         ],
                     }
@@ -3403,25 +3430,25 @@ mod tests {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
                 forall: vec![],
-                name: "plus".to_string(),
+                name: "something".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    TypedBinding::new("b", Type::float(), false),
                 ],
-                return_type: Type::int(),
+                return_type: Type::bool_(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: Type::bool_(),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo",
                         None,
                         false,
-                        co_expr(perform_anon("foo", 53)),
+                        co_expr(perform_anon("foo", 53.42)),
                     ),
                     let_stmt(
                         "performs_bar",
@@ -3430,16 +3457,16 @@ mod tests {
                         co_expr(perform_anon("bar", 53)),
                     ),
                     let_stmt(
-                        "both",
+                        "calls_something",
                         None,
                         false,
                         co_expr(call_expr(
-                            "plus",
+                            "something",
                             vec![propagate("performs_bar"), propagate("performs_foo")],
                         )),
                     ),
                     Expression::Handle {
-                        co: Box::new("both".into()),
+                        co: Box::new("calls_something".into()),
                         ty: Type::unknown(),
                         ops: vec![
                             HandleOpArm {
