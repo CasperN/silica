@@ -122,6 +122,35 @@ impl Type {
             }
         }
     }
+    fn contains_opset_ref(&self, other: &OpSetRefCell) -> bool {
+        match &*self.clone().inner() {
+            TypeI::Int
+            | TypeI::Bool
+            | TypeI::Float
+            | TypeI::Unit
+            | TypeI::Param(_)
+            | TypeI::Unknown(_) => false,
+            TypeI::Forall(_, ty) => ty.contains_opset_ref(other),
+            TypeI::Fn(arg_types, ret_type) => {
+                arg_types.iter().any(|a| a.contains_opset_ref(other))
+                    || ret_type.contains_opset_ref(other)
+            }
+            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
+                // We assume that declarations cannot contain unification cycles,
+                // so just check the params.
+                params.values().any(|p| p.contains_opset_ref(other))
+            }
+            TypeI::Co(ty, ops) => {
+                ty.contains_opset_ref(other)
+                    || ops
+                        .clone()
+                        .inner()
+                        .iter_types()
+                        .any(|ty| ty.contains_opset_ref(other))
+            }
+        }
+    }
+
     fn point_to(&mut self, other: &Self) -> Result<(), Error> {
         if other.contains_ptr(self) {
             return Err(Error::InfiniteType(self.clone(), other.clone()));
@@ -245,7 +274,7 @@ impl Type {
 
 // Union find wrapper.
 #[derive(Debug, Clone, PartialEq)]
-pub struct OpSetRefCell(UnionFindRef<OpSet>);
+pub struct OpSetRefCell(UnionFindRef<OpSet>); // TODO: Rename.
 
 // A set of ops that are being performed.
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -293,26 +322,39 @@ impl OpSetRefCell {
         self.0.clone_inner()
     }
     fn follow(&self, other: &OpSetRefCell) {
+        if other.contains_opset_ref(self) {
+            panic!("Looped introduced when following. Left {self:?}. Right: {other:?}.");
+        }
         self.0.clone().follow(&other.0);
     }
+    /// When self is extended with new ops, add them to `other` too.
+    fn when_extended_update(&mut self, other: &Self) {
+        if other.contains_opset_ref(self) {
+            return;
+        }
+        if self.is_extendable() {
+            self.mut_inner().super_sets.push(other.clone());
+        }
+    }
 
-    /// Adds all effects of `other` into `self` and makes `self` a super-set of `other`.
-    ///
-    /// When future ops of `other` are added, they will also be added to `self`.
-    fn subsume(&mut self, other: &mut Self) -> Result<(), Error> {
-        let mut other_inner = other.mut_inner();
-        let self_clone = self.clone();
+    /// Adds all currently known effects of `other` into `self`.
+    fn subsume(&mut self, other: &OpSet) -> Result<(), Error> {
         let mut self_inner = self.mut_inner();
-        for (op_name, (perform_type, resume_type)) in other_inner.anonymous_ops.iter() {
+        for (op_name, (perform_type, resume_type)) in other.anonymous_ops.iter() {
             self_inner.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
         }
-        for (effect_name, (instance, ops)) in other_inner.named_effects.iter() {
+        for (effect_name, (instance, ops)) in other.named_effects.iter() {
             for op_name in ops {
                 self_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
             }
         }
-        other_inner.super_sets.push(self_clone);
         Ok(())
+    }
+    fn contains_opset_ref(&self, other: &OpSetRefCell) -> bool {
+        if self.0.ptr_eq(&other.0) {
+            return true;
+        }
+        self.clone().inner().contains_opset_ref(other)
     }
 }
 impl OpSet {
@@ -332,9 +374,10 @@ impl OpSet {
         self.anonymous_ops.is_empty() && self.named_effects.is_empty()
     }
 
-    // An Opset is concrete if it will be unchanged under unification.
+    // An Opset is concrete if all the types therein are concrete.
+    // Note that we consider extendable OpSets to be concrete.
     fn is_concrete(&self) -> bool {
-        self.done_extending && self.iter_types().all(|ty| ty.is_concrete())
+        self.iter_types().all(|ty| ty.is_concrete())
     }
     fn get(&self, name_or_effect: Option<&str>, op_name: &str) -> Option<(Type, Type)> {
         if name_or_effect.is_none() {
@@ -373,6 +416,21 @@ impl OpSet {
         }
         types.into_iter()
     }
+    fn remove_anonymous_effect_or_die(&mut self, name: &str) {
+        self.anonymous_ops
+            .remove(name)
+            .unwrap_or_else(|| panic!("Expected {name} in {self:?}"));
+    }
+    fn remove_named_effect_or_die(&mut self, effect_name: &str, op_name: &str) {
+        if let Some((_, ops)) = self.named_effects.get_mut(effect_name) {
+            if !ops.remove(op_name) {
+                panic!("Expected {effect_name}.{op_name} in {self:?}");
+            }
+        } else {
+            panic!("Expected {effect_name} effect in {self:?}");
+        }
+    }
+
     fn unify_add_anonymous_effect(
         &mut self,
         name: &str,
@@ -449,6 +507,13 @@ impl OpSet {
         }
         Ok(self)
     }
+    fn get_anonymous_op(&self, name: &str) -> Option<(Type, Type)> {
+        self.anonymous_ops.get(name).cloned()
+    }
+    fn contains_opset_ref(&self, other: &OpSetRefCell) -> bool {
+        self.super_sets.iter().any(|s| s.contains_opset_ref(other))
+            && self.iter_types().any(|t| t.contains_opset_ref(other))
+    }
 }
 
 // *************************************************************************************************
@@ -485,43 +550,18 @@ fn unify_params(
 }
 
 fn unify_opsets(mut left_ops: OpSetRefCell, mut right_ops: OpSetRefCell) -> Result<(), Error> {
-    // Ensure if either of them are extendable, the extendable one is on the left.
-    if !left_ops.inner().done_extending && right_ops.inner().done_extending {
-        return unify_opsets(right_ops, left_ops);
-    }
-    // Use a scope so left and right are done borrowing before we call follow.
-    {
-        let mut left = left_ops.mut_inner();
-        let right = right_ops.mut_inner();
+    assert!(!left_ops.0.ptr_eq(&right_ops.0));
 
-        for (op_name, (perform_type, resume_type)) in right.anonymous_ops.iter() {
-            left.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
-        }
-        for (effect_name, (instance, ops)) in right.named_effects.iter() {
-            for op_name in ops.iter() {
-                left.unify_add_declared_op(Some(effect_name), instance, op_name)?;
-            }
-        }
-        // TODO: Do I need an occurs check here?
-        for super_set in right.super_sets.iter() {
-            left.super_sets.push(super_set.clone());
-        }
+    // Ensure all ops in left and right are on both sides.
+    left_ops.subsume(&right_ops.inner())?;
+    right_ops.subsume(&left_ops.inner())?;
+
+    // We wil make right follow left. If right is not extendable, left shouldn't be either.
+    if !right_ops.is_extendable() {
+        left_ops.mut_inner().done_extending = true;
     }
     right_ops.follow(&left_ops);
 
-    // Update super_sets with everything
-    let left = &mut *left_ops.mut_inner();
-    for super_set in left.super_sets.iter_mut() {
-        let mut super_inner = super_set.mut_inner();
-        for (op_name, (perform_type, resume_type)) in left.anonymous_ops.iter() {
-            super_inner.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
-        }
-        for (effect_name, (instance, ops)) in left.named_effects.iter() {
-            for op_name in ops.iter() {
-                super_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
-            }
-        }
-    }
     Ok(())
 }
 
@@ -660,8 +700,20 @@ pub enum Expression {
         resume_type: Type,
     },
     Propagate(Box<Expression>, Type),
-    // TODO: Handle, UFCS/method-call, ref/deref.
+    Handle {
+        co: Box<Expression>,
+        ops: Vec<HandleOpArm>,
+        ty: Type,
+    }, // TODO: UFCS/method-call, ref/deref.
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandleOpArm {
+    pub op_name: String,
+    pub performed_variable: SoftBinding,
+    pub body: Expression,
+}
+
 impl Expression {
     // Clones the type of the expression.
     fn get_type(&self) -> Type {
@@ -690,6 +742,7 @@ impl Expression {
                 arg: _,
                 resume_type: ty,
             }
+            | Self::Handle { ty, .. }
             | Self::Propagate(_, ty) => ty.clone(),
             Self::Co(_, return_ty, ops) => Type::co(return_ty.clone(), ops.clone()),
         }
@@ -705,6 +758,7 @@ pub enum Statement {
     },
     Expression(Expression),
     Return(Expression),
+    Resume(Expression),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -883,9 +937,10 @@ struct TypeContext {
     names: HashMap<String, NamedItem>,
     next_type_var: u32,
     // TODO: the return type and op-set need indicators to say whether they are being inferred or
-    // checked. FnDecls are checked, lambdas and such are inferred. OpSet perhas should be optional
+    // checked. FnDecls are checked, lambdas and such are inferred. OpSet perhaps should be optional
     // too, to distinguish between "this perform is not allowed" and "this is not a coroutine."
     return_type: Type,
+    resume_type: Option<Type>,
     ops: OpSetRefCell,
 }
 impl TypeContext {
@@ -923,6 +978,7 @@ impl TypeContext {
             finished: false,
             shadowed_return_type: None,
             shadowed_ops: None,
+            shadowed_resume_type: None,
         }
     }
     // When entering the body of a lambda, or `co {..}`, block, the semantics of
@@ -934,11 +990,13 @@ impl TypeContext {
     ) -> ShadowTypeContext {
         std::mem::swap(&mut return_type, &mut self.return_type);
         std::mem::swap(&mut ops, &mut self.ops);
+        let resume_type = self.resume_type.take();
         ShadowTypeContext {
             type_context: self,
             shadowed_variables: HashMap::new(),
             shadowed_return_type: Some(return_type),
             shadowed_ops: Some(ops),
+            shadowed_resume_type: Some(resume_type),
             finished: false,
         }
     }
@@ -949,6 +1007,7 @@ struct ShadowTypeContext<'a> {
     type_context: &'a mut TypeContext,
     shadowed_variables: HashMap<String, Option<NamedItem>>,
     shadowed_return_type: Option<Type>,
+    shadowed_resume_type: Option<Option<Type>>,
     shadowed_ops: Option<OpSetRefCell>,
     finished: bool,
 }
@@ -973,6 +1032,14 @@ impl<'a> ShadowTypeContext<'a> {
         let ty = ty.unwrap_or_else(Type::unknown);
         self.insert_variable(name, ty, mutable);
     }
+    fn set_resume_type(&mut self, ty: &Type) {
+        if self.shadowed_return_type.is_some() {
+            panic!("Resume type set multiple times.");
+        }
+        self.shadowed_resume_type = Some(self.context().resume_type.take());
+        self.context().resume_type = Some(ty.clone());
+    }
+
     // Defines a struct. Returns if there was a previous definition.
     fn define_struct(&mut self, decl: StructDecl) -> bool {
         let name = decl.name.clone();
@@ -1026,6 +1093,12 @@ impl<'a> Drop for ShadowTypeContext<'a> {
         if let Some(ty) = self.shadowed_return_type.take() {
             self.type_context.return_type = ty;
         }
+        if let Some(ops) = self.shadowed_ops.take() {
+            self.type_context.ops = ops;
+        }
+        if let Some(resume_type) = self.shadowed_resume_type.take() {
+            self.type_context.resume_type = resume_type;
+        }
     }
 }
 
@@ -1061,6 +1134,7 @@ enum Error {
     OpSetNotExtendable(OpSet),
     InapplicableConstraint(Type, Constraint),
     ExpressisonTypeNotInferred(Expression),
+    UnexpectedResume(Expression),
 }
 
 // *************************************************************************************************
@@ -1220,10 +1294,52 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
         }
         Expression::Propagate(expr, ty) => {
             infer(context, expr)?;
-            let co_ty = Type::co(ty.clone(), OpSetRefCell::empty_extensible());
-            unify(&co_ty, &expr.get_type())?;
-            let context_ops = &mut context.ops;
-            context_ops.subsume(&mut co_ty.unwrap_ops())?;
+            let mut co_ops = OpSetRefCell::empty_extensible();
+            unify(&expr.get_type(), &Type::co(ty.clone(), co_ops.clone()))?;
+            context.ops.subsume(&co_ops.inner())?;
+            co_ops.when_extended_update(&context.ops);
+            Ok(())
+        }
+        Expression::Handle { co, ops, ty } => {
+            infer(context, co)?;
+
+            // Add the handled ops to co_ops and then unify.
+            let mut co_ops = OpSetRefCell::empty_extensible();
+            for arm in ops.iter() {
+                co_ops.mut_inner().unify_add_anonymous_effect(
+                    &arm.op_name,
+                    &Type::unknown(),
+                    &Type::unknown(),
+                )?;
+            }
+            unify(&co.get_type(), &Type::co(ty.clone(), co_ops.clone()))?;
+
+            // Infer the arms.
+            for arm in ops.iter_mut() {
+                let mut shadow = context.shadow();
+                shadow.insert_soft_binding(arm.performed_variable.clone());
+                // TODO: Is there a less ugly way to set p_var_ty?
+                let p_var_ty = shadow
+                    .context()
+                    .variable_info(&arm.performed_variable.name)
+                    .unwrap()
+                    .ty
+                    .clone();
+                let (p_ty, r_ty) = co_ops.inner().get_anonymous_op(&arm.op_name).unwrap();
+                unify(&p_ty, &p_var_ty)?;
+                shadow.set_resume_type(&r_ty);
+                infer(shadow.context(), &mut arm.body)?;
+                // TODO: If the arm ends in a resume, then it does not need to unify here.
+                unify(&arm.body.get_type(), &ty)?;
+            }
+            // Clone the handled ops and removed the handled ones to get the remaining ops.
+            // Guaranteed not to die because they were just added.
+            let mut remaining_ops = co_ops.mut_inner().clone();
+            for arm in ops.iter() {
+                remaining_ops.remove_anonymous_effect_or_die(&arm.op_name);
+            }
+            context.ops.subsume(&remaining_ops)?;
+            co_ops.when_extended_update(&context.ops);
             Ok(())
         }
         Expression::Block {
@@ -1274,6 +1390,16 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                     Statement::Return(expr) => {
                         infer(shadow.context(), expr)?;
                         unify(&expr.get_type(), &shadow.context().return_type)?;
+                        last_statement_type = expr.get_type().clone();
+                        // TODO: Probably should issue a warning for unreachable statements.
+                    }
+                    Statement::Resume(expr) => {
+                        infer(shadow.context(), expr)?;
+                        if let Some(resume_type) = shadow.context().resume_type.as_ref() {
+                            unify(&expr.get_type(), resume_type)?;
+                        } else {
+                            return Err(Error::UnexpectedResume(expression.clone()));
+                        }
                         last_statement_type = expr.get_type().clone();
                         // TODO: Probably should issue a warning for unreachable statements.
                     }
@@ -1333,6 +1459,12 @@ fn check_expression_concrete(expression: &Expression) -> Result<(), Error> {
         Expression::Propagate(expr, _) => {
             check_expression_concrete(expr)?;
         }
+        Expression::Handle { co, ops, ty: _ } => {
+            check_expression_concrete(&co)?;
+            for arm in ops {
+                check_expression_concrete(&arm.body)?;
+            }
+        }
         Expression::Co(expr, _, _) => {
             check_expression_concrete(expr)?;
         }
@@ -1355,7 +1487,7 @@ fn check_statement_concrete(statement: &Statement) -> Result<(), Error> {
         Statement::Let { binding: _, value } => {
             check_expression_concrete(value)?;
         }
-        Statement::Return(expr) => {
+        Statement::Return(expr) | Statement::Resume(expr) => {
             check_expression_concrete(expr)?;
         }
     }
@@ -1558,7 +1690,9 @@ pub mod test_helpers {
     pub fn return_stmt(expr: impl Into<Expression>) -> Statement {
         Statement::Return(expr.into())
     }
-
+    pub fn resume_stmt(expr: impl Into<Expression>) -> Statement {
+        Statement::Resume(expr.into())
+    }
     pub fn call_expr(f: impl Into<Expression>, arg_exprs: Vec<Expression>) -> Expression {
         Expression::Call {
             fn_expr: Box::new(f.into()),
@@ -3187,5 +3321,336 @@ mod tests {
             typecheck_program(program),
             Err(Error::ExpressisonTypeNotInferred(Expression::Call { .. }))
         ));
+    }
+    #[test]
+    fn propagate_co() {
+        let program = &mut Program(vec![Declaration::Fn(FnDecl {
+            forall: vec![],
+            name: "main".to_string(),
+            args: vec![],
+            return_type: Type::int(),
+            body: Some(block_expr(vec![
+                let_stmt(
+                    "performs_bar",
+                    None,
+                    false,
+                    co_expr(perform_anon("bar", 53)),
+                ),
+                propagate("performs_bar").into(),
+            ])),
+        })]);
+        let result = typecheck_program(program);
+        assert!(matches!(result, Err(Error::OpSetNotExtendable(_))));
+    }
+    #[test]
+    fn handle_two_anonymous_effects() {
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "plus".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
+                ],
+                return_type: Type::int(),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::int(),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "performs_foo",
+                        None,
+                        false,
+                        co_expr(perform_anon("foo", 53)),
+                    ),
+                    let_stmt(
+                        "performs_bar",
+                        None,
+                        false,
+                        co_expr(perform_anon("bar", 53)),
+                    ),
+                    let_stmt(
+                        "both",
+                        None,
+                        false,
+                        co_expr(call_expr(
+                            "plus",
+                            vec![propagate("performs_bar"), propagate("performs_foo")],
+                        )),
+                    ),
+                    Expression::Handle {
+                        co: Box::new("both".into()),
+                        ty: Type::unknown(),
+                        ops: vec![
+                            HandleOpArm {
+                                op_name: "foo".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: "x".into(),
+                            },
+                            HandleOpArm {
+                                op_name: "bar".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: "x".into(),
+                            },
+                        ],
+                    }
+                    .into(),
+                ])),
+            }),
+        ]);
+        let result = typecheck_program(program);
+        assert_eq!(result, Ok(()));
+    }
+    #[test]
+    fn handle_two_anonymous_effects_resuming() {
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "plus".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
+                ],
+                return_type: Type::int(),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::int(),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "performs_foo",
+                        None,
+                        false,
+                        co_expr(perform_anon("foo", 53)),
+                    ),
+                    let_stmt(
+                        "performs_bar",
+                        None,
+                        false,
+                        co_expr(perform_anon("bar", 53)),
+                    ),
+                    let_stmt(
+                        "both",
+                        None,
+                        false,
+                        co_expr(call_expr(
+                            "plus",
+                            vec![propagate("performs_bar"), propagate("performs_foo")],
+                        )),
+                    ),
+                    Expression::Handle {
+                        co: Box::new("both".into()),
+                        ty: Type::unknown(),
+                        ops: vec![
+                            HandleOpArm {
+                                op_name: "foo".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: block_expr(vec![resume_stmt("x")]),
+                            },
+                            HandleOpArm {
+                                op_name: "bar".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: block_expr(vec![resume_stmt("x")]),
+                            },
+                        ],
+                    }
+                    .into(),
+                ])),
+            }),
+        ]);
+        let result = typecheck_program(program);
+        assert_eq!(result, Ok(()));
+    }
+    #[test]
+    fn handles_foo_but_not_bar() {
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "plus".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
+                ],
+                return_type: Type::int(),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::int(),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "performs_foo_and_bar",
+                        None,
+                        false,
+                        co_expr(block_expr(vec![
+                            let_stmt("bar", Type::bool_(), false, perform_anon("bar", 4.2)),
+                            perform_anon("foo", 53).into(),
+                        ])),
+                    ),
+                    Expression::Handle {
+                        co: Box::new("performs_foo_and_bar".into()),
+                        ty: Type::unknown(),
+                        ops: vec![HandleOpArm {
+                            op_name: "foo".to_string(),
+                            performed_variable: SoftBinding {
+                                name: "x".to_string(),
+                                ty: None,
+                                mutable: false,
+                            },
+                            body: "x".into(),
+                        }],
+                    }
+                    .into(),
+                ])),
+            }),
+        ]);
+        let result = typecheck_program(program);
+        assert!(matches!(result, Err(Error::OpSetNotExtendable(_))));
+    }
+    #[test]
+    fn handles_bar_incorrectly() {
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "plus".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
+                ],
+                return_type: Type::int(),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::int(),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "performs_foo_and_bar",
+                        None,
+                        false,
+                        co_expr(block_expr(vec![
+                            let_stmt("bar", Type::bool_(), false, perform_anon("bar", 4.2)),
+                            perform_anon("foo", 53).into(),
+                        ])),
+                    ),
+                    Expression::Handle {
+                        co: Box::new("performs_foo_and_bar".into()),
+                        ty: Type::unknown(),
+                        ops: vec![
+                            HandleOpArm {
+                                op_name: "foo".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: "x".into(),
+                            },
+                            HandleOpArm {
+                                op_name: "bar".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: "x".into(),
+                            },
+                        ],
+                    }
+                    .into(),
+                ])),
+            }),
+        ]);
+        let result = typecheck_program(program);
+        assert_eq!(result, Err(Error::NotUnifiable(Type::float(), Type::int())));
+    }
+    #[test]
+    fn handles_irrelevant() {
+        let program = &mut Program(vec![
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "plus".to_string(),
+                args: vec![
+                    TypedBinding::new("a", Type::int(), false),
+                    TypedBinding::new("b", Type::int(), false),
+                ],
+                return_type: Type::int(),
+                body: None,
+            }),
+            Declaration::Fn(FnDecl {
+                forall: vec![],
+                name: "main".to_string(),
+                args: vec![],
+                return_type: Type::int(),
+                body: Some(block_expr(vec![
+                    let_stmt(
+                        "performs_foo",
+                        None,
+                        false,
+                        co_expr(block_expr(vec![perform_anon("foo", 53).into()])),
+                    ),
+                    Expression::Handle {
+                        co: Box::new("performs_foo".into()),
+                        ty: Type::unknown(),
+                        ops: vec![
+                            HandleOpArm {
+                                op_name: "foo".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: "x".into(),
+                            },
+                            HandleOpArm {
+                                op_name: "irrelevant".to_string(),
+                                performed_variable: SoftBinding {
+                                    name: "x".to_string(),
+                                    ty: None,
+                                    mutable: false,
+                                },
+                                body: block_expr(vec![
+                                    resume_stmt(()), // Give the resume a unit type.
+                                    "x".into(),      // Returned x makes perform type an int.
+                                ]),
+                            },
+                        ],
+                    }
+                    .into(),
+                ])),
+            }),
+        ]);
+        let result = typecheck_program(program);
+        // TODO: This test is incorrect. While the program typechecks, it should be rejected because
+        // the "irrelevant" arm is handling an effect that will never be performed. This should be
+        // at least a warning, if not an error.
+        assert_eq!(result, Ok(()));
     }
 }
