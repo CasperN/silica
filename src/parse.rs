@@ -1,4 +1,4 @@
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 
 use crate::ast::{
     Declaration, Expression, FnDecl, LValue, Program, SoftBinding, Statement, StructDecl, Type,
@@ -134,7 +134,7 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     };
 
     Ok(Declaration::Fn(FnDecl {
-        forall: vec![], // TODO: Parse polymorphic function declarations.
+        forall: BTreeSet::new(), // TODO: Parse polymorphic function declarations.
         name: name.to_string(),
         args: params,
         return_type,
@@ -162,7 +162,7 @@ fn build_struct_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
 
     let params = generic_params_node
         .map(|node| build_generic_params(&node, source))
-        .unwrap_or(Ok(HashSet::new()))?;
+        .unwrap_or(Ok(BTreeSet::new()))?;
 
     let fields = build_fields_map(&field_nodes, source)?;
 
@@ -173,7 +173,7 @@ fn build_struct_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     }))
 }
 
-fn build_generic_params(node: &Node, source: &str) -> BuildResult<HashSet<u32>> {
+fn build_generic_params(node: &Node, source: &str) -> BuildResult<BTreeSet<String>> {
     let _ = (node, source);
     todo!()
 }
@@ -682,7 +682,7 @@ fn is_type_node(node: &Node) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap};
 
     use super::*;
     use crate::ast::{test_helpers::*, StructDecl};
@@ -698,7 +698,7 @@ mod tests {
         assert_eq!(
             build_ast_program(source_code),
             Ok(Program(vec![Declaration::Fn(FnDecl {
-                forall: vec![],
+                forall: BTreeSet::new(),
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -720,7 +720,7 @@ mod tests {
         ";
         let expected_program = Program(vec![
             Declaration::Fn(FnDecl {
-                forall: vec![],
+                forall: BTreeSet::new(),
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -730,7 +730,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: vec![],
+                forall: BTreeSet::new(),
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -764,7 +764,7 @@ mod tests {
         ";
         let program = Program(vec![
             Declaration::Fn(FnDecl {
-                forall: vec![],
+                forall: BTreeSet::new(),
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -774,7 +774,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: vec![],
+                forall: BTreeSet::new(),
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::func(vec![Type::int()], Type::int()),
@@ -798,7 +798,7 @@ mod tests {
     fn declare_struct() {
         let source = r"struct FooBar { foo: i64, bar: f64 }";
         let program = Program(vec![Declaration::Struct(StructDecl {
-            params: HashSet::new(),
+            params: BTreeSet::new(),
             name: "FooBar".to_string(),
             fields: HashMap::from_iter(
                 [
