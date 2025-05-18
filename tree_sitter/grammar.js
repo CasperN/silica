@@ -30,7 +30,8 @@ module.exports = grammar({
     source_file: $ => repeat($._declaration),
 
     _declaration: $ => choice(
-      $.function_declaration
+      $.function_declaration,
+      $.struct_declaration
       // Add rules for struct, enum, trait, effect declarations later
     ),
 
@@ -38,6 +39,7 @@ module.exports = grammar({
     function_declaration: $ => seq(
       'fn',
       field('name', $.identifier),
+      // TODO: Optional generic parameters.
       field('parameters', $.parameter_list),
       optional(seq('->', field('return_type', $._type))),
       field('body', choice($.block_expression, ';'))
@@ -51,6 +53,30 @@ module.exports = grammar({
 
     parameter: $ => seq( // Corresponds to TypedBinding
       optional('mut'),
+      field('name', $.identifier),
+      ':',
+      field('type', $._type)
+    ),
+
+    // --- Structs ---
+    struct_declaration: $ => seq(
+      'struct',
+      field('name', $.identifier),
+      field('generic_parameters', optional($.generic_parameter_list)),
+      field('fields', $.struct_field_list),
+      // TODO: What about unit structs?
+    ),
+
+
+    struct_field_list: $ => seq(
+      '{',
+      optional(sepBy(',', $.struct_field_declaration)),
+      optional(','), // Optional trailing comma for the field list itself
+      '}'
+    ),
+
+    struct_field_declaration: $ => seq(
+      // TODO: Add visibility modifiers (pub, etc.) later if needed
       field('name', $.identifier),
       ':',
       field('type', $._type)
@@ -198,6 +224,15 @@ module.exports = grammar({
 
     // --- Comment ---
     comment: $ => token(seq('//', /.*/)),
+
+    // Other helpers. 
+    generic_parameter_list: $ => seq(
+      '<',
+      sepBy1(',', field('parameter_name', $.identifier)), // Simple identifiers for generic params for now
+                                                          // Could be $._type for bounds later: T: MyTrait
+      optional(','), // Optional trailing comma
+      '>'
+    ),
 
   }
 });

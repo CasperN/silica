@@ -1,5 +1,8 @@
+use std::collections::{hash_map::Entry, HashMap, HashSet};
+
 use crate::ast::{
-    Declaration, Expression, FnDecl, LValue, Program, SoftBinding, Statement, Type, TypedBinding,
+    Declaration, Expression, FnDecl, LValue, Program, SoftBinding, Statement, StructDecl, Type,
+    TypedBinding,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -65,10 +68,20 @@ pub fn build_ast_program(source: &str) -> BuildResult<Program> {
 
     for child_node in root_node.children(&mut cursor) {
         // Depending on grammar, might need to check child_node.kind() == "_declaration" first
-        if child_node.kind() == "function_declaration" {
-            declarations.push(build_fn_decl(&child_node, source)?);
+        match child_node.kind() {
+            "function_declaration" => {
+                declarations.push(build_fn_decl(&child_node, source)?);
+            }
+            "struct_declaration" => {
+                declarations.push(build_struct_decl(&child_node, source)?);
+            }
+            "ERROR" => {
+                panic!()
+            }
+            _ => {
+                unimplemented!("{}", child_node.kind());
+            }
         }
-        // Add cases for other top-level declarations (structs, enums, etc.) here
     }
 
     Ok(Program(declarations))
@@ -127,6 +140,83 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
         return_type,
         body,
     }))
+}
+fn build_struct_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
+    let name_node =
+        node.child_by_field_name("name")
+            .ok_or_else(|| AstBuildError::MissingChild {
+                node_kind: "struct_declaration".to_string(),
+                field_name: Some("name".to_string()),
+                child_index: None,
+            })?;
+    let generic_params_node = node.child_by_field_name("parameters");
+    let field_nodes =
+        node.child_by_field_name("fields")
+            .ok_or_else(|| AstBuildError::MissingChild {
+                node_kind: "struct_declaration".to_string(),
+                field_name: Some("fields".to_string()),
+                child_index: None,
+            })?;
+
+    let name = get_node_text(&name_node, source).to_string();
+
+    let params = generic_params_node
+        .map(|node| build_generic_params(&node, source))
+        .unwrap_or(Ok(HashSet::new()))?;
+
+    let fields = build_fields_map(&field_nodes, source)?;
+
+    Ok(Declaration::Struct(StructDecl {
+        params,
+        name,
+        fields,
+    }))
+}
+
+fn build_generic_params(node: &Node, source: &str) -> BuildResult<HashSet<u32>> {
+    let _ = (node, source);
+    todo!()
+}
+
+fn build_fields_map(node: &Node, source: &str) -> BuildResult<HashMap<String, Type>> {
+    // { field_name: field_type, }
+    let mut fields = HashMap::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "struct_field_declaration" {
+            let (field_name, field_type) = build_struct_field(&child, source)?;
+            match fields.entry(field_name.to_string()) {
+                Entry::Occupied(_) => {
+                    // TODO: Better error.
+                    return Err(AstBuildError::Other(format!("Name conflict {field_name}")));
+                }
+                Entry::Vacant(e) => {
+                    e.insert(field_type);
+                }
+            }
+        }
+    }
+    Ok(fields)
+}
+
+fn build_struct_field(node: &Node, source: &str) -> BuildResult<(String, Type)> {
+    let name_node =
+        node.child_by_field_name("name")
+            .ok_or_else(|| AstBuildError::MissingChild {
+                node_kind: "struct_field".to_string(),
+                field_name: Some("name".to_string()),
+                child_index: None,
+            })?;
+    let type_node =
+        node.child_by_field_name("type")
+            .ok_or_else(|| AstBuildError::MissingChild {
+                node_kind: "struct_field".to_string(),
+                field_name: Some("type".to_string()),
+                child_index: None,
+            })?;
+    let name = get_node_text(&name_node, source).to_string();
+    let ty = build_type(&type_node, source)?;
+    Ok((name, ty))
 }
 
 fn build_parameter_list(node: &Node, source: &str) -> BuildResult<Vec<TypedBinding>> {
@@ -592,8 +682,10 @@ fn is_type_node(node: &Node) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use super::*;
-    use crate::ast::test_helpers::*;
+    use crate::ast::{test_helpers::*, StructDecl};
 
     #[test]
     fn parses_simple_main() {
@@ -702,4 +794,21 @@ mod tests {
         ]);
         assert_eq!(build_ast_program(source), Ok(program));
     }
+    #[test]
+    fn declare_struct() {
+        let source = r"struct FooBar { foo: i64, bar: f64 }";
+        let program = Program(vec![Declaration::Struct(StructDecl {
+            params: HashSet::new(),
+            name: "FooBar".to_string(),
+            fields: HashMap::from_iter(
+                [
+                    ("foo".to_string(), Type::int()),
+                    ("bar".to_string(), Type::float()),
+                ]
+                .into_iter(),
+            ),
+        })]);
+        assert_eq!(build_ast_program(source), Ok(program));
+    }
+    // TODO Declare generic struct and generic function.
 }

@@ -33,6 +33,7 @@ enum TypeI {
     Fn(Vec<Type>, Type),
     StructInstance(StructInstance),
     Co(Type, OpSet),
+    // TODO: Named type variant.
 
     // TODO: Consider deleting -- only top level decls should be polymorphic.
     Forall(Vec<u32>, Type),
@@ -855,9 +856,9 @@ impl CoDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
-    name: String,
-    params: HashSet<u32>,
-    fields: HashMap<String, Type>,
+    pub name: String,
+    pub params: HashSet<u32>,
+    pub fields: HashMap<String, Type>,
 }
 impl StructDecl {
     fn new(name: &str, fields: &[(&str, Type)]) -> Self {
