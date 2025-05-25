@@ -48,6 +48,33 @@ pub enum AstBuildError {
 // Helper type alias for results
 type BuildResult<T> = Result<T, AstBuildError>;
 
+fn get_required_child<'a>(
+    node: &Node<'a>,
+    source: &str,
+    child: &'static str,
+) -> BuildResult<Node<'a>> {
+    let _ = source;
+    node.child_by_field_name(child)
+        .ok_or_else(|| AstBuildError::MissingChild {
+            node_kind: node.kind(),
+            field_name: Some(child.to_string()),
+            child_index: None,
+        })
+}
+fn get_required_child_by_id<'a>(
+    node: &Node<'a>,
+    source: &str,
+    field_id: usize,
+) -> BuildResult<Node<'a>> {
+    let _ = source;
+    node.child(field_id)
+        .ok_or_else(|| AstBuildError::MissingChild {
+            node_kind: node.kind(),
+            field_name: None,
+            child_index: Some(field_id),
+        })
+}
+
 // --- Main Conversion Function ---
 
 /// Converts a tree-sitter Tree into an ast::Program
@@ -89,29 +116,11 @@ pub fn build_ast_program(source: &str) -> BuildResult<Program> {
 // --- Node Conversion Functions ---
 
 fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
-    let name_node =
-        node.child_by_field_name("name")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "function_declaration",
-                field_name: Some("name".to_string()),
-                child_index: None,
-            })?;
+    let name_node = get_required_child(node, source, "name")?;
     let params_node = node.child_by_field_name("generic_parameters");
-    let args_node =
-        node.child_by_field_name("args")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "function_declaration",
-                field_name: Some("args".to_string()),
-                child_index: None,
-            })?;
+    let args_node = get_required_child(node, source, "args")?;
     let return_type_node_opt = node.child_by_field_name("return_type"); // Optional field
-    let body_node =
-        node.child_by_field_name("body")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "function_declaration",
-                field_name: Some("body".to_string()),
-                child_index: None,
-            })?;
+    let body_node = get_required_child(node, source, "body")?;
 
     let name = get_node_text(&name_node, source);
     let params = if let Some(node) = params_node {
@@ -148,21 +157,9 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     }))
 }
 fn build_struct_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
-    let name_node =
-        node.child_by_field_name("name")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "struct_declaration",
-                field_name: Some("name".to_string()),
-                child_index: None,
-            })?;
+    let name_node = get_required_child(node, source, "name")?;
     let generic_params_node = node.child_by_field_name("parameters");
-    let field_nodes =
-        node.child_by_field_name("fields")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "struct_declaration",
-                field_name: Some("fields".to_string()),
-                child_index: None,
-            })?;
+    let field_nodes = get_required_child(node, source, "fields")?;
 
     let name = get_node_text(&name_node, source).to_string();
 
@@ -216,20 +213,8 @@ fn build_fields_map(node: &Node, source: &str) -> BuildResult<HashMap<String, Ty
 }
 
 fn build_struct_field(node: &Node, source: &str) -> BuildResult<(String, Type)> {
-    let name_node =
-        node.child_by_field_name("name")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "struct_field",
-                field_name: Some("name".to_string()),
-                child_index: None,
-            })?;
-    let type_node =
-        node.child_by_field_name("type")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "struct_field",
-                field_name: Some("type".to_string()),
-                child_index: None,
-            })?;
+    let name_node = get_required_child(node, source, "name")?;
+    let type_node = get_required_child(node, source, "type")?;
     let name = get_node_text(&name_node, source).to_string();
     let ty = build_type(&type_node, source)?;
     Ok((name, ty))
@@ -251,20 +236,8 @@ fn build_fn_arg_list(node: &Node, source: &str) -> BuildResult<Vec<TypedBinding>
 fn build_fn_arg(node: &Node, source: &str) -> BuildResult<TypedBinding> {
     // parameter: $ => seq(optional('mut'), name: $.identifier, ':', type: $._type)
     let is_mutable = node.child(0).map_or(false, |n| n.kind() == "mut"); // Check first child
-    let name_node =
-        node.child_by_field_name("name")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "parameter",
-                field_name: Some("name".to_string()),
-                child_index: None,
-            })?;
-    let type_node =
-        node.child_by_field_name("type")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "parameter",
-                field_name: Some("type".to_string()),
-                child_index: None,
-            })?;
+    let name_node = get_required_child(node, source, "name")?;
+    let type_node = get_required_child(node, source, "type")?;
 
     Ok(TypedBinding {
         name: get_node_text(&name_node, source).to_string(),
@@ -353,20 +326,8 @@ fn build_statement(node: &Node, source: &str) -> BuildResult<Statement> {
 }
 
 fn build_let_statement(node: &Node, source: &str) -> BuildResult<Statement> {
-    let binding_node =
-        node.child_by_field_name("binding")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "let_statement",
-                field_name: Some("binding".into()),
-                child_index: None,
-            })?;
-    let value_node =
-        node.child_by_field_name("value")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "let_statement",
-                field_name: Some("value".into()),
-                child_index: None,
-            })?;
+    let binding_node = get_required_child(node, source, "binding")?;
+    let value_node = get_required_child(node, source, "value")?;
 
     Ok(Statement::Let {
         binding: build_soft_binding(&binding_node, source)?,
@@ -387,11 +348,7 @@ fn build_expression(node: &Node, source: &str) -> BuildResult<Expression> {
         }
         "variable" => build_variable_expr(node, source),
         "parenthesized_expression" => {
-            let inner_node = node.child(1).ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "parenthesized_expression",
-                field_name: None,
-                child_index: Some(1),
-            })?; // Skip '('
+            let inner_node = get_required_child_by_id(node, source, 1)?;
             build_expression(&inner_node, source)
         }
         // Potentially handle _primary_expression or _l_value if needed by grammar structure
@@ -406,8 +363,10 @@ fn build_expression(node: &Node, source: &str) -> BuildResult<Expression> {
 fn build_literal_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     let text = get_node_text(node, source);
     // Go into the literal.
-    match node.named_child(0).map(|n| n.kind()) {
-        Some("integer_literal") => text
+    let child = get_required_child_by_id(node, source, 0)?;
+
+    match child.kind() {
+        "integer_literal" => text
             .parse::<i64>()
             .map(Expression::LiteralInt)
             .map_err(|e| AstBuildError::InvalidLiteral {
@@ -415,7 +374,7 @@ fn build_literal_expr(node: &Node, source: &str) -> BuildResult<Expression> {
                 text: text.to_string(),
                 error: e.to_string(),
             }),
-        Some("float_literal") => text
+        "float_literal" => text
             .parse::<f64>()
             .map(Expression::LiteralFloat)
             .map_err(|e| AstBuildError::InvalidLiteral {
@@ -423,32 +382,23 @@ fn build_literal_expr(node: &Node, source: &str) -> BuildResult<Expression> {
                 text: text.to_string(),
                 error: e.to_string(),
             }),
-        Some("boolean_literal") => match text {
+        "boolean_literal" => match text {
             "true" => Ok(Expression::LiteralBool(true)),
             "false" => Ok(Expression::LiteralBool(false)),
             _ => unreachable!(), // Grammar should prevent this
         },
-        Some("unit_literal") => Ok(Expression::LiteralUnit),
-        Some(_) => Err(AstBuildError::UnexpectedNodeType {
+        "unit_literal" => Ok(Expression::LiteralUnit),
+        other_kind => Err(AstBuildError::UnexpectedNodeType {
             expected: "literal", // TODO: What did we expect?
-            found: node.kind().to_string(),
+            found: other_kind.to_string(),
             node_text: text.to_string(),
-        }),
-        None => Err(AstBuildError::MissingChild {
-            node_kind: "literal",
-            field_name: None,
-            child_index: None,
         }),
     }
 }
 
 fn build_variable_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     // Assuming 'variable' node wraps an 'identifier' node
-    let ident_node = node.child(0).ok_or_else(|| AstBuildError::MissingChild {
-        node_kind: "variable",
-        field_name: None,
-        child_index: Some(0),
-    })?;
+    let ident_node = get_required_child_by_id(node, source, 0)?;
     Ok(Expression::L(
         LValue::Variable(get_node_text(&ident_node, source).to_string()),
         Type::unknown(),
@@ -504,13 +454,7 @@ fn build_block_expr(node: &Node, source: &str) -> BuildResult<Expression> {
 fn build_soft_binding(node: &Node, source: &str) -> BuildResult<SoftBinding> {
     // soft_binding: $ => seq(optional('mut'), name: $.identifier, optional(seq(':', type: $._type)))
     let is_mutable = node.child(0).map_or(false, |n| n.kind() == "mut");
-    let name_node =
-        node.child_by_field_name("name")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "name",
-                field_name: None,
-                child_index: None,
-            })?;
+    let name_node = get_required_child(node, source, "name")?;
     let type_node_opt = node.child_by_field_name("type"); // Optional
 
     Ok(SoftBinding {
@@ -524,7 +468,7 @@ fn build_l_value(node: &Node, source: &str) -> BuildResult<LValue> {
     match node.kind() {
         "identifier" => Ok(LValue::Variable(get_node_text(node, source).to_string())),
         _ => Err(AstBuildError::UnexpectedNodeType {
-            expected: "lvalue".into(),
+            expected: "lvalue",
             found: node.kind().into(),
             node_text: get_node_text(node, source).to_string(),
         }),
@@ -532,20 +476,8 @@ fn build_l_value(node: &Node, source: &str) -> BuildResult<LValue> {
 }
 
 fn build_assignment_statement(node: &Node, source: &str) -> BuildResult<Statement> {
-    let left_node =
-        node.child_by_field_name("left")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "assignee",
-                field_name: None,
-                child_index: None,
-            })?;
-    let right_node =
-        node.child_by_field_name("right")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "assignment_value",
-                field_name: None,
-                child_index: None,
-            })?;
+    let left_node = get_required_child(node, source, "left")?;
+    let right_node = get_required_child(node, source, "right")?;
     Ok(Statement::Assign(
         build_l_value(&left_node, source)?,
         build_expression(&right_node, source)?,
@@ -553,41 +485,20 @@ fn build_assignment_statement(node: &Node, source: &str) -> BuildResult<Statemen
 }
 
 fn build_return_statement(node: &Node, source: &str) -> BuildResult<Statement> {
-    let value_node =
-        node.child_by_field_name("value")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "return value",
-                field_name: None,
-                child_index: None,
-            })?;
+    let value_node = get_required_child(node, source, "value")?;
     Ok(Statement::Return(build_expression(&value_node, source)?))
 }
 
 fn build_expression_statement(node: &Node, source: &str) -> BuildResult<Statement> {
     // expression_statement: $ => seq($._expression, ';')
-    let expr_node = node.child(0).ok_or_else(|| AstBuildError::MissingChild {
-        node_kind: "expression",
-        field_name: None,
-        child_index: None,
-    })?;
+    let expr_node = get_required_child_by_id(node, source, 0)?;
     Ok(Statement::Expression(build_expression(&expr_node, source)?))
 }
 
 fn build_if_expr(node: &Node, source: &str) -> BuildResult<Expression> {
-    let cond_node =
-        node.child_by_field_name("condition")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "condition",
-                field_name: None,
-                child_index: None,
-            })?;
-    let cons_node =
-        node.child_by_field_name("consequence")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "consequence",
-                field_name: None,
-                child_index: None,
-            })?;
+    let cond_node = get_required_child(node, source, "condition")?;
+    // TODO: Change these weird names.
+    let cons_node = get_required_child(node, source, "consequence")?;
     let alt_node_opt = node.child_by_field_name("alternative");
 
     let false_expr = match alt_node_opt {
@@ -607,21 +518,9 @@ fn build_if_expr(node: &Node, source: &str) -> BuildResult<Expression> {
 }
 
 fn build_lambda_expr(node: &Node, source: &str) -> BuildResult<Expression> {
-    let params_node =
-        node.child_by_field_name("parameters")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "parameters",
-                field_name: None,
-                child_index: None,
-            })?;
+    let params_node = get_required_child(node, source, "parameters")?;
     // TODO: Currently, body expects a block expression. Can it just be an expression?
-    let body_node =
-        node.child_by_field_name("body")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "body",
-                field_name: None,
-                child_index: None,
-            })?;
+    let body_node = get_required_child(node, source, "body")?;
 
     Ok(Expression::Lambda {
         bindings: build_lambda_parameter_list(&params_node, source)?,
@@ -644,20 +543,8 @@ fn build_lambda_parameter_list(node: &Node, source: &str) -> BuildResult<Vec<Sof
 
 fn build_call_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     // call_expression: $ => prec.left(1, seq(function: $._expression, arguments: $.argument_list))
-    let func_node =
-        node.child_by_field_name("function")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "function",
-                field_name: None,
-                child_index: None,
-            })?;
-    let args_node =
-        node.child_by_field_name("arguments")
-            .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "arguments",
-                field_name: None,
-                child_index: None,
-            })?;
+    let func_node = get_required_child(node, source, "function")?;
+    let args_node = get_required_child(node, source, "arguments")?;
 
     Ok(Expression::Call {
         fn_expr: Box::new(build_expression(&func_node, source)?),
