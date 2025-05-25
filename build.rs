@@ -10,7 +10,6 @@ fn main() {
         .current_dir("tree_sitter")
         .output()
         .expect("Failed to call tree-sitter CLI");
-    println!("cargo:rerun-if-changed=tree_sitter/grammar.js");
 
     let parser_src_dir = PathBuf::from("tree_sitter/src");
     let parser_include_dir = PathBuf::from("tree_siter/src/tree_sitter");

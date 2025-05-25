@@ -39,8 +39,7 @@ module.exports = grammar({
     function_declaration: $ => seq(
       'fn',
       field('name', $.identifier),
-      // TODO: Optional generic parameters.
-      field('generic_parameters', optional($.generic_parameter_list)),
+      field('parameters', optional($.generic_parameter_list)),
       field('args', $.fn_args),
       optional(seq('->', field('return_type', $._type))),
       field('body', choice($.block_expression, ';'))
@@ -48,11 +47,11 @@ module.exports = grammar({
 
     fn_args: $ => seq(
       '(',
-      optional(sepBy(',', $.parameter)),
+      optional(sepBy(',', $.fn_arg)),
       ')'
     ),
 
-    parameter: $ => seq( // Corresponds to TypedBinding
+    fn_arg: $ => seq( // Corresponds to TypedBinding
       optional('mut'),
       field('name', $.identifier),
       ':',
@@ -63,7 +62,7 @@ module.exports = grammar({
     struct_declaration: $ => seq(
       'struct',
       field('name', $.identifier),
-      field('generic_parameters', optional($.generic_parameter_list)),
+      field('parameters', optional($.generic_parameter_list)),
       field('fields', $.struct_field_list),
       // TODO: What about unit structs?
     ),
@@ -192,7 +191,7 @@ module.exports = grammar({
 
     lambda_expression: $ => seq(
       '|',
-      field('parameters', optional($.soft_bindings)),
+      field('lambda_args', optional($.soft_bindings)),
       '|',
       field('body', $._expression)
     ),

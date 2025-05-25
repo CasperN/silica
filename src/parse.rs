@@ -117,7 +117,7 @@ pub fn build_ast_program(source: &str) -> BuildResult<Program> {
 
 fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     let name_node = get_required_child(node, source, "name")?;
-    let params_node = node.child_by_field_name("generic_parameters");
+    let params_node = node.child_by_field_name("parameters");
     let args_node = get_required_child(node, source, "args")?;
     let return_type_node_opt = node.child_by_field_name("return_type"); // Optional field
     let body_node = get_required_child(node, source, "body")?;
@@ -158,7 +158,7 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
 }
 fn build_struct_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     let name_node = get_required_child(node, source, "name")?;
-    let generic_params_node = node.child_by_field_name("parameters");
+    let generic_params_node = node.child_by_field_name("generic_parameters");
     let field_nodes = get_required_child(node, source, "fields")?;
 
     let name = get_node_text(&name_node, source).to_string();
@@ -225,7 +225,7 @@ fn build_fn_arg_list(node: &Node, source: &str) -> BuildResult<Vec<TypedBinding>
     let mut params = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "parameter" {
+        if child.kind() == "fn_arg" {
             params.push(build_fn_arg(&child, source)?);
         }
         // Skip '(' ')' ',' tokens if they appear as unnamed children
@@ -518,7 +518,7 @@ fn build_if_expr(node: &Node, source: &str) -> BuildResult<Expression> {
 }
 
 fn build_lambda_expr(node: &Node, source: &str) -> BuildResult<Expression> {
-    let params_node = get_required_child(node, source, "parameters")?;
+    let params_node = get_required_child(node, source, "lambda_args")?;
     // TODO: Currently, body expects a block expression. Can it just be an expression?
     let body_node = get_required_child(node, source, "body")?;
 
