@@ -33,7 +33,6 @@ enum TypeI {
     Fn(Vec<Type>, Type),
     StructInstance(StructInstance),
     Co(Type, OpSet),
-    // TODO: Named type variant.
 
     // TODO: Consider deleting -- only top level decls should be polymorphic.
     Forall(BTreeSet<String>, Type),
@@ -41,6 +40,11 @@ enum TypeI {
     // Unknown type variable. Unifies with any other type.
     // Should not appear in generic types.
     Unknown(Vec<Constraint>),
+
+    // TODO: Named types vs type parameters?
+    // We try to resolve a named type using the typing context. It may resolve to a struct or
+    // something, in which case, we can create an instance. It may also resolve to a parameter.
+    // It should not appear during unification as they will be resolved before then.
 
     // A type parameter. It should not appear during unification as
     // types need to be instantiated before then.

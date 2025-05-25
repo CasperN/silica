@@ -25,17 +25,17 @@ pub fn parse(source_code: &str) -> Option<tree_sitter::Tree> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AstBuildError {
     UnexpectedNodeType {
-        expected: String,
+        expected: &'static str,
         found: String,
         node_text: String,
     },
     MissingChild {
-        node_kind: String,
+        node_kind: &'static str,
         field_name: Option<String>, // Use field name if available
         child_index: Option<usize>, // Or index
     },
     InvalidLiteral {
-        kind: String,
+        kind: &'static str,
         text: String,
         error: String,
     },
@@ -54,10 +54,9 @@ type BuildResult<T> = Result<T, AstBuildError>;
 pub fn build_ast_program(source: &str) -> BuildResult<Program> {
     let tree = parse(source).ok_or(AstBuildError::Other("TODO".to_string()))?;
     let root_node = tree.root_node();
-    let expected_kind = "source_file";
-    if root_node.kind() != expected_kind {
+    if root_node.kind() != "source_file" {
         return Err(AstBuildError::UnexpectedNodeType {
-            expected: expected_kind.to_string(),
+            expected: "source_file",
             found: root_node.kind().to_string(),
             node_text: get_node_text(&root_node, source).to_string(),
         });
@@ -93,14 +92,14 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     let name_node =
         node.child_by_field_name("name")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "function_declaration".to_string(),
+                node_kind: "function_declaration",
                 field_name: Some("name".to_string()),
                 child_index: None,
             })?;
     let params_node =
         node.child_by_field_name("parameters")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "function_declaration".to_string(),
+                node_kind: "function_declaration",
                 field_name: Some("parameters".to_string()),
                 child_index: None,
             })?;
@@ -108,7 +107,7 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     let body_node =
         node.child_by_field_name("body")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "function_declaration".to_string(),
+                node_kind: "function_declaration",
                 field_name: Some("body".to_string()),
                 child_index: None,
             })?;
@@ -126,7 +125,7 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
         ";" => None, // External function
         _ => {
             return Err(AstBuildError::UnexpectedNodeType {
-                expected: "block_expression or ;".to_string(),
+                expected: "block_expression or ;",
                 found: body_node.kind().to_string(),
                 node_text: get_node_text(&body_node, source).to_string(),
             })
@@ -145,7 +144,7 @@ fn build_struct_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     let name_node =
         node.child_by_field_name("name")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "struct_declaration".to_string(),
+                node_kind: "struct_declaration",
                 field_name: Some("name".to_string()),
                 child_index: None,
             })?;
@@ -153,7 +152,7 @@ fn build_struct_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     let field_nodes =
         node.child_by_field_name("fields")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "struct_declaration".to_string(),
+                node_kind: "struct_declaration",
                 field_name: Some("fields".to_string()),
                 child_index: None,
             })?;
@@ -203,14 +202,14 @@ fn build_struct_field(node: &Node, source: &str) -> BuildResult<(String, Type)> 
     let name_node =
         node.child_by_field_name("name")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "struct_field".to_string(),
+                node_kind: "struct_field",
                 field_name: Some("name".to_string()),
                 child_index: None,
             })?;
     let type_node =
         node.child_by_field_name("type")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "struct_field".to_string(),
+                node_kind: "struct_field",
                 field_name: Some("type".to_string()),
                 child_index: None,
             })?;
@@ -238,14 +237,14 @@ fn build_parameter(node: &Node, source: &str) -> BuildResult<TypedBinding> {
     let name_node =
         node.child_by_field_name("name")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "parameter".to_string(),
+                node_kind: "parameter",
                 field_name: Some("name".to_string()),
                 child_index: None,
             })?;
     let type_node =
         node.child_by_field_name("type")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "parameter".to_string(),
+                node_kind: "parameter",
                 field_name: Some("type".to_string()),
                 child_index: None,
             })?;
@@ -314,7 +313,7 @@ fn build_type(node: &Node, source: &str) -> BuildResult<Type> {
         // TODO: Named type support
         // "named_type" | "identifier" => Ok(Type::Named(get_node_text(node, source))), // Assuming Type::Named
         _ => Err(AstBuildError::UnexpectedNodeType {
-            expected: "type".to_string(),
+            expected: "type",
             found: node.kind().to_string(),
             node_text: get_node_text(node, source).to_string(),
         }),
@@ -329,7 +328,7 @@ fn build_statement(node: &Node, source: &str) -> BuildResult<Statement> {
         "return_statement" => build_return_statement(node, source),
         "expression_statement" => build_expression_statement(node, source),
         _ => Err(AstBuildError::UnexpectedNodeType {
-            expected: "statement".to_string(),
+            expected: "statement",
             found: node.kind().to_string(),
             node_text: get_node_text(node, source).to_string(),
         }),
@@ -340,14 +339,14 @@ fn build_let_statement(node: &Node, source: &str) -> BuildResult<Statement> {
     let binding_node =
         node.child_by_field_name("binding")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "let_statement".into(),
+                node_kind: "let_statement",
                 field_name: Some("binding".into()),
                 child_index: None,
             })?;
     let value_node =
         node.child_by_field_name("value")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "let_statement".into(),
+                node_kind: "let_statement",
                 field_name: Some("value".into()),
                 child_index: None,
             })?;
@@ -372,7 +371,7 @@ fn build_expression(node: &Node, source: &str) -> BuildResult<Expression> {
         "variable" => build_variable_expr(node, source),
         "parenthesized_expression" => {
             let inner_node = node.child(1).ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "parenthesized_expression".into(),
+                node_kind: "parenthesized_expression",
                 field_name: None,
                 child_index: Some(1),
             })?; // Skip '('
@@ -380,7 +379,7 @@ fn build_expression(node: &Node, source: &str) -> BuildResult<Expression> {
         }
         // Potentially handle _primary_expression or _l_value if needed by grammar structure
         _ => Err(AstBuildError::UnexpectedNodeType {
-            expected: "expression".to_string(),
+            expected: "expression",
             found: node.kind().to_string(),
             node_text: get_node_text(node, source).to_string(),
         }),
@@ -414,12 +413,12 @@ fn build_literal_expr(node: &Node, source: &str) -> BuildResult<Expression> {
         },
         Some("unit_literal") => Ok(Expression::LiteralUnit),
         Some(_) => Err(AstBuildError::UnexpectedNodeType {
-            expected: "literal".to_string(), // TODO: What did we expect?
+            expected: "literal", // TODO: What did we expect?
             found: node.kind().to_string(),
             node_text: text.to_string(),
         }),
         None => Err(AstBuildError::MissingChild {
-            node_kind: "literal".to_string(),
+            node_kind: "literal",
             field_name: None,
             child_index: None,
         }),
@@ -429,7 +428,7 @@ fn build_literal_expr(node: &Node, source: &str) -> BuildResult<Expression> {
 fn build_variable_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     // Assuming 'variable' node wraps an 'identifier' node
     let ident_node = node.child(0).ok_or_else(|| AstBuildError::MissingChild {
-        node_kind: "variable".into(),
+        node_kind: "variable",
         field_name: None,
         child_index: Some(0),
     })?;
@@ -491,7 +490,7 @@ fn build_soft_binding(node: &Node, source: &str) -> BuildResult<SoftBinding> {
     let name_node =
         node.child_by_field_name("name")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "name".to_string(),
+                node_kind: "name",
                 field_name: None,
                 child_index: None,
             })?;
@@ -519,14 +518,14 @@ fn build_assignment_statement(node: &Node, source: &str) -> BuildResult<Statemen
     let left_node =
         node.child_by_field_name("left")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "assignee".to_string(),
+                node_kind: "assignee",
                 field_name: None,
                 child_index: None,
             })?;
     let right_node =
         node.child_by_field_name("right")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "assignment_value".to_string(),
+                node_kind: "assignment_value",
                 field_name: None,
                 child_index: None,
             })?;
@@ -540,7 +539,7 @@ fn build_return_statement(node: &Node, source: &str) -> BuildResult<Statement> {
     let value_node =
         node.child_by_field_name("value")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "return value".to_string(),
+                node_kind: "return value",
                 field_name: None,
                 child_index: None,
             })?;
@@ -550,7 +549,7 @@ fn build_return_statement(node: &Node, source: &str) -> BuildResult<Statement> {
 fn build_expression_statement(node: &Node, source: &str) -> BuildResult<Statement> {
     // expression_statement: $ => seq($._expression, ';')
     let expr_node = node.child(0).ok_or_else(|| AstBuildError::MissingChild {
-        node_kind: "expression".to_string(),
+        node_kind: "expression",
         field_name: None,
         child_index: None,
     })?;
@@ -561,14 +560,14 @@ fn build_if_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     let cond_node =
         node.child_by_field_name("condition")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "condition".to_string(),
+                node_kind: "condition",
                 field_name: None,
                 child_index: None,
             })?;
     let cons_node =
         node.child_by_field_name("consequence")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "consequence".to_string(),
+                node_kind: "consequence",
                 field_name: None,
                 child_index: None,
             })?;
@@ -594,7 +593,7 @@ fn build_lambda_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     let params_node =
         node.child_by_field_name("parameters")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "parameters".to_string(),
+                node_kind: "parameters",
                 field_name: None,
                 child_index: None,
             })?;
@@ -602,7 +601,7 @@ fn build_lambda_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     let body_node =
         node.child_by_field_name("body")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "body".to_string(),
+                node_kind: "body",
                 field_name: None,
                 child_index: None,
             })?;
@@ -631,14 +630,14 @@ fn build_call_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     let func_node =
         node.child_by_field_name("function")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "function".to_string(),
+                node_kind: "function",
                 field_name: None,
                 child_index: None,
             })?;
     let args_node =
         node.child_by_field_name("arguments")
             .ok_or_else(|| AstBuildError::MissingChild {
-                node_kind: "arguments".to_string(),
+                node_kind: "arguments",
                 field_name: None,
                 child_index: None,
             })?;
