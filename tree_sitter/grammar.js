@@ -40,12 +40,13 @@ module.exports = grammar({
       'fn',
       field('name', $.identifier),
       // TODO: Optional generic parameters.
-      field('parameters', $.parameter_list),
+      field('generic_parameters', optional($.generic_parameter_list)),
+      field('args', $.fn_args),
       optional(seq('->', field('return_type', $._type))),
       field('body', choice($.block_expression, ';'))
     ),
 
-    parameter_list: $ => seq(
+    fn_args: $ => seq(
       '(',
       optional(sepBy(',', $.parameter)),
       ')'

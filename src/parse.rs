@@ -96,11 +96,12 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
                 field_name: Some("name".to_string()),
                 child_index: None,
             })?;
-    let params_node =
-        node.child_by_field_name("parameters")
+    let params_node = node.child_by_field_name("generic_parameters");
+    let args_node =
+        node.child_by_field_name("args")
             .ok_or_else(|| AstBuildError::MissingChild {
                 node_kind: "function_declaration",
-                field_name: Some("parameters".to_string()),
+                field_name: Some("args".to_string()),
                 child_index: None,
             })?;
     let return_type_node_opt = node.child_by_field_name("return_type"); // Optional field
@@ -113,7 +114,13 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
             })?;
 
     let name = get_node_text(&name_node, source);
-    let params = build_parameter_list(&params_node, source)?;
+    let params = if let Some(node) = params_node {
+        dbg!(&node);
+        build_generic_params(&node, source)?
+    } else {
+        BTreeSet::new()
+    };
+    let args = build_fn_arg_list(&args_node, source)?;
     let return_type = match return_type_node_opt {
         Some(n) => build_type(&n, source)?,
         None => Type::unit(), // Default return type if not specified
@@ -133,9 +140,9 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     };
 
     Ok(Declaration::Fn(FnDecl {
-        forall: BTreeSet::new(), // TODO: Parse polymorphic function declarations.
+        forall: params,
         name: name.to_string(),
-        args: params,
+        args,
         return_type,
         body,
     }))
@@ -173,8 +180,18 @@ fn build_struct_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
 }
 
 fn build_generic_params(node: &Node, source: &str) -> BuildResult<BTreeSet<String>> {
-    let _ = (node, source);
-    todo!()
+    let mut params = BTreeSet::new();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "identifier" {
+            let child_text = get_node_text(&child, source);
+            if !params.insert(child_text.to_string()) {
+                return Err(AstBuildError::Other(format!("Name conflict {child_text}")));
+            }
+        }
+        // Skip '<' ')' ',' tokens if they appear as unnamed children
+    }
+    Ok(params)
 }
 
 fn build_fields_map(node: &Node, source: &str) -> BuildResult<HashMap<String, Type>> {
@@ -218,20 +235,20 @@ fn build_struct_field(node: &Node, source: &str) -> BuildResult<(String, Type)> 
     Ok((name, ty))
 }
 
-fn build_parameter_list(node: &Node, source: &str) -> BuildResult<Vec<TypedBinding>> {
+fn build_fn_arg_list(node: &Node, source: &str) -> BuildResult<Vec<TypedBinding>> {
     // parameter_list: $ => seq('(', optional(sepBy(',', $.parameter)), ')')
     let mut params = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         if child.kind() == "parameter" {
-            params.push(build_parameter(&child, source)?);
+            params.push(build_fn_arg(&child, source)?);
         }
         // Skip '(' ')' ',' tokens if they appear as unnamed children
     }
     Ok(params)
 }
 
-fn build_parameter(node: &Node, source: &str) -> BuildResult<TypedBinding> {
+fn build_fn_arg(node: &Node, source: &str) -> BuildResult<TypedBinding> {
     // parameter: $ => seq(optional('mut'), name: $.identifier, ':', type: $._type)
     let is_mutable = node.child(0).map_or(false, |n| n.kind() == "mut"); // Check first child
     let name_node =
@@ -311,7 +328,7 @@ fn build_type(node: &Node, source: &str) -> BuildResult<Type> {
             Ok(Type::func(arg_types, return_type.unwrap_or(Type::unit())))
         }
         // TODO: Named type support
-        // "named_type" | "identifier" => Ok(Type::Named(get_node_text(node, source))), // Assuming Type::Named
+        "named_type" | "identifier" => Ok(Type::param(get_node_text(node, source))),
         _ => Err(AstBuildError::UnexpectedNodeType {
             expected: "type",
             found: node.kind().to_string(),
@@ -644,12 +661,12 @@ fn build_call_expr(node: &Node, source: &str) -> BuildResult<Expression> {
 
     Ok(Expression::Call {
         fn_expr: Box::new(build_expression(&func_node, source)?),
-        arg_exprs: build_argument_list(&args_node, source)?,
+        arg_exprs: build_call_arg_list(&args_node, source)?,
         return_type: Type::unknown(),
     })
 }
 
-fn build_argument_list(node: &Node, source: &str) -> BuildResult<Vec<Expression>> {
+fn build_call_arg_list(node: &Node, source: &str) -> BuildResult<Vec<Expression>> {
     // argument_list: $ => seq('(', optional(sepBy(',', $._expression)), ')')
     let mut args = Vec::new();
     let mut cursor = node.walk();
@@ -809,5 +826,36 @@ mod tests {
         })]);
         assert_eq!(build_ast_program(source), Ok(program));
     }
-    // TODO Declare generic struct and generic function.
+    #[test]
+    fn declare_generic_fn() {
+        let source = r"fn id<T>(x: T) -> T { x }";
+        let program = Program(vec![Declaration::Fn(FnDecl {
+            forall: ["T".to_string()].into_iter().collect(),
+            name: "id".to_string(),
+            args: vec![TypedBinding {
+                name: "x".to_string(),
+                ty: Type::param("T"),
+                mutable: false,
+            }],
+            return_type: Type::param("T"),
+            body: Some(block_expr(vec!["x".into()])),
+        })]);
+        assert_eq!(build_ast_program(source), Ok(program));
+    }
+    #[test]
+    fn declare_generic_struct() {
+        let source = r"struct FooBar<F, B> { foo: F, bar: B }";
+        let program = Program(vec![Declaration::Struct(StructDecl {
+            params: BTreeSet::new(),
+            name: "FooBar".to_string(),
+            fields: HashMap::from_iter(
+                [
+                    ("foo".to_string(), Type::param("F")),
+                    ("bar".to_string(), Type::param("B")),
+                ]
+                .into_iter(),
+            ),
+        })]);
+        assert_eq!(build_ast_program(source), Ok(program));
+    }
 }
