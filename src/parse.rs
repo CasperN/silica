@@ -1,8 +1,8 @@
 use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 
 use crate::ast::{
-    Declaration, Expression, FnDecl, LValue, Program, SoftBinding, Statement, StructDecl, Type,
-    TypedBinding,
+    Declaration, EffectDecl, Expression, FnDecl, LValue, Program, SoftBinding, Statement,
+    StructDecl, Type, TypedBinding,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -101,6 +101,9 @@ pub fn build_ast_program(source: &str) -> BuildResult<Program> {
             "struct_declaration" => {
                 declarations.push(build_struct_decl(&child_node, source)?);
             }
+            "effect_declaration" => {
+                declarations.push(build_effect_decl(&child_node, source)?);
+            }
             "ERROR" => {
                 panic!()
             }
@@ -114,6 +117,49 @@ pub fn build_ast_program(source: &str) -> BuildResult<Program> {
 }
 
 // --- Node Conversion Functions ---
+fn build_effect_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
+    let name_node = get_required_child(node, source, "name")?; // [cite: 792]
+    let name = get_node_text(&name_node, source).to_string(); // [cite: 879]
+
+    let generic_params_node = node.child_by_field_name("generic_parameters");
+    let params = if let Some(gp_node) = generic_params_node {
+        build_generic_params(&gp_node, source)? //
+    } else {
+        BTreeSet::new()
+    };
+
+    let mut ops = HashMap::new();
+    let mut cursor = node.walk(); // [cite: 796]
+
+    // Iterate through children of the effect_declaration node to find operation signatures
+    for child_node in node.children(&mut cursor) {
+        dbg!(child_node.kind());
+        if child_node.kind() == "operation_signature" {
+            let op_name_node = get_required_child(&child_node, source, "op_name")?;
+            let op_name = get_node_text(&op_name_node, source).to_string();
+
+            let perform_type_node = get_required_child(&child_node, source, "perform_type")?;
+            let perform_type = build_type(&perform_type_node, source)?;
+
+            let resume_type_node = get_required_child(&child_node, source, "resume_type")?;
+            let resume_type = build_type(&resume_type_node, source)?;
+
+            match ops.entry(op_name.clone()) {
+                Entry::Occupied(_) => {
+                    return Err(AstBuildError::Other(format!(
+                        "Duplicate operation name '{}' in effect '{}'",
+                        op_name, name
+                    )));
+                }
+                Entry::Vacant(e) => {
+                    e.insert((perform_type, resume_type));
+                }
+            }
+        }
+    }
+
+    Ok(Declaration::Effect(EffectDecl { name, params, ops }))
+}
 
 fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
     let name_node = get_required_child(node, source, "name")?;
@@ -742,6 +788,37 @@ mod tests {
                 ]
                 .into_iter(),
             ),
+        })]);
+        assert_eq!(build_ast_program(source), Ok(program));
+    }
+    #[test]
+    fn declare_effect() {
+        let source = r"effect IntState { get: unit -> i64, set: i64 -> unit }";
+        let program = Program(vec![Declaration::Effect(EffectDecl {
+            name: "IntState".to_string(),
+            params: BTreeSet::default(),
+            ops: [
+                ("get".to_string(), (Type::unit(), Type::int())),
+                ("set".to_string(), (Type::int(), Type::unit())),
+            ]
+            .into_iter()
+            .collect(),
+        })]);
+        assert_eq!(build_ast_program(source), Ok(program));
+    }
+
+    #[test]
+    fn declare_generic_effect() {
+        let source = r"effect State<T> { get: unit -> T, set: T -> unit }";
+        let program = Program(vec![Declaration::Effect(EffectDecl {
+            name: "State".to_string(),
+            params: ["T".to_string()].into_iter().collect(),
+            ops: [
+                ("get".to_string(), (Type::unit(), Type::param("T"))),
+                ("set".to_string(), (Type::param("T"), Type::unit())),
+            ]
+            .into_iter()
+            .collect(),
         })]);
         assert_eq!(build_ast_program(source), Ok(program));
     }

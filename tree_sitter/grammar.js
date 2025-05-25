@@ -31,8 +31,28 @@ module.exports = grammar({
 
     _declaration: $ => choice(
       $.function_declaration,
-      $.struct_declaration
-      // Add rules for struct, enum, trait, effect declarations later
+      $.struct_declaration,
+      $.effect_declaration
+      // Add rules for enum, trait declarations later
+    ),
+
+    // --- Effect Declaration ---
+    effect_declaration: $ => seq(
+      'effect',
+      field('name', $.identifier),
+      field('generic_parameters', optional($.generic_parameter_list)),
+      '{',
+      optional(sepBy(',', $.operation_signature)),
+      optional(','), // Optional trailing comma for the operations list itself
+      '}'
+    ),
+
+    operation_signature: $ => seq(
+      field('op_name', $.identifier),
+      ':',
+      field('perform_type', $._type),
+      '->',
+      field('resume_type', $._type)
     ),
 
     // --- Function Declaration ---
@@ -91,7 +111,7 @@ module.exports = grammar({
 
     primitive_type: $ => choice(
       'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'i128', 'u128',
-      'isize', 'usize', 'f64', 'bool', 'unit'
+      'isize', 'usize', 'f64', 'bool', 'unit'  // TODO unit should be "()"
     ),
 
     function_type: $ => seq(

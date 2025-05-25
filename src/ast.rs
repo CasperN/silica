@@ -41,11 +41,6 @@ enum TypeI {
     // Should not appear in generic types.
     Unknown(Vec<Constraint>),
 
-    // TODO: Named types vs type parameters?
-    // We try to resolve a named type using the typing context. It may resolve to a struct or
-    // something, in which case, we can create an instance. It may also resolve to a parameter.
-    // It should not appear during unification as they will be resolved before then.
-
     // A type parameter. It should not appear during unification as
     // types need to be instantiated before then.
     Param(String),
@@ -884,9 +879,9 @@ impl StructDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectDecl {
-    name: String,
-    params: HashSet<u32>,
-    ops: HashMap<String, (Type, Type)>,
+    pub name: String,
+    pub params: BTreeSet<String>,
+    pub ops: HashMap<String, (Type, Type)>,
 }
 impl EffectDecl {
     fn unwrap_op_type(&self, op: &str) -> (Type, Type) {
@@ -2669,7 +2664,7 @@ mod tests {
     fn perform_named_effects() {
         let state_effect = EffectDecl {
             name: "State".to_string(),
-            params: HashSet::from_iter([0]),
+            params: BTreeSet::from_iter(["T".to_string()]),
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param("T"))),
                 ("set".into(), (Type::param("T"), Type::unit())),
@@ -2718,7 +2713,7 @@ mod tests {
     fn two_state_effects_ok_because_one_is_named() {
         let state_effect = EffectDecl {
             name: "State".to_string(),
-            params: HashSet::from_iter([0]),
+            params: BTreeSet::from_iter(["T".to_string()]),
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param("T"))),
                 ("set".into(), (Type::param("T"), Type::unit())),
@@ -2744,7 +2739,7 @@ mod tests {
     fn conflicting_parametric_effects_both_unnamed() {
         let state_effect = EffectDecl {
             name: "State".to_string(),
-            params: HashSet::from_iter([0]),
+            params: BTreeSet::from_iter(["T".to_string()]),
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param("T"))),
                 ("set".into(), (Type::param("T"), Type::unit())),
@@ -2771,7 +2766,7 @@ mod tests {
     fn empty_opset_is_identity_under_unification() {
         let state_effect = EffectDecl {
             name: "State".to_string(),
-            params: HashSet::from_iter([0]),
+            params: BTreeSet::from_iter(["T".to_string()]),
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param("T"))),
                 ("set".into(), (Type::param("T"), Type::unit())),
