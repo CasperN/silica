@@ -29,10 +29,13 @@ pub enum ParseError {
         found: String,
         node_text: String,
     },
-    MissingChild {
+    MissingField {
         node_kind: &'static str,
-        field_name: Option<String>, // Use field name if available
-        child_index: Option<usize>, // Or index
+        field_name: String,
+    },
+    MissingIndex {
+        node_kind: &'static str,
+        child_index: usize,
     },
     InvalidLiteral {
         kind: &'static str,
@@ -45,7 +48,7 @@ pub enum ParseError {
         context_name: String,
         context_type: &'static str,
     },
-    TopLevelParseError,
+    NoTree,
     UnknownPrimitiveType(String),
 }
 
@@ -59,10 +62,9 @@ fn get_required_child<'a>(
 ) -> BuildResult<Node<'a>> {
     let _ = source;
     node.child_by_field_name(child)
-        .ok_or_else(|| ParseError::MissingChild {
+        .ok_or_else(|| ParseError::MissingField {
             node_kind: node.kind(),
-            field_name: Some(child.to_string()),
-            child_index: None,
+            field_name: child.to_string(),
         })
 }
 fn get_required_child_by_id<'a>(
@@ -72,10 +74,9 @@ fn get_required_child_by_id<'a>(
 ) -> BuildResult<Node<'a>> {
     let _ = source;
     node.child(field_id)
-        .ok_or_else(|| ParseError::MissingChild {
+        .ok_or_else(|| ParseError::MissingIndex {
             node_kind: node.kind(),
-            field_name: None,
-            child_index: Some(field_id),
+            child_index: field_id,
         })
 }
 
@@ -83,7 +84,7 @@ fn get_required_child_by_id<'a>(
 
 /// Converts a tree-sitter Tree into an ast::Program
 pub fn build_ast_program(source: &str) -> BuildResult<Program> {
-    let tree = parse(source).ok_or(ParseError::TopLevelParseError)?;
+    let tree = parse(source).ok_or(ParseError::NoTree)?;
     let root_node = tree.root_node();
     if root_node.kind() != "source_file" {
         return Err(ParseError::UnexpectedNodeType {
@@ -470,7 +471,10 @@ fn build_block_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     if let Some(node) = node.child_by_field_name("final_expression") {
         statements.push(Statement::Expression(build_expression(&node, source)?));
     }
-    Ok(Expression::Block { statements, ty: Type::unknown() })
+    Ok(Expression::Block {
+        statements,
+        ty: Type::unknown(),
+    })
 }
 
 // --- TODO: Implement remaining build functions ---
