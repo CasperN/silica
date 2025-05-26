@@ -45,12 +45,9 @@ pub enum ParseError {
         context_name: String,
         context_type: &'static str,
     },
+    TopLevelParseError,
     UnknownPrimitiveType(String),
-    // Add more specific errors as needed
-    Other(String),
 }
-
-// Implement std::error::Error etc. if desired
 
 // Helper type alias for results
 type BuildResult<T> = Result<T, ParseError>;
@@ -86,7 +83,7 @@ fn get_required_child_by_id<'a>(
 
 /// Converts a tree-sitter Tree into an ast::Program
 pub fn build_ast_program(source: &str) -> BuildResult<Program> {
-    let tree = parse(source).ok_or(ParseError::Other("TODO".to_string()))?;
+    let tree = parse(source).ok_or(ParseError::TopLevelParseError)?;
     let root_node = tree.root_node();
     if root_node.kind() != "source_file" {
         return Err(ParseError::UnexpectedNodeType {
@@ -465,48 +462,15 @@ fn build_variable_expr(node: &Node, source: &str) -> BuildResult<Expression> {
 }
 
 fn build_block_expr(node: &Node, source: &str) -> BuildResult<Expression> {
-    // block_expression: $ => seq('{', repeat($._statement), optional($._expression), '}')
     let mut statements = Vec::new();
-    let mut final_expr = None;
     let mut cursor = node.walk();
-    // TODO: Expressions do not have to be last in the block.
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "{" | "}" => {} // Skip braces
-            "comment" => {} // Skip comments
-            // Check if it's a statement kind before checking for expression kind
-            "let_statement"
-            | "assignment_statement"
-            | "return_statement"
-            | "expression_statement" => {
-                // If we already found a final expression, it's an error or needs specific handling
-                if final_expr.is_some() {
-                    return Err(ParseError::Other(
-                        "Statement after final expression in block".into(),
-                    ));
-                }
-                statements.push(build_statement(&child, source)?);
-            }
-            // Assume anything else is the final expression (needs refinement)
-            _ => {
-                if final_expr.is_some() {
-                    let current = child.to_string();
-                    return Err(ParseError::Other(
-                        format!("Multiple final expressions in block? existing: {final_expr:?} current: {current}"),
-                    ));
-                }
-                final_expr = Some(build_expression(&child, source)?);
-            }
-        }
+    for statement_node in node.children_by_field_name("statements", &mut cursor) {
+        statements.push(build_statement(&statement_node, source)?);
     }
-    // AST requires block body to be Vec<Statement>, handle final expression
-    if let Some(expr) = final_expr {
-        statements.push(Statement::Expression(expr)); // Convert final expr to statement
+    if let Some(node) = node.child_by_field_name("final_expression") {
+        statements.push(Statement::Expression(build_expression(&node, source)?));
     }
-    Ok(Expression::Block {
-        statements,
-        ty: Type::unknown(),
-    })
+    Ok(Expression::Block { statements, ty: Type::unknown() })
 }
 
 // --- TODO: Implement remaining build functions ---

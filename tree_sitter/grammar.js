@@ -220,8 +220,8 @@ module.exports = grammar({
 
     block_expression: $ => seq(
       '{',
-      repeat($._statement),
-      optional($._expression),
+        field("statements", repeat($._statement)),
+        field("final_expression", optional($._expression)),
       '}'
     ),
 
