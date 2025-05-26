@@ -109,8 +109,12 @@ pub fn build_ast_program(source: &str) -> BuildResult<Program> {
             "effect_declaration" => {
                 declarations.push(build_effect_decl(&child_node, source)?);
             }
-            _ => {
-                unimplemented!("{}", child_node.kind());
+            other_kind => {
+                return Err(ParseError::UnexpectedNodeType {
+                    expected: "function/struct/effect declaration",
+                    found: other_kind.to_string(),
+                    node_text: get_node_text(&child_node, source).to_string(),
+                })
             }
         }
     }
