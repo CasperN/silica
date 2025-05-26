@@ -23,7 +23,7 @@ pub fn parse(source_code: &str) -> Option<tree_sitter::Tree> {
 // - `kind` probably can be a static str
 // - They need helper functions.
 #[derive(Debug, Clone, PartialEq)]
-pub enum AstBuildError {
+pub enum ParseError {
     UnexpectedNodeType {
         expected: &'static str,
         found: String,
@@ -39,6 +39,13 @@ pub enum AstBuildError {
         text: String,
         error: String,
     },
+    DuplicateItem {
+        duplicated_item: String,
+        item_type: &'static str,
+        context_name: String,
+        context_type: &'static str,
+    },
+    UnknownPrimitiveType(String),
     // Add more specific errors as needed
     Other(String),
 }
@@ -46,7 +53,7 @@ pub enum AstBuildError {
 // Implement std::error::Error etc. if desired
 
 // Helper type alias for results
-type BuildResult<T> = Result<T, AstBuildError>;
+type BuildResult<T> = Result<T, ParseError>;
 
 fn get_required_child<'a>(
     node: &Node<'a>,
@@ -55,7 +62,7 @@ fn get_required_child<'a>(
 ) -> BuildResult<Node<'a>> {
     let _ = source;
     node.child_by_field_name(child)
-        .ok_or_else(|| AstBuildError::MissingChild {
+        .ok_or_else(|| ParseError::MissingChild {
             node_kind: node.kind(),
             field_name: Some(child.to_string()),
             child_index: None,
@@ -68,7 +75,7 @@ fn get_required_child_by_id<'a>(
 ) -> BuildResult<Node<'a>> {
     let _ = source;
     node.child(field_id)
-        .ok_or_else(|| AstBuildError::MissingChild {
+        .ok_or_else(|| ParseError::MissingChild {
             node_kind: node.kind(),
             field_name: None,
             child_index: Some(field_id),
@@ -79,10 +86,10 @@ fn get_required_child_by_id<'a>(
 
 /// Converts a tree-sitter Tree into an ast::Program
 pub fn build_ast_program(source: &str) -> BuildResult<Program> {
-    let tree = parse(source).ok_or(AstBuildError::Other("TODO".to_string()))?;
+    let tree = parse(source).ok_or(ParseError::Other("TODO".to_string()))?;
     let root_node = tree.root_node();
     if root_node.kind() != "source_file" {
-        return Err(AstBuildError::UnexpectedNodeType {
+        return Err(ParseError::UnexpectedNodeType {
             expected: "source_file",
             found: root_node.kind().to_string(),
             node_text: get_node_text(&root_node, source).to_string(),
@@ -103,9 +110,6 @@ pub fn build_ast_program(source: &str) -> BuildResult<Program> {
             }
             "effect_declaration" => {
                 declarations.push(build_effect_decl(&child_node, source)?);
-            }
-            "ERROR" => {
-                panic!()
             }
             _ => {
                 unimplemented!("{}", child_node.kind());
@@ -146,10 +150,12 @@ fn build_effect_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
 
             match ops.entry(op_name.clone()) {
                 Entry::Occupied(_) => {
-                    return Err(AstBuildError::Other(format!(
-                        "Duplicate operation name '{}' in effect '{}'",
-                        op_name, name
-                    )));
+                    return Err(ParseError::DuplicateItem {
+                        duplicated_item: op_name.to_string(),
+                        item_type: "operation name",
+                        context_name: name.to_string(),
+                        context_type: "effect",
+                    });
                 }
                 Entry::Vacant(e) => {
                     e.insert((perform_type, resume_type));
@@ -186,7 +192,7 @@ fn build_fn_decl(node: &Node, source: &str) -> BuildResult<Declaration> {
         "block_expression" => Some(build_block_expr(&body_node, source)?),
         ";" => None, // External function
         _ => {
-            return Err(AstBuildError::UnexpectedNodeType {
+            return Err(ParseError::UnexpectedNodeType {
                 expected: "block_expression or ;",
                 found: body_node.kind().to_string(),
                 node_text: get_node_text(&body_node, source).to_string(),
@@ -229,7 +235,12 @@ fn build_generic_params(node: &Node, source: &str) -> BuildResult<BTreeSet<Strin
         if child.kind() == "identifier" {
             let child_text = get_node_text(&child, source);
             if !params.insert(child_text.to_string()) {
-                return Err(AstBuildError::Other(format!("Name conflict {child_text}")));
+                return Err(ParseError::DuplicateItem {
+                    duplicated_item: child_text.to_string(),
+                    item_type: "parameter",
+                    context_name: "".to_string(),
+                    context_type: "generic parameter list",
+                });
             }
         }
         // Skip '<' ')' ',' tokens if they appear as unnamed children
@@ -247,7 +258,12 @@ fn build_fields_map(node: &Node, source: &str) -> BuildResult<HashMap<String, Ty
             match fields.entry(field_name.to_string()) {
                 Entry::Occupied(_) => {
                     // TODO: Better error.
-                    return Err(AstBuildError::Other(format!("Name conflict {field_name}")));
+                    return Err(ParseError::DuplicateItem {
+                        duplicated_item: field_name,
+                        item_type: "field",
+                        context_name: "".to_string(),
+                        context_type: "struct",
+                    });
                 }
                 Entry::Vacant(e) => {
                     e.insert(field_type);
@@ -316,10 +332,7 @@ fn build_type(node: &Node, source: &str) -> BuildResult<Type> {
                 "i64" => Ok(Type::int()),
                 "bool" => Ok(Type::bool_()),
                 "unit" => Ok(Type::unit()),
-                _ => Err(AstBuildError::Other(format!(
-                    "Unknown primitive type: {}",
-                    type_name
-                ))),
+                other => Err(ParseError::UnknownPrimitiveType(other.to_string())),
             }
         }
         "function_type" => {
@@ -348,7 +361,7 @@ fn build_type(node: &Node, source: &str) -> BuildResult<Type> {
         }
         // TODO: Named type support
         "named_type" | "identifier" => Ok(Type::param(get_node_text(node, source))),
-        _ => Err(AstBuildError::UnexpectedNodeType {
+        _ => Err(ParseError::UnexpectedNodeType {
             expected: "type",
             found: node.kind().to_string(),
             node_text: get_node_text(node, source).to_string(),
@@ -363,7 +376,7 @@ fn build_statement(node: &Node, source: &str) -> BuildResult<Statement> {
         "assignment_statement" => build_assignment_statement(node, source),
         "return_statement" => build_return_statement(node, source),
         "expression_statement" => build_expression_statement(node, source),
-        _ => Err(AstBuildError::UnexpectedNodeType {
+        _ => Err(ParseError::UnexpectedNodeType {
             expected: "statement",
             found: node.kind().to_string(),
             node_text: get_node_text(node, source).to_string(),
@@ -398,7 +411,7 @@ fn build_expression(node: &Node, source: &str) -> BuildResult<Expression> {
             build_expression(&inner_node, source)
         }
         // Potentially handle _primary_expression or _l_value if needed by grammar structure
-        _ => Err(AstBuildError::UnexpectedNodeType {
+        _ => Err(ParseError::UnexpectedNodeType {
             expected: "expression",
             found: node.kind().to_string(),
             node_text: get_node_text(node, source).to_string(),
@@ -415,16 +428,16 @@ fn build_literal_expr(node: &Node, source: &str) -> BuildResult<Expression> {
         "integer_literal" => text
             .parse::<i64>()
             .map(Expression::LiteralInt)
-            .map_err(|e| AstBuildError::InvalidLiteral {
-                kind: "integer".into(),
+            .map_err(|e| ParseError::InvalidLiteral {
+                kind: "integer",
                 text: text.to_string(),
                 error: e.to_string(),
             }),
         "float_literal" => text
             .parse::<f64>()
             .map(Expression::LiteralFloat)
-            .map_err(|e| AstBuildError::InvalidLiteral {
-                kind: "float".into(),
+            .map_err(|e| ParseError::InvalidLiteral {
+                kind: "float",
                 text: text.to_string(),
                 error: e.to_string(),
             }),
@@ -434,7 +447,7 @@ fn build_literal_expr(node: &Node, source: &str) -> BuildResult<Expression> {
             _ => unreachable!(), // Grammar should prevent this
         },
         "unit_literal" => Ok(Expression::LiteralUnit),
-        other_kind => Err(AstBuildError::UnexpectedNodeType {
+        other_kind => Err(ParseError::UnexpectedNodeType {
             expected: "literal", // TODO: What did we expect?
             found: other_kind.to_string(),
             node_text: text.to_string(),
@@ -456,6 +469,7 @@ fn build_block_expr(node: &Node, source: &str) -> BuildResult<Expression> {
     let mut statements = Vec::new();
     let mut final_expr = None;
     let mut cursor = node.walk();
+    // TODO: Expressions do not have to be last in the block.
     for child in node.children(&mut cursor) {
         match child.kind() {
             "{" | "}" => {} // Skip braces
@@ -467,7 +481,7 @@ fn build_block_expr(node: &Node, source: &str) -> BuildResult<Expression> {
             | "expression_statement" => {
                 // If we already found a final expression, it's an error or needs specific handling
                 if final_expr.is_some() {
-                    return Err(AstBuildError::Other(
+                    return Err(ParseError::Other(
                         "Statement after final expression in block".into(),
                     ));
                 }
@@ -477,7 +491,7 @@ fn build_block_expr(node: &Node, source: &str) -> BuildResult<Expression> {
             _ => {
                 if final_expr.is_some() {
                     let current = child.to_string();
-                    return Err(AstBuildError::Other(
+                    return Err(ParseError::Other(
                         format!("Multiple final expressions in block? existing: {final_expr:?} current: {current}"),
                     ));
                 }
@@ -513,7 +527,7 @@ fn build_soft_binding(node: &Node, source: &str) -> BuildResult<SoftBinding> {
 fn build_l_value(node: &Node, source: &str) -> BuildResult<LValue> {
     match node.kind() {
         "identifier" => Ok(LValue::Variable(get_node_text(node, source).to_string())),
-        _ => Err(AstBuildError::UnexpectedNodeType {
+        _ => Err(ParseError::UnexpectedNodeType {
             expected: "lvalue",
             found: node.kind().into(),
             node_text: get_node_text(node, source).to_string(),
