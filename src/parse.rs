@@ -70,32 +70,33 @@ impl<'t, 's> SourceNode<'t, 's> {
             .expect("Node text decode failed")
     }
 
+    fn child_by_field_name_opt(self, field: &str) -> Option<Self> {
+        self.node.child_by_field_name(field).map(|node| Self {
+            node,
+            source: self.source,
+        })
+    }
+
     fn child_by_field_name(self, field: &str) -> BuildResult<Self> {
-        let node =
-            self.node
-                .child_by_field_name(field)
-                .ok_or_else(|| ParseError::MissingField {
-                    node_kind: self.node.kind(),
-                    field_name: field.to_string(),
-                })?;
-        Ok(Self {
+        self.child_by_field_name_opt(field)
+            .ok_or_else(|| ParseError::MissingField {
+                node_kind: self.node.kind(),
+                field_name: field.to_string(),
+            })
+    }
+    fn child_by_id_opt(self, field_id: usize) -> Option<Self> {
+        self.node.child(field_id).map(|node| Self {
             node,
             source: self.source,
         })
     }
 
     fn child_by_id(self, field_id: usize) -> BuildResult<Self> {
-        let node = self
-            .node
-            .child(field_id)
+        self.child_by_id_opt(field_id)
             .ok_or_else(|| ParseError::MissingIndex {
                 node_kind: self.node.kind(),
                 child_index: field_id,
-            })?;
-        Ok(Self {
-            node,
-            source: self.source,
-        })
+            })
     }
 
     fn children(self) -> Vec<Self> {
@@ -231,16 +232,15 @@ fn build_effect_decl(node: SourceNode) -> BuildResult<Declaration> {
     // Iterate through children of the effect_declaration node to find operation signatures
     for child_node in node.children() {
         if child_node.kind() == "operation_signature" {
-            let op_name_node = child_node.child_by_field_name("op_name")?;
-            let op_name = op_name_node.text().to_string();
+            let op_name = child_node.child_by_field_name("op_name")?.text();
+            let perform_type = child_node
+                .child_by_field_name("perform_type")
+                .and_then(build_type)?;
+            let resume_type = child_node
+                .child_by_field_name("resume_type")
+                .and_then(build_type)?;
 
-            let perform_type_node = child_node.child_by_field_name("perform_type")?;
-            let perform_type = build_type(perform_type_node)?;
-
-            let resume_type_node = child_node.child_by_field_name("resume_type")?;
-            let resume_type = build_type(resume_type_node)?;
-
-            match ops.entry(op_name.clone()) {
+            match ops.entry(op_name.to_string()) {
                 Entry::Occupied(_) => {
                     return Err(ParseError::DuplicateItem {
                         duplicated_item: op_name.to_string(),
@@ -260,25 +260,25 @@ fn build_effect_decl(node: SourceNode) -> BuildResult<Declaration> {
 }
 
 fn build_fn_decl(node: SourceNode) -> BuildResult<Declaration> {
-    let name_node = node.child_by_field_name("name")?;
-    let params_node = node.child_by_field_name("parameters").ok();
-    let args_node = node.child_by_field_name("args")?;
-    let return_type_node = node.child_by_field_name("return_type").ok();
-    let body_node = node.child_by_field_name("body")?;
-
-    let name = name_node.text();
-    let params = if let Some(node) = params_node {
+    let name = node.child_by_field_name("name")?.text().to_string();
+    let params = if let Some(node) = node.child_by_field_name_opt("parameters") {
         build_generic_params(node)?
     } else {
         BTreeSet::new()
     };
-    let args = build_fn_arg_list(args_node)?;
-    let return_type = match return_type_node {
-        Some(n) => build_type(n)?,
-        None => Type::unit(), // Default return type if not specified
+
+    let args = node
+        .child_by_field_name("args")
+        .and_then(build_fn_arg_list)?;
+
+    let return_type = if let Some(n) = node.child_by_field_name_opt("return_type") {
+        build_type(n)?
+    } else {
+        Type::unit()
     };
 
     // Check if body is ';' (external) or a block expression
+    let body_node = node.child_by_field_name("body")?;
     let body = match body_node.kind() {
         "block_expression" => Some(build_block_expr(body_node)?),
         ";" => None, // External function
@@ -293,24 +293,21 @@ fn build_fn_decl(node: SourceNode) -> BuildResult<Declaration> {
 
     Ok(Declaration::Fn(FnDecl {
         forall: params,
-        name: name.to_string(),
+        name,
         args,
         return_type,
         body,
     }))
 }
 fn build_struct_decl(node: SourceNode) -> BuildResult<Declaration> {
-    let name_node = node.child_by_field_name("name")?;
-    let generic_params_node = node.child_by_field_name("generic_parameters");
-    let field_nodes = node.child_by_field_name("fields")?;
-
-    let name = name_node.text().to_string();
-
-    let params = generic_params_node
+    let name = node.child_by_field_name("name")?.text().to_string();
+    let params = node
+        .child_by_field_name("generic_parameters")
         .map(|node| build_generic_params(node))
         .unwrap_or(Ok(BTreeSet::new()))?;
-
-    let fields = build_fields_map(field_nodes)?;
+    let fields = node
+        .child_by_field_name("fields")
+        .and_then(build_fields_map)?;
 
     Ok(Declaration::Struct(StructDecl {
         params,
@@ -363,10 +360,8 @@ fn build_fields_map(node: SourceNode) -> BuildResult<HashMap<String, Type>> {
 }
 
 fn build_struct_field(node: SourceNode) -> BuildResult<(String, Type)> {
-    let name_node = node.child_by_field_name("name")?;
-    let type_node = node.child_by_field_name("type")?;
-    let name = name_node.text().to_string();
-    let ty = build_type(type_node)?;
+    let name = node.child_by_field_name("name")?.text().to_string();
+    let ty = node.child_by_field_name("type").and_then(build_type)?;
     Ok((name, ty))
 }
 
@@ -384,15 +379,11 @@ fn build_fn_arg_list(node: SourceNode) -> BuildResult<Vec<TypedBinding>> {
 
 fn build_fn_arg(node: SourceNode) -> BuildResult<TypedBinding> {
     // parameter: $ => seq(optional('mut'), name: $.identifier, ':', type: $._type)
-    let is_mutable = node.child_by_id(0).map_or(false, |n| n.kind() == "mut"); // Check first child
-    let name_node = node.child_by_field_name("name")?;
-    let type_node = node.child_by_field_name("type")?;
+    let mutable = node.child_by_id(0).map_or(false, |n| n.kind() == "mut"); // Check first child
+    let name = node.child_by_field_name("name")?.text().to_string();
+    let ty = node.child_by_field_name("type").and_then(build_type)?;
 
-    Ok(TypedBinding {
-        name: name_node.text().to_string(),
-        ty: build_type(type_node)?,
-        mutable: is_mutable,
-    })
+    Ok(TypedBinding { name, ty, mutable })
 }
 
 // --- Type Parsing ---
@@ -471,13 +462,14 @@ fn build_statement(node: SourceNode) -> BuildResult<Statement> {
 }
 
 fn build_let_statement(node: SourceNode) -> BuildResult<Statement> {
-    let binding_node = node.child_by_field_name("binding")?;
-    let value_node = node.child_by_field_name("value")?;
+    let binding = node
+        .child_by_field_name("binding")
+        .and_then(build_soft_binding)?;
+    let value = node
+        .child_by_field_name("value")
+        .and_then(build_expression)?;
 
-    Ok(Statement::Let {
-        binding: build_soft_binding(binding_node)?,
-        value: build_expression(value_node)?,
-    })
+    Ok(Statement::Let { binding, value })
 }
 
 // --- Expression Parsing ---
@@ -541,17 +533,14 @@ fn build_literal_expr(node: SourceNode) -> BuildResult<Expression> {
 
 fn build_variable_expr(node: SourceNode) -> BuildResult<Expression> {
     // Assuming 'variable' node wraps an 'identifier' node
-    let ident_node = node.child_by_id(0)?;
-    Ok(Expression::L(
-        LValue::Variable(ident_node.text().to_string()),
-        Type::unknown(),
-    ))
+    let var = node.child_by_id(0)?.text().to_string();
+    Ok(Expression::L(LValue::Variable(var), Type::unknown()))
 }
 
 fn build_block_expr(node: SourceNode) -> BuildResult<Expression> {
     let mut statements = Vec::new();
-    for statement_node in node.children_by_field_name("statements") {
-        statements.push(build_statement(statement_node)?);
+    for s in node.children_by_field_name("statements") {
+        statements.push(build_statement(s)?);
     }
     if let Ok(node) = node.child_by_field_name("final_expression") {
         statements.push(Statement::Expression(build_expression(node)?));
@@ -567,11 +556,10 @@ fn build_block_expr(node: SourceNode) -> BuildResult<Expression> {
 fn build_soft_binding(node: SourceNode) -> BuildResult<SoftBinding> {
     let mutable = node.child_by_id(0).map_or(false, |n| n.kind() == "mut");
     let name = node.child_by_field_name("name")?.text().to_string();
-    let ty = if let Ok(type_node) = node.child_by_field_name("type") {
-        Some(build_type(type_node)?)
-    } else {
-        None
-    };
+    let ty = node
+        .child_by_field_name_opt("type")
+        .map(build_type)
+        .transpose()?;
 
     Ok(SoftBinding { name, ty, mutable })
 }
@@ -588,55 +576,64 @@ fn build_l_value(node: SourceNode) -> BuildResult<LValue> {
 }
 
 fn build_assignment_statement(node: SourceNode) -> BuildResult<Statement> {
-    let left_node = node.child_by_field_name("left")?;
-    let right_node = node.child_by_field_name("right")?;
-    Ok(Statement::Assign(
-        build_l_value(left_node)?,
-        build_expression(right_node)?,
-    ))
+    let left = node.child_by_field_name("left").and_then(build_l_value)?;
+    let right = node
+        .child_by_field_name("right")
+        .and_then(build_expression)?;
+    Ok(Statement::Assign(left, right))
 }
 
 fn build_return_statement(node: SourceNode) -> BuildResult<Statement> {
-    let value_node = node.child_by_field_name("value")?;
-    Ok(Statement::Return(build_expression(value_node)?))
+    let expr = node
+        .child_by_field_name("value")
+        .and_then(build_expression)?;
+    Ok(Statement::Return(expr))
 }
 
 fn build_expression_statement(node: SourceNode) -> BuildResult<Statement> {
     // expression_statement: $ => seq($._expression, ';')
-    let expr_node = node.child_by_id(0)?;
-    Ok(Statement::Expression(build_expression(expr_node)?))
+    let expr = node.child_by_id(0).and_then(build_expression)?;
+    Ok(Statement::Expression(expr))
 }
 
 fn build_if_expr(node: SourceNode) -> BuildResult<Expression> {
-    let cond_node = node.child_by_field_name("condition")?;
-    // TODO: Change these weird names.
-    let cons_node = node.child_by_field_name("consequence")?;
-    let alt_node_opt = node.child_by_field_name("alternative").ok();
+    let condition = node
+        .child_by_field_name("condition")
+        .and_then(build_expression)
+        .map(Box::new)?;
+    let true_expr = node
+        .child_by_field_name("consequence")
+        .and_then(build_expression)
+        .map(Box::new)?;
 
-    let false_expr = match alt_node_opt {
-        Some(alt_node) => build_block_expr(alt_node)?, // Assume block expr
+    let false_expr = match node.child_by_field_name_opt("alternative") {
+        Some(node) => build_block_expr(node)?,
         None => Expression::Block {
-            statements: vec![Statement::Expression(Expression::LiteralUnit)],
+            statements: vec![],
             ty: Type::unknown(),
         }, // Default else
     };
 
     Ok(Expression::If {
-        condition: Box::new(build_expression(cond_node)?),
-        true_expr: Box::new(build_block_expr(cons_node)?), // Assume block expr
+        condition,
+        true_expr,
         false_expr: Box::new(false_expr),
         ty: Type::unknown(),
     })
 }
 
 fn build_lambda_expr(node: SourceNode) -> BuildResult<Expression> {
-    let params_node = node.child_by_field_name("lambda_args")?;
-    // TODO: Currently, body expects a block expression. Can it just be an expression?
-    let body_node = node.child_by_field_name("body")?;
+    let bindings = node
+        .child_by_field_name("lambda_args")
+        .and_then(build_lambda_parameter_list)?;
+    let body = node
+        .child_by_field_name("body")
+        .and_then(build_expression)
+        .map(Box::new)?;
 
     Ok(Expression::Lambda {
-        bindings: build_lambda_parameter_list(params_node)?,
-        body: Box::new(build_expression(body_node)?),
+        bindings,
+        body,
         lambda_type: Type::unknown(),
     })
 }
@@ -654,11 +651,17 @@ fn build_lambda_parameter_list(node: SourceNode) -> BuildResult<Vec<SoftBinding>
 
 fn build_call_expr(node: SourceNode) -> BuildResult<Expression> {
     // call_expression: $ => prec.left(1, seq(function: $._expression, arguments: $.argument_list))
-    let func = node.child_by_field_name("function")?;
-    let args = node.child_by_field_name("arguments")?;
+    let fn_expr = node
+        .child_by_field_name("function")
+        .and_then(build_expression)
+        .map(Box::new)?;
+    let arg_exprs = node
+        .child_by_field_name("arguments")
+        .and_then(build_call_arg_list)?;
+
     Ok(Expression::Call {
-        fn_expr: Box::new(build_expression(func)?),
-        arg_exprs: build_call_arg_list(args)?,
+        fn_expr,
+        arg_exprs,
         return_type: Type::unknown(),
     })
 }
@@ -674,22 +677,6 @@ fn build_call_arg_list(node: SourceNode) -> BuildResult<Vec<Expression>> {
         }
     }
     Ok(args)
-}
-
-// --- Helper Functions ---
-
-/// Helper to get the source text for a node. Panics on error for simplicity here.
-fn get_node_text<'a>(node: &Node<'a>, source: &'a str) -> &'a str {
-    node.utf8_text(source.as_bytes())
-        .expect("Node text decode failed")
-}
-
-/// Helper to check if a node represents a type rule in the grammar
-fn is_type_node(node: &Node) -> bool {
-    matches!(
-        node.kind(),
-        "primitive_type" | "function_type" | "named_type" | "_type"
-    )
 }
 
 #[cfg(test)]
