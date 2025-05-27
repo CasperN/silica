@@ -150,7 +150,7 @@ pub enum ParseError<'source> {
 type ParseResult<'source, T> = Result<T, ParseError<'source>>;
 
 /// Converts a tree-sitter Tree into an ast::Program
-pub fn build_ast_program(source: &str) -> ParseResult<Program> {
+pub fn parse_ast_program(source: &str) -> ParseResult<Program> {
     let source_tree = SourceTree::parse(source)?;
     let root_node = source_tree.root()?;
 
@@ -159,13 +159,13 @@ pub fn build_ast_program(source: &str) -> ParseResult<Program> {
     for child in root_node.children() {
         match child.kind() {
             "function_declaration" => {
-                declarations.push(build_fn_decl(child)?);
+                declarations.push(parse_fn_decl(child)?);
             }
             "struct_declaration" => {
-                declarations.push(build_struct_decl(child)?);
+                declarations.push(parse_struct_decl(child)?);
             }
             "effect_declaration" => {
-                declarations.push(build_effect_decl(child)?);
+                declarations.push(parse_effect_decl(child)?);
             }
             other_kind => {
                 return Err(ParseError::UnexpectedNodeType {
@@ -181,12 +181,11 @@ pub fn build_ast_program(source: &str) -> ParseResult<Program> {
 }
 
 // --- Node Conversion Functions ---
-fn build_effect_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
+fn parse_effect_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
     let name = node.child_by_field_name("name")?.text();
-
-    let generic_params_node = node.child_by_field_name("generic_parameters").ok();
+    let generic_params_node = node.child_by_field_name_opt("parameters");
     let params = if let Some(gp_node) = generic_params_node {
-        build_generic_params(gp_node)?
+        parse_generic_params(gp_node)?
     } else {
         BTreeSet::new()
     };
@@ -199,10 +198,10 @@ fn build_effect_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaratio
             let op_name = child_node.child_by_field_name("op_name")?.text();
             let perform_type = child_node
                 .child_by_field_name("perform_type")
-                .and_then(build_type)?;
+                .and_then(parse_type)?;
             let resume_type = child_node
                 .child_by_field_name("resume_type")
-                .and_then(build_type)?;
+                .and_then(parse_type)?;
 
             match ops.entry(op_name.to_string()) {
                 Entry::Occupied(_) => {
@@ -227,20 +226,20 @@ fn build_effect_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaratio
     }))
 }
 
-fn build_fn_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
+fn parse_fn_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
     let name = node.child_by_field_name("name")?.text().to_string();
     let params = if let Some(node) = node.child_by_field_name_opt("parameters") {
-        build_generic_params(node)?
+        parse_generic_params(node)?
     } else {
         BTreeSet::new()
     };
 
     let args = node
         .child_by_field_name("args")
-        .and_then(build_fn_arg_list)?;
+        .and_then(parse_fn_arg_list)?;
 
     let return_type = if let Some(n) = node.child_by_field_name_opt("return_type") {
-        build_type(n)?
+        parse_type(n)?
     } else {
         Type::unit()
     };
@@ -248,7 +247,7 @@ fn build_fn_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
     // Check if body is ';' (external) or a block expression
     let body_node = node.child_by_field_name("body")?;
     let body = match body_node.kind() {
-        "block_expression" => Some(build_block_expr(body_node)?),
+        "block_expression" => Some(parse_block_expr(body_node)?),
         ";" => None, // External function
         _ => {
             return Err(ParseError::UnexpectedNodeType {
@@ -267,24 +266,45 @@ fn build_fn_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
         body,
     }))
 }
-fn build_struct_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
-    let name = node.child_by_field_name("name")?.text();
+fn parse_struct_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
+    let struct_name = node.child_by_field_name("name")?.text();
     let params = node
         .child_by_field_name("generic_parameters")
-        .map(|node| build_generic_params(node))
+        .map(|node| parse_generic_params(node))
         .unwrap_or(Ok(BTreeSet::new()))?;
-    let fields = node
-        .child_by_field_name("fields")
-        .and_then(|node| build_fields_map(node, name))?;
+
+    let mut fields = HashMap::new();
+    for field_node in node.child_by_field_name("fields")?.children() {
+        if field_node.kind() == "struct_field_declaration" {
+            let field_name = field_node.child_by_field_name("name")?.text();
+            let field_type = field_node
+                .child_by_field_name("type")
+                .and_then(parse_type)?;
+
+            match fields.entry(field_name.to_string()) {
+                Entry::Occupied(_) => {
+                    return Err(ParseError::DuplicateItem {
+                        duplicated_item: field_name,
+                        item_type: "field",
+                        context_name: struct_name,
+                        context_type: "struct",
+                    });
+                }
+                Entry::Vacant(e) => {
+                    e.insert(field_type);
+                }
+            }
+        }
+    }
 
     Ok(Declaration::Struct(StructDecl {
         params,
-        name: name.to_string(),
+        name: struct_name.to_string(),
         fields,
     }))
 }
 
-fn build_generic_params<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, BTreeSet<String>> {
+fn parse_generic_params<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, BTreeSet<String>> {
     let mut params = BTreeSet::new();
     for child in node.children() {
         if child.kind() == "identifier" {
@@ -303,58 +323,29 @@ fn build_generic_params<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, BTreeSe
     Ok(params)
 }
 
-fn build_fields_map<'s>(
-    node: SourceNode<'s, '_>,
-    context_name: &'s str,
-) -> ParseResult<'s, HashMap<String, Type>> {
-    // { field_name: field_type, }
-    let mut fields = HashMap::new();
+fn parse_fn_arg_list<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Vec<TypedBinding>> {
+    let mut args = Vec::new();
     for child in node.children() {
-        if child.kind() == "struct_field_declaration" {
-            let field_name = child.child_by_field_name("name")?.text();
-            let field_type = child.child_by_field_name("type").and_then(build_type)?;
-
-            match fields.entry(field_name.to_string()) {
-                Entry::Occupied(_) => {
-                    return Err(ParseError::DuplicateItem {
-                        duplicated_item: field_name,
-                        item_type: "field",
-                        context_name,
-                        context_type: "struct",
-                    });
-                }
-                Entry::Vacant(e) => {
-                    e.insert(field_type);
-                }
-            }
+        if matches!(child.kind(), "(" | "," | ")") {
+            continue;
         }
-    }
-    Ok(fields)
-}
-
-fn build_fn_arg_list<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Vec<TypedBinding>> {
-    // parameter_list: $ => seq('(', optional(sepBy(',', $.parameter)), ')')
-    let mut params = Vec::new();
-    for child in node.children() {
-        if child.kind() == "fn_arg" {
-            params.push(build_fn_arg(child)?);
+        if child.kind() != "fn_arg" {
+            return Err(ParseError::UnexpectedNodeType {
+                expected: "fn_arg",
+                found: child.kind(),
+                node_text: child.text(),
+            });
         }
-        // Skip '(' ')' ',' tokens if they appear as unnamed children
+        let mutable = child.child_by_id(0).map_or(false, |n| n.kind() == "mut");
+        let name = child.child_by_field_name("name")?.text().to_string();
+        let ty = child.child_by_field_name("type").and_then(parse_type)?;
+        args.push(TypedBinding { name, ty, mutable });
     }
-    Ok(params)
-}
-
-fn build_fn_arg<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, TypedBinding> {
-    // parameter: $ => seq(optional('mut'), name: $.identifier, ':', type: $._type)
-    let mutable = node.child_by_id(0).map_or(false, |n| n.kind() == "mut"); // Check first child
-    let name = node.child_by_field_name("name")?.text().to_string();
-    let ty = node.child_by_field_name("type").and_then(build_type)?;
-
-    Ok(TypedBinding { name, ty, mutable })
+    Ok(args)
 }
 
 // --- Type Parsing ---
-fn build_type<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Type> {
+fn parse_type<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Type> {
     match node.kind() {
         "primitive_type" => {
             match node.text() {
@@ -398,10 +389,10 @@ fn build_type<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Type> {
                 if is_type {
                     // Helper function needed
                     if found_arrow {
-                        return_type = Some(build_type(child)?);
+                        return_type = Some(parse_type(child)?);
                     } else {
                         // Assume types before '->' are args
-                        arg_types.push(build_type(child)?);
+                        arg_types.push(parse_type(child)?);
                     }
                 }
                 // Skip 'fn', '(', ')', ',' tokens
@@ -419,12 +410,12 @@ fn build_type<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Type> {
 }
 
 // --- Statement Parsing ---
-fn build_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
+fn parse_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
     match node.kind() {
-        "let_statement" => build_let_statement(node),
-        "assignment_statement" => build_assignment_statement(node),
-        "return_statement" => build_return_statement(node),
-        "expression_statement" => build_expression_statement(node),
+        "let_statement" => parse_let_statement(node),
+        "assignment_statement" => parse_assignment_statement(node),
+        "return_statement" => parse_return_statement(node),
+        "expression_statement" => parse_expression_statement(node),
         _ => Err(ParseError::UnexpectedNodeType {
             expected: "statement",
             found: node.kind(),
@@ -433,32 +424,30 @@ fn build_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
     }
 }
 
-fn build_let_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
+fn parse_let_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
     let binding = node
         .child_by_field_name("binding")
-        .and_then(build_soft_binding)?;
-    let value = node
-        .child_by_field_name("value")
-        .and_then(build_expression)?;
+        .and_then(parse_soft_binding)?;
+    let value = node.child_by_field_name("value").and_then(parse_expr)?;
 
     Ok(Statement::Let { binding, value })
 }
 
 // --- Expression Parsing ---
-fn build_expression<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
+fn parse_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     // Use node.kind() to dispatch to specific build functions
     match node.kind() {
-        "if_expression" => build_if_expr(node),
-        "lambda_expression" => build_lambda_expr(node),
-        "call_expression" => build_call_expr(node),
-        "block_expression" => build_block_expr(node),
+        "if_expression" => parse_if_expr(node),
+        "lambda_expression" => parse_lambda_expr(node),
+        "call_expression" => parse_call_expr(node),
+        "block_expression" => parse_block_expr(node),
         "literal" | "integer_literal" | "float_literal" | "boolean_literal" | "unit_literal" => {
-            build_literal_expr(node)
+            parse_literal_expr(node)
         }
-        "variable" => build_variable_expr(node),
+        "variable" => parse_variable_expr(node),
         "parenthesized_expression" => {
             // TODO: This probably doesn't do well with tuples.
-            build_expression(node.child_by_id(1)?)
+            parse_expr(node.child_by_id(1)?)
         }
         // Potentially handle _primary_expression or _l_value if needed by grammar structure
         _ => Err(ParseError::UnexpectedNodeType {
@@ -469,7 +458,7 @@ fn build_expression<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression>
     }
 }
 
-fn build_literal_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
+fn parse_literal_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     let text = node.text();
     let child = node.child_by_id(0)?;
     match child.kind() {
@@ -503,19 +492,19 @@ fn build_literal_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expressio
     }
 }
 
-fn build_variable_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
+fn parse_variable_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     // Assuming 'variable' node wraps an 'identifier' node
     let var = node.child_by_id(0)?.text().to_string();
     Ok(Expression::L(LValue::Variable(var), Type::unknown()))
 }
 
-fn build_block_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
+fn parse_block_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     let mut statements = Vec::new();
     for s in node.children_by_field_name("statements") {
-        statements.push(build_statement(s)?);
+        statements.push(parse_statement(s)?);
     }
     if let Ok(node) = node.child_by_field_name("final_expression") {
-        statements.push(Statement::Expression(build_expression(node)?));
+        statements.push(Statement::Expression(parse_expr(node)?));
     }
     Ok(Expression::Block {
         statements,
@@ -525,18 +514,18 @@ fn build_block_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression>
 
 // --- TODO: Implement remaining build functions ---
 
-fn build_soft_binding<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, SoftBinding> {
+fn parse_soft_binding<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, SoftBinding> {
     let mutable = node.child_by_id(0).map_or(false, |n| n.kind() == "mut");
     let name = node.child_by_field_name("name")?.text().to_string();
     let ty = node
         .child_by_field_name_opt("type")
-        .map(build_type)
+        .map(parse_type)
         .transpose()?;
 
     Ok(SoftBinding { name, ty, mutable })
 }
 
-fn build_l_value<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, LValue> {
+fn parse_l_value<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, LValue> {
     match node.kind() {
         "identifier" => Ok(LValue::Variable(node.text().to_string())),
         _ => Err(ParseError::UnexpectedNodeType {
@@ -547,39 +536,34 @@ fn build_l_value<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, LValue> {
     }
 }
 
-fn build_assignment_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
-    let left = node.child_by_field_name("left").and_then(build_l_value)?;
-    let right = node
-        .child_by_field_name("right")
-        .and_then(build_expression)?;
+fn parse_assignment_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
+    let left = node.child_by_field_name("left").and_then(parse_l_value)?;
+    let right = node.child_by_field_name("right").and_then(parse_expr)?;
     Ok(Statement::Assign(left, right))
 }
 
-fn build_return_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
-    let expr = node
-        .child_by_field_name("value")
-        .and_then(build_expression)?;
+fn parse_return_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
+    let expr = node.child_by_field_name("value").and_then(parse_expr)?;
     Ok(Statement::Return(expr))
 }
 
-fn build_expression_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
+fn parse_expression_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
     // expression_statement: $ => seq($._expression, ';')
-    let expr = node.child_by_id(0).and_then(build_expression)?;
+    let expr = node.child_by_id(0).and_then(parse_expr)?;
     Ok(Statement::Expression(expr))
 }
 
-fn build_if_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
+fn parse_if_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     let condition = node
         .child_by_field_name("condition")
-        .and_then(build_expression)
+        .and_then(parse_expr)
         .map(Box::new)?;
     let true_expr = node
         .child_by_field_name("consequence")
-        .and_then(build_expression)
+        .and_then(parse_expr)
         .map(Box::new)?;
-
     let false_expr = match node.child_by_field_name_opt("alternative") {
-        Some(node) => build_block_expr(node)?,
+        Some(node) => parse_block_expr(node)?,
         None => Expression::Block {
             statements: vec![],
             ty: Type::unknown(),
@@ -594,13 +578,16 @@ fn build_if_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     })
 }
 
-fn build_lambda_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
-    let bindings = node
-        .child_by_field_name("lambda_args")
-        .and_then(build_lambda_parameter_list)?;
+fn parse_lambda_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
+    let mut bindings = Vec::new();
+    for child in node.child_by_field_name("lambda_args")?.children() {
+        if child.kind() == "soft_binding" {
+            bindings.push(parse_soft_binding(child)?);
+        }
+    }
     let body = node
         .child_by_field_name("body")
-        .and_then(build_expression)
+        .and_then(parse_expr)
         .map(Box::new)?;
 
     Ok(Expression::Lambda {
@@ -610,45 +597,23 @@ fn build_lambda_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression
     })
 }
 
-fn build_lambda_parameter_list<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Vec<SoftBinding>> {
-    // lambda_parameter_list: $ => seq('(', optional(sepBy(',', $.soft_binding)), ')')
-    let mut params = Vec::new();
-    for child in node.children() {
-        if child.kind() == "soft_binding" {
-            params.push(build_soft_binding(child)?);
-        }
-    }
-    Ok(params)
-}
-
-fn build_call_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
-    // call_expression: $ => prec.left(1, seq(function: $._expression, arguments: $.argument_list))
+fn parse_call_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     let fn_expr = node
         .child_by_field_name("function")
-        .and_then(build_expression)
+        .and_then(parse_expr)
         .map(Box::new)?;
-    let arg_exprs = node
-        .child_by_field_name("arguments")
-        .and_then(build_call_arg_list)?;
+    let mut arg_exprs = Vec::new();
+    for child in node.child_by_field_name("arguments")?.children() {
+        if !matches!(child.kind(), "(" | ")" | ",") {
+            arg_exprs.push(parse_expr(child)?);
+        }
+    }
 
     Ok(Expression::Call {
         fn_expr,
         arg_exprs,
         return_type: Type::unknown(),
     })
-}
-
-fn build_call_arg_list<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Vec<Expression>> {
-    // argument_list: $ => seq('(', optional(sepBy(',', $._expression)), ')')
-    let mut args = Vec::new();
-    for child in node.children() {
-        // Need to handle potential intermediate nodes depending on `sepBy` implementation in
-        // grammar. Assuming direct children are expressions for now
-        if !matches!(child.kind(), "(" | ")" | ",") {
-            args.push(build_expression(child)?);
-        }
-    }
-    Ok(args)
 }
 
 #[cfg(test)]
@@ -667,7 +632,7 @@ mod tests {
         assert_eq!(root_node.kind(), "source_file");
 
         assert_eq!(
-            build_ast_program(source_code),
+            parse_ast_program(source_code),
             Ok(Program(vec![Declaration::Fn(FnDecl {
                 forall: BTreeSet::new(),
                 name: "main".to_string(),
@@ -721,7 +686,7 @@ mod tests {
                 ])),
             }),
         ]);
-        assert_eq!(build_ast_program(source), Ok(expected_program));
+        assert_eq!(parse_ast_program(source), Ok(expected_program));
     }
     #[test]
     fn return_lambda() {
@@ -763,7 +728,7 @@ mod tests {
                 ])),
             }),
         ]);
-        assert_eq!(build_ast_program(source), Ok(program));
+        assert_eq!(parse_ast_program(source), Ok(program));
     }
     #[test]
     fn declare_struct() {
@@ -779,7 +744,7 @@ mod tests {
                 .into_iter(),
             ),
         })]);
-        assert_eq!(build_ast_program(source), Ok(program));
+        assert_eq!(parse_ast_program(source), Ok(program));
     }
     #[test]
     fn declare_generic_fn() {
@@ -795,7 +760,7 @@ mod tests {
             return_type: Type::param("T"),
             body: Some(block_expr(vec!["x".into()])),
         })]);
-        assert_eq!(build_ast_program(source), Ok(program));
+        assert_eq!(parse_ast_program(source), Ok(program));
     }
     #[test]
     fn declare_generic_struct() {
@@ -811,7 +776,7 @@ mod tests {
                 .into_iter(),
             ),
         })]);
-        assert_eq!(build_ast_program(source), Ok(program));
+        assert_eq!(parse_ast_program(source), Ok(program));
     }
     #[test]
     fn declare_effect() {
@@ -826,7 +791,7 @@ mod tests {
             .into_iter()
             .collect(),
         })]);
-        assert_eq!(build_ast_program(source), Ok(program));
+        assert_eq!(parse_ast_program(source), Ok(program));
     }
 
     #[test]
@@ -842,6 +807,6 @@ mod tests {
             .into_iter()
             .collect(),
         })]);
-        assert_eq!(build_ast_program(source), Ok(program));
+        assert_eq!(parse_ast_program(source), Ok(program));
     }
 }

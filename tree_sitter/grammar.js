@@ -40,7 +40,7 @@ module.exports = grammar({
     effect_declaration: $ => seq(
       'effect',
       field('name', $.identifier),
-      field('generic_parameters', optional($.generic_parameter_list)),
+      field('parameters', optional($.generic_parameter_list)),
       '{',
       optional(sepBy(',', $.operation_signature)),
       optional(','), // Optional trailing comma for the operations list itself
@@ -78,7 +78,7 @@ module.exports = grammar({
       field('type', $._type)
     ),
 
-    // --- Structs ---
+    // --- Struct Declaration ---
     struct_declaration: $ => seq(
       'struct',
       field('name', $.identifier),
