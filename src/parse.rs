@@ -24,11 +24,11 @@ struct SourceTree<'source> {
     tree: tree_sitter::Tree,
 }
 impl<'source> SourceTree<'source> {
-    fn parse(source: &'source str) -> BuildResult<Self> {
+    fn parse(source: &'source str) -> ParseResult<Self> {
         let tree = parse(source).ok_or(ParseError::NoTree)?;
         Ok(Self { source, tree })
     }
-    fn root<'tree>(&'tree self) -> BuildResult<'source, SourceNode<'source, 'tree>> {
+    fn root<'tree>(&'tree self) -> ParseResult<'source, SourceNode<'source, 'tree>> {
         let root_node = SourceNode {
             node: self.tree.root_node(),
             source: self.source,
@@ -69,7 +69,7 @@ impl<'t, 's> SourceNode<'s, 't> {
         })
     }
 
-    fn child_by_field_name(self, field: &str) -> BuildResult<Self> {
+    fn child_by_field_name(self, field: &str) -> ParseResult<Self> {
         self.child_by_field_name_opt(field)
             .ok_or_else(|| ParseError::MissingField {
                 node_kind: self.node.kind(),
@@ -83,7 +83,7 @@ impl<'t, 's> SourceNode<'s, 't> {
         })
     }
 
-    fn child_by_id(self, field_id: usize) -> BuildResult<'s, Self> {
+    fn child_by_id(self, field_id: usize) -> ParseResult<'s, Self> {
         self.child_by_id_opt(field_id)
             .ok_or_else(|| ParseError::MissingIndex {
                 node_kind: self.node.kind(),
@@ -147,10 +147,10 @@ pub enum ParseError<'source> {
 }
 
 // Helper type alias for results
-type BuildResult<'source, T> = Result<T, ParseError<'source>>;
+type ParseResult<'source, T> = Result<T, ParseError<'source>>;
 
 /// Converts a tree-sitter Tree into an ast::Program
-pub fn build_ast_program(source: &str) -> BuildResult<Program> {
+pub fn build_ast_program(source: &str) -> ParseResult<Program> {
     let source_tree = SourceTree::parse(source)?;
     let root_node = source_tree.root()?;
 
@@ -181,7 +181,7 @@ pub fn build_ast_program(source: &str) -> BuildResult<Program> {
 }
 
 // --- Node Conversion Functions ---
-fn build_effect_decl<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Declaration> {
+fn build_effect_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
     let name = node.child_by_field_name("name")?.text();
 
     let generic_params_node = node.child_by_field_name("generic_parameters").ok();
@@ -220,10 +220,14 @@ fn build_effect_decl<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Declaratio
         }
     }
 
-    Ok(Declaration::Effect(EffectDecl { name: name.to_string(), params, ops }))
+    Ok(Declaration::Effect(EffectDecl {
+        name: name.to_string(),
+        params,
+        ops,
+    }))
 }
 
-fn build_fn_decl<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Declaration> {
+fn build_fn_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
     let name = node.child_by_field_name("name")?.text().to_string();
     let params = if let Some(node) = node.child_by_field_name_opt("parameters") {
         build_generic_params(node)?
@@ -263,7 +267,7 @@ fn build_fn_decl<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Declaration> {
         body,
     }))
 }
-fn build_struct_decl<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Declaration> {
+fn build_struct_decl<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Declaration> {
     let name = node.child_by_field_name("name")?.text();
     let params = node
         .child_by_field_name("generic_parameters")
@@ -280,7 +284,7 @@ fn build_struct_decl<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Declaratio
     }))
 }
 
-fn build_generic_params<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, BTreeSet<String>> {
+fn build_generic_params<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, BTreeSet<String>> {
     let mut params = BTreeSet::new();
     for child in node.children() {
         if child.kind() == "identifier" {
@@ -299,7 +303,10 @@ fn build_generic_params<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, BTreeSe
     Ok(params)
 }
 
-fn build_fields_map<'s>(node: SourceNode<'s, '_>, context_name: &'s str) -> BuildResult<'s, HashMap<String, Type>> {
+fn build_fields_map<'s>(
+    node: SourceNode<'s, '_>,
+    context_name: &'s str,
+) -> ParseResult<'s, HashMap<String, Type>> {
     // { field_name: field_type, }
     let mut fields = HashMap::new();
     for child in node.children() {
@@ -325,8 +332,7 @@ fn build_fields_map<'s>(node: SourceNode<'s, '_>, context_name: &'s str) -> Buil
     Ok(fields)
 }
 
-
-fn build_fn_arg_list<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Vec<TypedBinding>> {
+fn build_fn_arg_list<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Vec<TypedBinding>> {
     // parameter_list: $ => seq('(', optional(sepBy(',', $.parameter)), ')')
     let mut params = Vec::new();
     for child in node.children() {
@@ -338,7 +344,7 @@ fn build_fn_arg_list<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Vec<TypedB
     Ok(params)
 }
 
-fn build_fn_arg<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, TypedBinding> {
+fn build_fn_arg<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, TypedBinding> {
     // parameter: $ => seq(optional('mut'), name: $.identifier, ':', type: $._type)
     let mutable = node.child_by_id(0).map_or(false, |n| n.kind() == "mut"); // Check first child
     let name = node.child_by_field_name("name")?.text().to_string();
@@ -348,7 +354,7 @@ fn build_fn_arg<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, TypedBinding> {
 }
 
 // --- Type Parsing ---
-fn build_type<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Type> {
+fn build_type<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Type> {
     match node.kind() {
         "primitive_type" => {
             match node.text() {
@@ -413,7 +419,7 @@ fn build_type<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Type> {
 }
 
 // --- Statement Parsing ---
-fn build_statement<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Statement> {
+fn build_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
     match node.kind() {
         "let_statement" => build_let_statement(node),
         "assignment_statement" => build_assignment_statement(node),
@@ -427,7 +433,7 @@ fn build_statement<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Statement> {
     }
 }
 
-fn build_let_statement<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Statement> {
+fn build_let_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
     let binding = node
         .child_by_field_name("binding")
         .and_then(build_soft_binding)?;
@@ -439,7 +445,7 @@ fn build_let_statement<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Statemen
 }
 
 // --- Expression Parsing ---
-fn build_expression<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression> {
+fn build_expression<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     // Use node.kind() to dispatch to specific build functions
     match node.kind() {
         "if_expression" => build_if_expr(node),
@@ -463,7 +469,7 @@ fn build_expression<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression>
     }
 }
 
-fn build_literal_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression> {
+fn build_literal_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     let text = node.text();
     let child = node.child_by_id(0)?;
     match child.kind() {
@@ -497,13 +503,13 @@ fn build_literal_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expressio
     }
 }
 
-fn build_variable_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression> {
+fn build_variable_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     // Assuming 'variable' node wraps an 'identifier' node
     let var = node.child_by_id(0)?.text().to_string();
     Ok(Expression::L(LValue::Variable(var), Type::unknown()))
 }
 
-fn build_block_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression> {
+fn build_block_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     let mut statements = Vec::new();
     for s in node.children_by_field_name("statements") {
         statements.push(build_statement(s)?);
@@ -519,7 +525,7 @@ fn build_block_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression>
 
 // --- TODO: Implement remaining build functions ---
 
-fn build_soft_binding<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, SoftBinding> {
+fn build_soft_binding<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, SoftBinding> {
     let mutable = node.child_by_id(0).map_or(false, |n| n.kind() == "mut");
     let name = node.child_by_field_name("name")?.text().to_string();
     let ty = node
@@ -530,7 +536,7 @@ fn build_soft_binding<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, SoftBindi
     Ok(SoftBinding { name, ty, mutable })
 }
 
-fn build_l_value<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, LValue> {
+fn build_l_value<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, LValue> {
     match node.kind() {
         "identifier" => Ok(LValue::Variable(node.text().to_string())),
         _ => Err(ParseError::UnexpectedNodeType {
@@ -541,7 +547,7 @@ fn build_l_value<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, LValue> {
     }
 }
 
-fn build_assignment_statement<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Statement> {
+fn build_assignment_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
     let left = node.child_by_field_name("left").and_then(build_l_value)?;
     let right = node
         .child_by_field_name("right")
@@ -549,20 +555,20 @@ fn build_assignment_statement<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, S
     Ok(Statement::Assign(left, right))
 }
 
-fn build_return_statement<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Statement> {
+fn build_return_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
     let expr = node
         .child_by_field_name("value")
         .and_then(build_expression)?;
     Ok(Statement::Return(expr))
 }
 
-fn build_expression_statement<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Statement> {
+fn build_expression_statement<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Statement> {
     // expression_statement: $ => seq($._expression, ';')
     let expr = node.child_by_id(0).and_then(build_expression)?;
     Ok(Statement::Expression(expr))
 }
 
-fn build_if_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression> {
+fn build_if_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     let condition = node
         .child_by_field_name("condition")
         .and_then(build_expression)
@@ -588,7 +594,7 @@ fn build_if_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression> {
     })
 }
 
-fn build_lambda_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression> {
+fn build_lambda_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     let bindings = node
         .child_by_field_name("lambda_args")
         .and_then(build_lambda_parameter_list)?;
@@ -604,7 +610,7 @@ fn build_lambda_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression
     })
 }
 
-fn build_lambda_parameter_list<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Vec<SoftBinding>> {
+fn build_lambda_parameter_list<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Vec<SoftBinding>> {
     // lambda_parameter_list: $ => seq('(', optional(sepBy(',', $.soft_binding)), ')')
     let mut params = Vec::new();
     for child in node.children() {
@@ -615,7 +621,7 @@ fn build_lambda_parameter_list<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, 
     Ok(params)
 }
 
-fn build_call_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression> {
+fn build_call_expr<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Expression> {
     // call_expression: $ => prec.left(1, seq(function: $._expression, arguments: $.argument_list))
     let fn_expr = node
         .child_by_field_name("function")
@@ -632,7 +638,7 @@ fn build_call_expr<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Expression> 
     })
 }
 
-fn build_call_arg_list<'s>(node: SourceNode<'s, '_>) -> BuildResult<'s, Vec<Expression>> {
+fn build_call_arg_list<'s>(node: SourceNode<'s, '_>) -> ParseResult<'s, Vec<Expression>> {
     // argument_list: $ => seq('(', optional(sepBy(',', $._expression)), ')')
     let mut args = Vec::new();
     for child in node.children() {

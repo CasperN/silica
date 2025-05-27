@@ -2730,7 +2730,9 @@ mod tests {
         let mut ops = OpSetI::empty();
         ops.unify_add_declared_op(Some("int_state"), &int_state_instance, "get")
             .unwrap();
-        assert!(ops.unify_add_declared_op(None, &bool_state_instance, "set").is_ok());
+        assert!(ops
+            .unify_add_declared_op(None, &bool_state_instance, "set")
+            .is_ok());
     }
     #[test]
     fn conflicting_parametric_effects_both_unnamed() {
