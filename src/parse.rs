@@ -24,23 +24,27 @@ struct SourceTree<'source> {
     tree: tree_sitter::Tree,
 }
 impl<'source> SourceTree<'source> {
-    fn parse(source: &'source str) -> ParseResult<Self> {
-        let tree = parse(source).ok_or(ParseError::NoTree)?;
-        Ok(Self { source, tree })
+    fn parse(source: &'source str, errors: &mut Vec<ParseError<'source>>) -> Option<Self> {
+        if let Some(tree) = parse(source) {
+            Some(Self { source, tree })
+        } else {
+            errors.push(ParseError::NoTree);
+            None
+        }
     }
-    fn root<'tree>(&'tree self) -> ParseResult<'source, SourceNode<'source, 'tree>> {
+    fn root<'tree>(&'tree self, errors: &mut Vec<ParseError<'source>>) -> SourceNode<'source, 'tree> {
         let root_node = SourceNode {
             node: self.tree.root_node(),
             source: self.source,
         };
         if root_node.kind() != "source_file" {
-            return Err(ParseError::UnexpectedNodeType {
+            errors.push(ParseError::UnexpectedNodeType {
                 expected: "source_file",
                 found: root_node.kind(),
                 node_text: root_node.source,
             });
         }
-        Ok(root_node)
+        root_node
     }
 }
 
@@ -172,9 +176,9 @@ type ParseResult<'source, T> = Result<T, ParseError<'source>>;
 pub fn parse_ast_program<'s>(
     source: &'s str,
     errors: &mut Vec<ParseError<'s>>,
-) -> ParseResult<'s, Program> {
-    let source_tree = SourceTree::parse(source)?;
-    let root_node = source_tree.root()?;
+) -> Option<Program> {
+    let source_tree = SourceTree::parse(source, errors)?;
+    let root_node = source_tree.root(errors);
 
     let mut declarations = Vec::new();
 
@@ -197,7 +201,7 @@ pub fn parse_ast_program<'s>(
         }
     }
 
-    Ok(Program(declarations))
+    Some(Program(declarations))
 }
 
 // --- Node Conversion Functions ---
@@ -362,7 +366,7 @@ fn parse_generic_params<'s>(
     let mut params = BTreeSet::new();
     for child in node.children() {
         match child.kind() {
-            "(" | "," | ")" => continue,
+            "<" | "," | ">" => continue,
             "identifier" => {
                 let parameter = child.text();
                 if !params.insert(parameter.to_string()) {
@@ -453,7 +457,7 @@ fn parse_type<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) ->
             let mut found_arrow = false;
             for child in node.children() {
                 match child.kind() {
-                    "(" | "," | ")" => {}
+                    "fn" | "(" | "," | ")" => {}
                     "->" => {
                         found_arrow = true;
                     }
@@ -806,7 +810,7 @@ mod tests {
         let mut errors = vec![];
         assert_eq!(
             parse_ast_program(source_code, &mut errors),
-            Ok(Program(vec![Declaration::Fn(FnDecl {
+            Some(Program(vec![Declaration::Fn(FnDecl {
                 forall: BTreeSet::new(),
                 name: "main".to_string(),
                 args: vec![],
@@ -814,6 +818,7 @@ mod tests {
                 body: Some(block_expr(vec![2.into()]))
             })]))
         );
+        assert_eq!(&errors, &[]);
     }
     #[test]
     fn use_lambda() {
@@ -827,7 +832,7 @@ mod tests {
                 b
             }
         ";
-        let expected_program = Program(vec![
+        let program = Program(vec![
             Declaration::Fn(FnDecl {
                 forall: BTreeSet::new(),
                 name: "plus".to_string(),
@@ -860,7 +865,9 @@ mod tests {
             }),
         ]);
         let mut errors = vec![];
-        assert_eq!(parse_ast_program(source, &mut errors), Ok(expected_program));
+        let parsed = parse_ast_program(source, &mut errors);
+        assert_eq!(&errors, &[]);
+        assert_eq!(parsed, Some(program));
     }
     #[test]
     fn return_lambda() {
@@ -903,7 +910,9 @@ mod tests {
             }),
         ]);
         let mut errors = vec![];
-        assert_eq!(parse_ast_program(source, &mut errors), Ok(program));
+        let parsed = parse_ast_program(source, &mut errors);
+        assert_eq!(&errors, &[]);
+        assert_eq!(parsed, Some(program));
     }
     #[test]
     fn declare_struct() {
@@ -920,7 +929,9 @@ mod tests {
             ),
         })]);
         let mut errors = vec![];
-        assert_eq!(parse_ast_program(source, &mut errors), Ok(program));
+        let parsed = parse_ast_program(source, &mut errors);
+        assert_eq!(&errors, &[]);
+        assert_eq!(parsed, Some(program));
     }
     #[test]
     fn declare_generic_fn() {
@@ -937,7 +948,9 @@ mod tests {
             body: Some(block_expr(vec!["x".into()])),
         })]);
         let mut errors = vec![];
-        assert_eq!(parse_ast_program(source, &mut errors), Ok(program));
+        let parsed = parse_ast_program(source, &mut errors);
+        assert_eq!(&errors, &[]);
+        assert_eq!(parsed, Some(program));
     }
     #[test]
     fn declare_generic_struct() {
@@ -954,7 +967,9 @@ mod tests {
             ),
         })]);
         let mut errors = vec![];
-        assert_eq!(parse_ast_program(source, &mut errors), Ok(program));
+        let parsed = parse_ast_program(source, &mut errors);
+        assert_eq!(&errors, &[]);
+        assert_eq!(parsed, Some(program));
     }
     #[test]
     fn declare_effect() {
@@ -970,7 +985,9 @@ mod tests {
             .collect(),
         })]);
         let mut errors = vec![];
-        assert_eq!(parse_ast_program(source, &mut errors), Ok(program));
+        let parsed = parse_ast_program(source, &mut errors);
+        assert_eq!(&errors, &[]);
+        assert_eq!(parsed, Some(program));
     }
 
     #[test]
@@ -987,6 +1004,8 @@ mod tests {
             .collect(),
         })]);
         let mut errors = vec![];
-        assert_eq!(parse_ast_program(source, &mut errors), Ok(program));
+        let parsed = parse_ast_program(source, &mut errors);
+        assert_eq!(&errors, &[]);
+        assert_eq!(parsed, Some(program));
     }
 }
