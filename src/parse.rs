@@ -32,7 +32,10 @@ impl<'source> SourceTree<'source> {
             None
         }
     }
-    fn root<'tree>(&'tree self, errors: &mut Vec<ParseError<'source>>) -> SourceNode<'source, 'tree> {
+    fn root<'tree>(
+        &'tree self,
+        errors: &mut Vec<ParseError<'source>>,
+    ) -> SourceNode<'source, 'tree> {
         let root_node = SourceNode {
             node: self.tree.root_node(),
             source: self.source,
@@ -173,10 +176,7 @@ pub enum ParseError<'source> {
 type ParseResult<'source, T> = Result<T, ParseError<'source>>;
 
 /// Converts a tree-sitter Tree into an ast::Program
-pub fn parse_ast_program<'s>(
-    source: &'s str,
-    errors: &mut Vec<ParseError<'s>>,
-) -> Option<Program> {
+pub fn parse_ast_program<'s>(source: &'s str, errors: &mut Vec<ParseError<'s>>) -> Option<Program> {
     let source_tree = SourceTree::parse(source, errors)?;
     let root_node = source_tree.root(errors);
 
@@ -666,10 +666,7 @@ fn parse_soft_binding<'s>(
     name.map(|name| SoftBinding { name, ty, mutable })
 }
 
-fn parse_l_value<'s>(
-    node: SourceNode<'s, '_>,
-    errors: &mut Vec<ParseError<'s>>,
-) -> Option<LValue> {
+fn parse_l_value<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) -> Option<LValue> {
     match node.kind() {
         "identifier" => Some(LValue::Variable(node.text().to_string())),
         found => {
@@ -1006,6 +1003,46 @@ mod tests {
         let mut errors = vec![];
         let parsed = parse_ast_program(source, &mut errors);
         assert_eq!(&errors, &[]);
+        assert_eq!(parsed, Some(program));
+    }
+    #[test]
+    fn struct_with_repeated_fields() {
+        let source = r"
+        struct Foo {
+            foo: i64,
+            foo: bool,
+            bar: unit,
+            bar: f64,
+        }";
+        let mut errors = vec![];
+        let parsed = parse_ast_program(source, &mut errors);
+        assert_eq!(
+            &errors,
+            &[
+                ParseError::DuplicateItem {
+                    duplicated_item: "foo",
+                    item_type: "field",
+                    context_name: "Foo",
+                    context_type: "struct"
+                },
+                ParseError::DuplicateItem {
+                    duplicated_item: "bar",
+                    item_type: "field",
+                    context_name: "Foo",
+                    context_type: "struct"
+                }
+            ]
+        );
+        let program = Program(vec![Declaration::Struct(StructDecl {
+            name: "Foo".to_string(),
+            params: Default::default(),
+            fields: [
+                ("foo".to_string(), Type::int()),
+                ("bar".to_string(), Type::unit()),
+            ]
+            .into_iter()
+            .collect(),
+        })]);
         assert_eq!(parsed, Some(program));
     }
 }
