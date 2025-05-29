@@ -83,14 +83,15 @@ impl<'t, 's> SourceNode<'s, 't> {
         errors: &'e mut Vec<ParseError<'s>>,
     ) -> Option<Self> {
         if let Some(node) = self.optional_child(field_name) {
-            Some(node)
-        } else {
-            errors.push(ParseError::MissingField {
-                node_kind: self.kind(),
-                field_name,
-            });
-            None
+            if !node.node.is_missing() && !node.node.is_error() && !node.text().is_empty() {
+                return Some(node);
+            }
         }
+        errors.push(ParseError::MissingField {
+            node_kind: self.kind(),
+            field_name,
+        });
+        None
     }
 
     fn optional_child_by_id(self, field_id: usize) -> Option<Self> {
@@ -107,14 +108,15 @@ impl<'t, 's> SourceNode<'s, 't> {
         errors: &'e mut Vec<ParseError<'s>>,
     ) -> Option<Self> {
         if let Some(node) = self.optional_child_by_id(field_id) {
-            Some(node)
-        } else {
-            errors.push(ParseError::MissingIndex {
-                node_kind: self.node.kind(),
-                child_index: field_id,
-            });
-            None
+            if !node.node.is_missing() && !node.node.is_error() && !node.text().is_empty() {
+                return Some(node);
+            }
         }
+        errors.push(ParseError::MissingIndex {
+            node_kind: self.node.kind(),
+            child_index: field_id,
+        });
+        None
     }
 
     fn children(self) -> Vec<Self> {
@@ -167,6 +169,9 @@ pub enum ParseError<'source> {
         item_type: &'static str,
         context_name: &'source str,
         context_type: &'static str,
+    },
+    HasErrorInNode {
+        text: &'source str,
     },
     NoTree,
     UnknownPrimitiveType(String),
@@ -1044,5 +1049,29 @@ mod tests {
             .collect(),
         })]);
         assert_eq!(parsed, Some(program));
+    }
+    #[test]
+    fn missing_struct_field_type() {
+        let source_code = r#"
+        struct Point {
+            x: i64,
+            y:,
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![ParseError::MissingField {
+            node_kind: "struct_field_declaration",
+            field_name: "type",
+        }];
+        assert_eq!(errors, expected_errors);
+
+        let expected_ast = Some(Program(vec![Declaration::Struct(StructDecl {
+            name: "Point".to_string(),
+            params: BTreeSet::new(),
+            fields: [("x".to_string(), Type::int())].into_iter().collect(),
+        })]));
+        assert_eq!(parsed, expected_ast);
     }
 }
