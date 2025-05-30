@@ -35,19 +35,16 @@ impl<'source> SourceTree<'source> {
     fn root<'tree>(
         &'tree self,
         errors: &mut Vec<ParseError<'source>>,
-    ) -> SourceNode<'source, 'tree> {
-        let root_node = SourceNode {
-            node: self.tree.root_node(),
-            source: self.source,
-        };
+    ) -> Option<SourceNode<'source, 'tree>> {
+        let root_node = SourceNode::new(self.tree.root_node(), self.source, "root", errors)?;
         if root_node.kind() != "source_file" {
             errors.push(ParseError::UnexpectedNodeType {
                 expected: "source_file",
                 found: root_node.kind(),
-                node_text: root_node.source,
+                node_text: self.source,
             });
         }
-        root_node
+        Some(root_node)
     }
 }
 
@@ -57,6 +54,22 @@ struct SourceNode<'source, 'tree> {
     node: Node<'tree>,
 }
 impl<'t, 's> SourceNode<'s, 't> {
+    fn new(
+        node: Node<'t>,
+        source: &'s str,
+        context_kind: &'static str,
+        errors: &mut Vec<ParseError<'s>>,
+    ) -> Option<Self> {
+        if node.is_error() || node.is_missing() {
+            errors.push(ParseError::Unparsable {
+                context_kind,
+                text: node.utf8_text(source.as_bytes()).unwrap(),
+            });
+            return None;
+        }
+        Some(SourceNode { node, source })
+    }
+
     fn kind(&self) -> &'static str {
         self.node.kind()
     }
@@ -69,11 +82,10 @@ impl<'t, 's> SourceNode<'s, 't> {
             .expect("Node text decode failed")
     }
 
-    fn optional_child(self, field: &str) -> Option<Self> {
-        self.node.child_by_field_name(field).map(|node| Self {
-            node,
-            source: self.source,
-        })
+    fn optional_child(self, field: &str, errors: &mut Vec<ParseError<'s>>) -> Option<Self> {
+        self.node
+            .child_by_field_name(field)
+            .and_then(|n| Self::new(n, self.source, self.kind(), errors))
     }
 
     // Returns the child if its there. If not, appends an error to `errors``.
@@ -82,7 +94,7 @@ impl<'t, 's> SourceNode<'s, 't> {
         field_name: &'static str,
         errors: &'e mut Vec<ParseError<'s>>,
     ) -> Option<Self> {
-        if let Some(node) = self.optional_child(field_name) {
+        if let Some(node) = self.optional_child(field_name, errors) {
             if !node.node.is_missing() && !node.node.is_error() && !node.text().is_empty() {
                 return Some(node);
             }
@@ -94,11 +106,14 @@ impl<'t, 's> SourceNode<'s, 't> {
         None
     }
 
-    fn optional_child_by_id(self, field_id: usize) -> Option<Self> {
-        self.node.child(field_id).map(|node| Self {
-            node,
-            source: self.source,
-        })
+    fn optional_child_by_id(
+        self,
+        field_id: usize,
+        errors: &mut Vec<ParseError<'s>>,
+    ) -> Option<Self> {
+        self.node
+            .child(field_id)
+            .and_then(|node| Self::new(node, self.source, self.kind(), errors))
     }
 
     // Returns the child if its there. If not, appends an error to `errors``.
@@ -107,7 +122,7 @@ impl<'t, 's> SourceNode<'s, 't> {
         field_id: usize,
         errors: &'e mut Vec<ParseError<'s>>,
     ) -> Option<Self> {
-        if let Some(node) = self.optional_child_by_id(field_id) {
+        if let Some(node) = self.optional_child_by_id(field_id, errors) {
             if !node.node.is_missing() && !node.node.is_error() && !node.text().is_empty() {
                 return Some(node);
             }
@@ -119,25 +134,27 @@ impl<'t, 's> SourceNode<'s, 't> {
         None
     }
 
-    fn children(self) -> Vec<Self> {
+    fn children(self, errors: &mut Vec<ParseError<'s>>) -> Vec<Self> {
         let mut cursor = self.node.walk();
         let mut children = Vec::new();
         for node in self.node.children(&mut cursor) {
-            children.push(Self {
-                node,
-                source: self.source,
-            });
+            if let Some(c) = Self::new(node, self.source, self.kind(), errors) {
+                children.push(c);
+            }
         }
         children
     }
-    fn children_by_field_name(self, field_name: &str) -> Vec<Self> {
+    fn children_by_field_name(
+        self,
+        field_name: &str,
+        errors: &mut Vec<ParseError<'s>>,
+    ) -> Vec<Self> {
         let mut cursor = self.node.walk();
         let mut children = Vec::new();
         for node in self.node.children_by_field_name(field_name, &mut cursor) {
-            children.push(Self {
-                node,
-                source: self.source,
-            });
+            if let Some(c) = Self::new(node, self.source, self.kind(), errors) {
+                children.push(c);
+            }
         }
         children
     }
@@ -170,7 +187,8 @@ pub enum ParseError<'source> {
         context_name: &'source str,
         context_type: &'static str,
     },
-    HasErrorInNode {
+    Unparsable {
+        context_kind: &'static str,
         text: &'source str,
     },
     NoTree,
@@ -183,11 +201,11 @@ type ParseResult<'source, T> = Result<T, ParseError<'source>>;
 /// Converts a tree-sitter Tree into an ast::Program
 pub fn parse_ast_program<'s>(source: &'s str, errors: &mut Vec<ParseError<'s>>) -> Option<Program> {
     let source_tree = SourceTree::parse(source, errors)?;
-    let root_node = source_tree.root(errors);
+    let root_node = source_tree.root(errors)?;
 
     let mut declarations = Vec::new();
 
-    for child in root_node.children() {
+    for child in root_node.children(errors) {
         let decl = match child.kind() {
             "function_declaration" => parse_fn_decl(child, errors),
             "struct_declaration" => parse_struct_decl(child, errors),
@@ -216,12 +234,13 @@ fn parse_effect_decl<'s>(
 ) -> Option<Declaration> {
     let name = node.required_child("name", errors).map(|n| n.text());
     let params = node
-        .optional_child("parameters")
+        .optional_child("parameters", errors)
         .map(|n| parse_generic_params(n, errors))
         .unwrap_or_default();
 
     let mut ops = HashMap::new();
-    for child_node in node.children() {
+    for child_node in node.children(errors) {
+        child_node.children(errors);
         if child_node.kind() == "operation_signature" {
             let op_name = child_node
                 .required_child("op_name", errors)
@@ -250,6 +269,8 @@ fn parse_effect_decl<'s>(
                     }
                 }
             }
+        } else {
+            dbg!(child_node.kind(), child_node.node);
         }
     }
     name.map(|name| {
@@ -269,7 +290,7 @@ fn parse_fn_decl<'s>(
         .required_child("name", errors)
         .map(|n| n.text().to_string());
     let params = node
-        .optional_child("parameters")
+        .optional_child("parameters", errors)
         .map(|n| parse_generic_params(n, errors))
         .unwrap_or_default();
 
@@ -279,7 +300,7 @@ fn parse_fn_decl<'s>(
         .unwrap_or_default();
 
     let return_type = node
-        .optional_child("return_type")
+        .optional_child("return_type", errors)
         .and_then(|n| parse_type(n, errors))
         .unwrap_or(Type::unit());
 
@@ -315,13 +336,13 @@ fn parse_struct_decl<'s>(
 ) -> Option<Declaration> {
     let struct_name = node.required_child("name", errors).map(|n| n.text());
     let params = node
-        .optional_child("generic_parameters")
+        .optional_child("generic_parameters", errors)
         .map(|node| parse_generic_params(node, errors))
         .unwrap_or_default();
 
     let mut fields = HashMap::new();
     if let Some(fields_node) = node.required_child("fields", errors) {
-        for field_node in fields_node.children() {
+        for field_node in fields_node.children(errors) {
             if field_node.kind() == "struct_field_declaration" {
                 let (field_name, field_type) = match parse_struct_field(field_node, errors) {
                     Some((f, t)) => (f, t),
@@ -369,7 +390,7 @@ fn parse_generic_params<'s>(
     errors: &mut Vec<ParseError<'s>>,
 ) -> BTreeSet<String> {
     let mut params = BTreeSet::new();
-    for child in node.children() {
+    for child in node.children(errors) {
         match child.kind() {
             "<" | "," | ">" => continue,
             "identifier" => {
@@ -398,7 +419,7 @@ fn parse_fn_arg_list<'s>(
     errors: &mut Vec<ParseError<'s>>,
 ) -> Vec<TypedBinding> {
     let mut args = Vec::new();
-    for child in node.children() {
+    for child in node.children(errors) {
         if matches!(child.kind(), "(" | "," | ")") {
             continue;
         }
@@ -411,7 +432,7 @@ fn parse_fn_arg_list<'s>(
             continue;
         }
         let mutable = child
-            .optional_child_by_id(0)
+            .optional_child_by_id(0, errors)
             .map_or(false, |n| n.kind() == "mut");
         let name = child
             .required_child("name", errors)
@@ -460,7 +481,7 @@ fn parse_type<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) ->
             let mut arg_types = Vec::new();
             let mut return_type = Type::unit();
             let mut found_arrow = false;
-            for child in node.children() {
+            for child in node.children(errors) {
                 match child.kind() {
                     "fn" | "(" | "," | ")" => {}
                     "->" => {
@@ -472,11 +493,9 @@ fn parse_type<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) ->
                             if let Some(ty) = parse_type(child, errors) {
                                 return_type = ty;
                             }
-                        } else {
-                            if let Some(ty) = parse_type(child, errors) {
-                                arg_types.push(ty);
-                                // TODO: Some kind of unknown type placeholder?
-                            }
+                        } else if let Some(ty) = parse_type(child, errors) {
+                            arg_types.push(ty);
+                            // TODO: Some kind of unknown type placeholder?
                         }
                     }
                     found => {
@@ -532,7 +551,7 @@ fn parse_let_statement<'s>(
         .required_child("binding", errors)
         .and_then(|n| parse_soft_binding(n, errors));
     let value = node
-        .optional_child("value")
+        .optional_child("value", errors)
         .and_then(|n| parse_expr(n, errors));
 
     Some(Statement::Let {
@@ -638,7 +657,7 @@ fn parse_block_expr<'s>(
     errors: &mut Vec<ParseError<'s>>,
 ) -> Option<Expression> {
     let mut statements = Vec::new();
-    for child_node in node.children_by_field_name("statements") {
+    for child_node in node.children_by_field_name("statements", errors) {
         if let Some(statement) = parse_statement(child_node, errors) {
             statements.push(statement);
         }
@@ -659,13 +678,13 @@ fn parse_soft_binding<'s>(
     errors: &mut Vec<ParseError<'s>>,
 ) -> Option<SoftBinding> {
     let mutable = node
-        .optional_child_by_id(0)
+        .optional_child_by_id(0, errors)
         .map_or(false, |n| n.kind() == "mut");
     let name = node
         .required_child("name", errors)
         .map(|n| n.text().to_string());
     let ty = node
-        .optional_child("type")
+        .optional_child("type", errors)
         .and_then(|n| parse_type(n, errors));
 
     name.map(|name| SoftBinding { name, ty, mutable })
@@ -730,7 +749,7 @@ fn parse_if_expr<'s>(
         .and_then(|n| parse_expr(n, errors))
         .map(Box::new);
     let false_expr = node
-        .optional_child("alternative")
+        .optional_child("alternative", errors)
         .and_then(|n| parse_expr(n, errors))
         .unwrap_or(Expression::Block {
             statements: vec![],
@@ -753,7 +772,7 @@ fn parse_lambda_expr<'s>(
     errors: &mut Vec<ParseError<'s>>,
 ) -> Option<Expression> {
     let mut bindings = Vec::new();
-    for child in node.required_child("lambda_args", errors)?.children() {
+    for child in node.required_child("lambda_args", errors)?.children(errors) {
         if child.kind() == "soft_binding" {
             if let Some(b) = parse_soft_binding(child, errors) {
                 bindings.push(b);
@@ -780,7 +799,7 @@ fn parse_call_expr<'s>(
         .and_then(|n| parse_expr(n, errors))
         .map(Box::new);
     let mut arg_exprs = Vec::new();
-    for child in node.required_child("arguments", errors)?.children() {
+    for child in node.required_child("arguments", errors)?.children(errors) {
         if !matches!(child.kind(), "(" | ")" | ",") {
             if let Some(expr) = parse_expr(child, errors) {
                 arg_exprs.push(expr);
@@ -1071,6 +1090,66 @@ mod tests {
             name: "Point".to_string(),
             params: BTreeSet::new(),
             fields: [("x".to_string(), Type::int())].into_iter().collect(),
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn unexpected_identifier_in_struct() {
+        let source_code = r#"
+        struct Point {
+            x: i64,
+            garbage borked 123 tokens
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![ParseError::Unparsable {
+            context_kind: "struct_field_list",
+            text: "garbage borked 123 tokens",
+        }];
+        assert_eq!(errors, expected_errors);
+
+        let expected_ast = Some(Program(vec![Declaration::Struct(StructDecl {
+            name: "Point".to_string(),
+            params: BTreeSet::new(),
+            fields: [("x".to_string(), Type::int())].into_iter().collect(),
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn unexpected_identifier_in_effect() {
+        let source_code = r#"
+        effect State<T> {
+            get: unit -> T,
+            set (the inner garbage tokens): T -> unit,
+            the outer garbage tokens
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![
+            ParseError::Unparsable {
+                context_kind: "effect_declaration",
+                text: "the outer garbage tokens",
+            },
+            ParseError::Unparsable {
+                context_kind: "operation_signature",
+                text: "(the inner garbage tokens)",
+            },
+        ];
+        assert_eq!(errors, expected_errors);
+
+        let expected_ast = Some(Program(vec![Declaration::Effect(EffectDecl {
+            name: "State".to_string(),
+            params: ["T".to_string()].into_iter().collect(),
+            ops: [
+                ("get".to_string(), (Type::unit(), Type::param("T"))),
+                ("set".to_string(), (Type::param("T"), Type::unit())),
+            ]
+            .into_iter()
+            .collect(),
         })]));
         assert_eq!(parsed, expected_ast);
     }
