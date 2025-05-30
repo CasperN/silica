@@ -36,7 +36,9 @@ impl<'source> SourceTree<'source> {
         &'tree self,
         errors: &mut Vec<ParseError<'source>>,
     ) -> Option<SourceNode<'source, 'tree>> {
-        let root_node = SourceNode::new(self.tree.root_node(), self.source, "root", errors)?;
+        // SourceNode::new assumes we've already verified root_node and only verifies that the
+        // immediate children are valid.
+        let root_node = self.tree.root_node();
         if root_node.kind() != "source_file" {
             errors.push(ParseError::UnexpectedNodeType {
                 expected: "source_file",
@@ -44,7 +46,7 @@ impl<'source> SourceTree<'source> {
                 node_text: self.source,
             });
         }
-        Some(root_node)
+        SourceNode::new(self.tree.root_node(), self.source, errors)
     }
 }
 
@@ -54,18 +56,19 @@ struct SourceNode<'source, 'tree> {
     node: Node<'tree>,
 }
 impl<'t, 's> SourceNode<'s, 't> {
-    fn new(
-        node: Node<'t>,
-        source: &'s str,
-        context_kind: &'static str,
-        errors: &mut Vec<ParseError<'s>>,
-    ) -> Option<Self> {
+    fn new(node: Node<'t>, source: &'s str, errors: &mut Vec<ParseError<'s>>) -> Option<Self> {
         if node.is_error() || node.is_missing() {
-            errors.push(ParseError::Unparsable {
-                context_kind,
-                text: node.utf8_text(source.as_bytes()).unwrap(),
-            });
+            // Assume the error has already been added by the caller.
             return None;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.is_error() {
+                errors.push(ParseError::Unparsable {
+                    context_kind: node.kind(),
+                    text: child.utf8_text(source.as_bytes()).unwrap(),
+                });
+            }
         }
         Some(SourceNode { node, source })
     }
@@ -85,7 +88,7 @@ impl<'t, 's> SourceNode<'s, 't> {
     fn optional_child(self, field: &str, errors: &mut Vec<ParseError<'s>>) -> Option<Self> {
         self.node
             .child_by_field_name(field)
-            .and_then(|n| Self::new(n, self.source, self.kind(), errors))
+            .and_then(|n| Self::new(n, self.source, errors))
     }
 
     // Returns the child if its there. If not, appends an error to `errors``.
@@ -113,7 +116,7 @@ impl<'t, 's> SourceNode<'s, 't> {
     ) -> Option<Self> {
         self.node
             .child(field_id)
-            .and_then(|node| Self::new(node, self.source, self.kind(), errors))
+            .and_then(|node| Self::new(node, self.source, errors))
     }
 
     // Returns the child if its there. If not, appends an error to `errors``.
@@ -138,7 +141,7 @@ impl<'t, 's> SourceNode<'s, 't> {
         let mut cursor = self.node.walk();
         let mut children = Vec::new();
         for node in self.node.children(&mut cursor) {
-            if let Some(c) = Self::new(node, self.source, self.kind(), errors) {
+            if let Some(c) = Self::new(node, self.source, errors) {
                 children.push(c);
             }
         }
@@ -152,7 +155,7 @@ impl<'t, 's> SourceNode<'s, 't> {
         let mut cursor = self.node.walk();
         let mut children = Vec::new();
         for node in self.node.children_by_field_name(field_name, &mut cursor) {
-            if let Some(c) = Self::new(node, self.source, self.kind(), errors) {
+            if let Some(c) = Self::new(node, self.source, errors) {
                 children.push(c);
             }
         }
@@ -240,7 +243,6 @@ fn parse_effect_decl<'s>(
 
     let mut ops = HashMap::new();
     for child_node in node.children(errors) {
-        child_node.children(errors);
         if child_node.kind() == "operation_signature" {
             let op_name = child_node
                 .required_child("op_name", errors)
