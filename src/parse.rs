@@ -581,6 +581,7 @@ fn parse_expr<'s>(
             // TODO: This probably doesn't do well with tuples.
             parse_expr(node.required_child_by_id(1, errors)?, errors)
         }
+        "perform_expression" => parse_perform_expression(node, errors),
         // Potentially handle _primary_expression or _l_value if needed by grammar structure
         _ => {
             errors.push(ParseError::UnexpectedNodeType {
@@ -591,6 +592,26 @@ fn parse_expr<'s>(
             None
         }
     }
+}
+
+fn parse_perform_expression<'s>(
+    node: SourceNode<'s, '_>,
+    errors: &mut Vec<ParseError<'s>>,
+) -> Option<Expression> {
+    let qualifier = node.optional_child("effect_name", errors);
+    let op_name = node.required_child("op_name", errors)?;
+    // If the arg expression is an error, default to unit.
+    let arg = node
+        .required_child("argument", errors)
+        .and_then(|node| parse_expr(node, errors))
+        .unwrap_or(Expression::LiteralUnit);
+
+    Some(Expression::Perform {
+        name: qualifier.map(|n| n.text().to_string()),
+        op: op_name.text().to_string(),
+        arg: Box::new(arg),
+        resume_type: Type::unknown(),
+    })
 }
 
 fn parse_literal_expr<'s>(
@@ -1182,5 +1203,50 @@ mod tests {
             text: "-> T",
         }];
         assert_eq!(errors, expected_errors);
+    }
+    #[test]
+    fn perform_op() {
+        let source_code = r#"
+        fn main() {
+            perform foo(1)
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            return_type: Type::unit(),
+            body: Some(block_expr(vec![perform_anon("foo", 1).into()])),
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn missing_op_arg() {
+        let source_code = r#"
+        fn main() {
+            perform foo()
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![ParseError::MissingField {
+            node_kind: "perform_expression",
+            field_name: "argument",
+        }];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            return_type: Type::unit(),
+            body: Some(block_expr(vec![perform_anon("foo", ()).into()])),
+        })]));
+        assert_eq!(parsed, expected_ast);
     }
 }

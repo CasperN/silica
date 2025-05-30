@@ -169,6 +169,7 @@ module.exports = grammar({
 
     // --- Expressions ---
     _expression: $ => choice(
+      $.perform_expression,
       $.call_expression,
       $.if_expression,
       $.lambda_expression,
@@ -223,6 +224,18 @@ module.exports = grammar({
         field("statements", repeat($._statement)),
         field("final_expression", optional($._expression)),
       '}'
+    ),
+
+    perform_expression: $ => seq(
+        'perform',
+        optional(seq(
+          field('effect_name', $.identifier),
+          "."
+        )),
+        field("op_name", $.identifier),
+        '(',
+        field('argument', $._expression),
+        ')',
     ),
 
     // --- Literals ---
