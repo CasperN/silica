@@ -1155,4 +1155,32 @@ mod tests {
         })]));
         assert_eq!(parsed, expected_ast);
     }
+    #[test]
+    fn missing_fn_name() {
+        let source_code = r#"
+        fn <T>(x: T) -> T { x }
+        "#;
+        let mut errors = Vec::new();
+        parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![ParseError::Unparsable {
+            context_kind: "source_file",
+            text: "fn <T>(x: T) -> T { x }",
+        }];
+        assert_eq!(errors, expected_errors);
+    }
+    #[test]
+    fn extra_fn_return_type() {
+        let source_code = r#"
+        fn id<T>(x: T) -> T -> T { x }
+        "#;
+        let mut errors = Vec::new();
+        parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![ParseError::Unparsable {
+            context_kind: "function_declaration",
+            text: "-> T",
+        }];
+        assert_eq!(errors, expected_errors);
+    }
 }
