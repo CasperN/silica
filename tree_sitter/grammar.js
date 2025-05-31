@@ -153,6 +153,7 @@ module.exports = grammar({
       $.block_expression,
       $.co_expression,
       $.struct_literal_expression,
+      $.handle_expression,
       $._primary_expression,
       // Add binary/unary operators with precedence later
     ),
@@ -197,6 +198,8 @@ module.exports = grammar({
     ),
 
     // Higher precedence than identifiers.
+    // if identifier { ... }  is ambiguous between. 
+    // TODO: Precedence testing and think carefully about what to set the levels to.
     struct_literal_expression: $ => prec(14, seq(
       field("name", $.identifier),
       delimited("{", field("fields", $.struct_field), ",", "}"),
@@ -218,9 +221,38 @@ module.exports = grammar({
         field('argument', $._expression),
         ')',
     ),
-    co_expression: $ => seq("co", $._expression),
+    co_expression: $ => prec.right(1, seq("co", $._expression)),
 
     propagate_expression: $ => prec.left(19, seq($._expression, "?")),
+
+    handle_expression: $ => prec.left(10, seq(
+      field("coroutine", $._expression),
+      "handle",
+      // TODO: initially arm, finally arm, and return arm.
+      delimited(
+        "{", 
+        field("arms", choice($.return_arm, $.op_arm)),
+        ",",
+        "}"
+      )
+    )),
+    return_arm: $ => seq(
+      "return",
+      field("binding", $.soft_binding),
+      "=>",
+      field("expr", $._expression),
+    ),
+    op_arm: $ => seq(
+      optional(seq(
+        field("effect_name", $.identifier), "."
+      )),
+      field("op_name", $.identifier),
+      "(",
+      field("binding", $.soft_binding),
+      ")",
+      "=>",
+      field("expr", $._expression),
+    ),
 
     // --- Literals ---
     literal: $ => choice(

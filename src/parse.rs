@@ -1,8 +1,8 @@
 use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 
 use crate::ast::{
-    Declaration, EffectDecl, Expression, FnDecl, LValue, OpSet, Program, SoftBinding, Statement,
-    StructDecl, Type, TypedBinding,
+    Declaration, EffectDecl, Expression, FnDecl, HandleOpArm, LValue, OpSet, Program, SoftBinding,
+    Statement, StructDecl, Type, TypedBinding,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -564,6 +564,7 @@ fn parse_expr<'s>(
                 .map(|e| Expression::Co(Box::new(e), Type::unknown(), OpSet::empty_extensible()))
         }
         "struct_literal_expression" => parse_struct_literal(node, errors),
+        "handle_expression" => parse_handle_expression(node, errors),
         // Potentially handle _primary_expression or _l_value if needed by grammar structure
         _ => {
             errors.push(ParseError::UnexpectedNodeType {
@@ -574,6 +575,76 @@ fn parse_expr<'s>(
             None
         }
     }
+}
+
+fn parse_handle_expression<'s>(
+    node: SourceNode<'s, '_>,
+    errors: &mut Vec<ParseError<'s>>,
+) -> Option<Expression> {
+    let coroutine = node
+        .required_child("coroutine", errors)
+        .and_then(|node| parse_expr(node, errors))?;
+    let mut return_arm = None;
+    let mut op_arms = Vec::new();
+    for arm in node.children_by_field_name("arms", errors) {
+        match arm.kind() {
+            "return_arm" => {
+                if return_arm.is_some() {
+                    errors.push(ParseError::DuplicateItem {
+                        duplicated_item: "return_arm",
+                        item_type: "handle_arm",
+                        context_name: "",
+                        context_type: "handle expression",
+                    });
+                    continue;
+                }
+                let binding = arm
+                    .required_child("binding", errors)
+                    .and_then(|node| parse_soft_binding(node, errors));
+                let expr = arm
+                    .required_child("expr", errors)
+                    .and_then(|node| parse_expr(node, errors));
+                if let (Some(binding), Some(expr)) = (binding, expr) {
+                    return_arm = Some((binding, Box::new(expr)));
+                }
+            }
+            "op_arm" => {
+                // TODO: Use effect name once handled in AST.
+                // let effect_name = node
+                //     .optional_child("effect_name", errors)
+                //     .map(|node| node.text());
+                let op_name = arm
+                    .required_child("op_name", errors)
+                    .map(|node| node.text().to_string());
+                let binding = arm
+                    .required_child("binding", errors)
+                    .and_then(|node| parse_soft_binding(node, errors));
+                let expr = arm
+                    .required_child("expr", errors)
+                    .and_then(|node| parse_expr(node, errors));
+                if let (Some(op_name), Some(binding), Some(expr)) = (op_name, binding, expr) {
+                    op_arms.push(HandleOpArm {
+                        op_name: op_name.to_string(),
+                        performed_variable: binding,
+                        body: expr,
+                    })
+                }
+            }
+            found => {
+                errors.push(ParseError::UnexpectedNodeType {
+                    expected: "handle arm",
+                    found,
+                    node_text: arm.text(),
+                });
+            }
+        }
+    }
+    Some(Expression::Handle {
+        co: Box::new(coroutine),
+        return_arm,
+        op_arms,
+        ty: Type::unknown(),
+    })
 }
 
 fn parse_struct_literal<'s>(
@@ -1367,6 +1438,63 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
+            }
+            .into()])),
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn handle_expr() {
+        let source_code = r#"
+        fn main() {
+            foo() handle {
+                return x => bar(x, x),
+                foo(mut y: unit) => baz(y),
+                bar(z) => z(1),
+            }
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            return_type: Type::unit(),
+            body: Some(block_expr(vec![Expression::Handle {
+                co: Box::new(call_expr("foo", vec![])),
+                return_arm: Some((
+                    SoftBinding {
+                        name: "x".to_string(),
+                        mutable: false,
+                        ty: None,
+                    },
+                    Box::new(call_expr("bar", vec!["x".into(), "x".into()])),
+                )),
+                op_arms: vec![
+                    HandleOpArm {
+                        op_name: "foo".to_string(),
+                        performed_variable: SoftBinding {
+                            name: "y".to_string(),
+                            mutable: true,
+                            ty: Some(Type::unit()),
+                        },
+                        body: call_expr("baz", vec!["y".into()]),
+                    },
+                    HandleOpArm {
+                        op_name: "bar".to_string(),
+                        performed_variable: SoftBinding {
+                            name: "z".to_string(),
+                            ty: None,
+                            mutable: false,
+                        },
+                        body: call_expr("z", vec![1.into()]),
+                    },
+                ],
+                ty: Type::unknown(),
             }
             .into()])),
         })]));
