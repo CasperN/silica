@@ -152,6 +152,7 @@ module.exports = grammar({
       $.lambda_expression,
       $.block_expression,
       $.co_expression,
+      $.struct_literal_expression,
       $._primary_expression,
       // Add binary/unary operators with precedence later
     ),
@@ -193,6 +194,17 @@ module.exports = grammar({
         field("statements", repeat($._statement)),
         field("final_expression", optional($._expression)),
       '}'
+    ),
+
+    // Higher precedence than identifiers.
+    struct_literal_expression: $ => prec(14, seq(
+      field("name", $.identifier),
+      delimited("{", field("fields", $.struct_field), ",", "}"),
+    )),
+    struct_field: $ => seq(
+      field("name", $.identifier),
+      ":",
+      field("value", $._expression),
     ),
 
     perform_expression: $ => seq(

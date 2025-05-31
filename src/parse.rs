@@ -563,6 +563,7 @@ fn parse_expr<'s>(
                 .and_then(|node| parse_expr(node, errors))
                 .map(|e| Expression::Co(Box::new(e), Type::unknown(), OpSet::empty_extensible()))
         }
+        "struct_literal_expression" => parse_struct_literal(node, errors),
         // Potentially handle _primary_expression or _l_value if needed by grammar structure
         _ => {
             errors.push(ParseError::UnexpectedNodeType {
@@ -573,6 +574,40 @@ fn parse_expr<'s>(
             None
         }
     }
+}
+
+fn parse_struct_literal<'s>(
+    node: SourceNode<'s, '_>,
+    errors: &mut Vec<ParseError<'s>>,
+) -> Option<Expression> {
+    let struct_name = node.required_child("name", errors).map(|n| n.text())?;
+    let mut fields = HashMap::new();
+    for field in node.children_by_field_name("fields", errors) {
+        let field_name = field.required_child("name", errors).map(|f| f.text());
+        let value = field
+            .required_child("value", errors)
+            .and_then(|n| parse_expr(n, errors));
+        if let (Some(field_name), Some(value)) = (field_name, value) {
+            match fields.entry(field_name.to_string()) {
+                Entry::Occupied(_) => {
+                    errors.push(ParseError::DuplicateItem {
+                        duplicated_item: field_name,
+                        item_type: "field",
+                        context_name: struct_name,
+                        context_type: "struct",
+                    });
+                }
+                Entry::Vacant(e) => {
+                    e.insert(value);
+                }
+            }
+        }
+    }
+    Some(Expression::LiteralStruct {
+        name: struct_name.to_string(),
+        fields,
+        ty: Type::unknown(),
+    })
 }
 
 fn parse_perform_expression<'s>(
@@ -1266,6 +1301,74 @@ mod tests {
             args: vec![],
             return_type: Type::unit(),
             body: Some(block_expr(vec![co_expr(call_expr("foo", vec![])).into()])),
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+
+    #[test]
+    fn struct_literal_expression() {
+        let source_code = r#"
+        fn main() {
+            Foo { foo: 1, bar: true }
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            return_type: Type::unit(),
+            body: Some(block_expr(vec![Expression::LiteralStruct {
+                name: "Foo".to_string(),
+                ty: Type::unknown(),
+                fields: [
+                    ("foo".to_string(), 1.into()),
+                    ("bar".to_string(), true.into()),
+                ]
+                .into_iter()
+                .collect(),
+            }
+            .into()])),
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn duplicate_field_in_struct_literal() {
+        let source_code = r#"
+        fn main() {
+            Foo { foo: 1, bar: true, bar: true }
+        }
+        "#;
+        let mut errors = vec![];
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![ParseError::DuplicateItem {
+            duplicated_item: "bar",
+            item_type: "field",
+            context_name: "Foo",
+            context_type: "struct",
+        }];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            return_type: Type::unit(),
+            body: Some(block_expr(vec![Expression::LiteralStruct {
+                name: "Foo".to_string(),
+                ty: Type::unknown(),
+                fields: [
+                    ("foo".to_string(), 1.into()),
+                    ("bar".to_string(), true.into()),
+                ]
+                .into_iter()
+                .collect(),
+            }
+            .into()])),
         })]));
         assert_eq!(parsed, expected_ast);
     }
