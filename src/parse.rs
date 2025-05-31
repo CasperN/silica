@@ -504,6 +504,7 @@ fn parse_statement<'s>(
         "let_statement" => parse_let_statement(node, errors),
         "assignment_statement" => parse_assignment_statement(node, errors),
         "return_statement" => parse_return_statement(node, errors),
+        "resume_statement" => parse_resume_statement(node, errors),
         "expression_statement" => parse_expression_statement(node, errors),
         found => {
             errors.push(ParseError::UnexpectedNodeType {
@@ -772,7 +773,7 @@ fn parse_block_expr<'s>(
             statements.push(statement);
         }
     }
-    if let Some(node) = node.required_child("final_expression", errors) {
+    if let Some(node) = node.optional_child("final_expression", errors) {
         if let Some(expr) = parse_expr(node, errors) {
             statements.push(Statement::Expression(expr));
         }
@@ -835,6 +836,15 @@ fn parse_return_statement<'s>(
     node.required_child("value", errors)
         .and_then(|n| parse_expr(n, errors))
         .map(Statement::Return)
+}
+
+fn parse_resume_statement<'s>(
+    node: SourceNode<'s, '_>,
+    errors: &mut Vec<ParseError<'s>>,
+) -> Option<Statement> {
+    node.required_child("value", errors)
+        .and_then(|n| parse_expr(n, errors))
+        .map(Statement::Resume)
 }
 
 fn parse_expression_statement<'s>(
@@ -1450,7 +1460,9 @@ mod tests {
             foo() handle {
                 return x => bar(x, x),
                 foo(mut y: unit) => baz(y),
-                bar(z) => z(1),
+                bar(z) => {
+                    resume z(1);
+                },
             }
         }
         "#;
@@ -1491,7 +1503,7 @@ mod tests {
                             ty: None,
                             mutable: false,
                         },
-                        body: call_expr("z", vec![1.into()]),
+                        body: block_expr(vec![resume_stmt(call_expr("z", vec![1.into()]))]),
                     },
                 ],
                 ty: Type::unknown(),

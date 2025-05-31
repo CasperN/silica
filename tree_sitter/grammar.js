@@ -113,6 +113,7 @@ module.exports = grammar({
       $.let_statement,
       $.assignment_statement,
       $.return_statement,
+      $.resume_statement,
       $.expression_statement
       // Add perform, handle statements later
     ),
@@ -134,6 +135,11 @@ module.exports = grammar({
 
     return_statement: $ => seq(
       'return',
+      field('value', $._expression),
+      ';'
+    ),
+    resume_statement: $ => seq(
+      'resume',
       field('value', $._expression),
       ';'
     ),
@@ -169,8 +175,8 @@ module.exports = grammar({
     variable: $ => $._l_value,
 
     _l_value: $ => choice(
-        // TODO: Deref, Field access, etc.
-        $.identifier
+      // TODO: Deref, Field access, etc.
+      $.identifier
     ),
 
     call_expression: $ => prec.left(1, seq(
@@ -192,8 +198,8 @@ module.exports = grammar({
 
     block_expression: $ => seq(
       '{',
-        field("statements", repeat($._statement)),
-        field("final_expression", optional($._expression)),
+      field("statements", repeat($._statement)),
+      field("final_expression", optional($._expression)),
       '}'
     ),
 
@@ -211,15 +217,15 @@ module.exports = grammar({
     ),
 
     perform_expression: $ => seq(
-        'perform',
-        optional(seq(
-          field('effect_name', $.identifier),
-          "."
-        )),
-        field("op_name", $.identifier),
-        '(',
-        field('argument', $._expression),
-        ')',
+      'perform',
+      optional(seq(
+        field('effect_name', $.identifier),
+        "."
+      )),
+      field("op_name", $.identifier),
+      '(',
+      field('argument', $._expression),
+      ')',
     ),
     co_expression: $ => prec.right(1, seq("co", $._expression)),
 
@@ -230,7 +236,7 @@ module.exports = grammar({
       "handle",
       // TODO: initially arm, finally arm, and return arm.
       delimited(
-        "{", 
+        "{",
         field("arms", choice($.return_arm, $.op_arm)),
         ",",
         "}"
@@ -278,13 +284,13 @@ module.exports = grammar({
 
     // Soft binding used in `let` and lambda parameters
     soft_binding: $ => seq(
-        optional('mut'),
-        field('name', $.identifier),
-        optional(seq(':', field('type', $._type)))
+      optional('mut'),
+      field('name', $.identifier),
+      optional(seq(':', field('type', $._type)))
     ),
 
     // TODO: Consider constraining params, e.g. T: MyTrait.
-    generic_parameter_list: $ =>  delimited("<", field("parameter_name", $.identifier), ",", ">"),
+    generic_parameter_list: $ => delimited("<", field("parameter_name", $.identifier), ",", ">"),
 
   }
 });
