@@ -566,6 +566,7 @@ fn parse_expr<'s>(
         }
         "struct_literal_expression" => parse_struct_literal(node, errors),
         "handle_expression" => parse_handle_expression(node, errors),
+        "field_access_expression" => parse_field_access(node, errors),
         // Potentially handle _primary_expression or _l_value if needed by grammar structure
         _ => {
             errors.push(ParseError::UnexpectedNodeType {
@@ -576,6 +577,22 @@ fn parse_expr<'s>(
             None
         }
     }
+}
+
+fn parse_field_access<'s>(
+    node: SourceNode<'s, '_>,
+    errors: &mut Vec<ParseError<'s>>,
+) -> Option<Expression> {
+    let obj = node
+        .required_child("object", errors)
+        .and_then(|node| parse_expr(node, errors))?;
+    let field = node
+        .required_child("field", errors)
+        .map(|node| node.text().to_string())?;
+    Some(Expression::L(
+        LValue::Field(Box::new(obj), field),
+        Type::unknown(),
+    ))
 }
 
 fn parse_handle_expression<'s>(
@@ -1508,6 +1525,31 @@ mod tests {
                 ],
                 ty: Type::unknown(),
             }
+            .into()])),
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn field_access() {
+        let source_code = r#"
+        fn main() {
+            foo().bar
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            return_type: Type::unit(),
+            body: Some(block_expr(vec![Expression::L(
+                LValue::Field(Box::new(call_expr("foo", vec![])), "bar".to_string()),
+                Type::unknown(),
+            )
             .into()])),
         })]));
         assert_eq!(parsed, expected_ast);

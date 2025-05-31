@@ -159,6 +159,7 @@ module.exports = grammar({
       $.block_expression,
       $.co_expression,
       $.struct_literal_expression,
+      $.field_access_expression,
       $.handle_expression,
       $._primary_expression,
       // Add binary/unary operators with precedence later
@@ -202,6 +203,13 @@ module.exports = grammar({
       field("final_expression", optional($._expression)),
       '}'
     ),
+
+
+    field_access_expression: $ => prec.left(25, seq(
+      field('object', $._expression),
+      '.',
+      field('field', $.identifier)
+    )),
 
     // Higher precedence than identifiers.
     // if identifier { ... }  is ambiguous between. 
