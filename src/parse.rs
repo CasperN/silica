@@ -169,7 +169,6 @@ impl<'t, 's> SourceNode<'s, 't> {
     }
 }
 
-// TODO: Some of these strings can be borrowed.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseError<'source> {
     UnexpectedNodeType {
@@ -201,7 +200,7 @@ pub enum ParseError<'source> {
         text: &'source str,
     },
     NoTree,
-    UnknownPrimitiveType(String),
+    UnknownPrimitiveType(&'source str),
 }
 
 // Helper type alias for results
@@ -466,7 +465,7 @@ fn parse_type<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) ->
                 "bool" => Some(Type::bool_()),
                 "unit" => Some(Type::unit()),
                 other => {
-                    errors.push(ParseError::UnknownPrimitiveType(other.to_string()));
+                    errors.push(ParseError::UnknownPrimitiveType(other));
                     None
                 }
             }
