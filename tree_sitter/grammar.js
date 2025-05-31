@@ -8,11 +8,16 @@
 // @ts-check
 
 function sepBy1(sep, rule) {
-  return seq(rule, repeat(seq(sep, rule)));
+  return seq(rule, repeat(seq(sep, rule)), optional(sep));
 }
 
 function sepBy(sep, rule) {
   return optional(sepBy1(sep, rule));
+}
+
+// A delimited list where the start and end are required and there may be a trailing seperator.
+function delimited(start, rule, sep, end) {
+  return seq(start, sepBy(sep, rule), end);
 }
 
 module.exports = grammar({
@@ -24,16 +29,14 @@ module.exports = grammar({
     $.comment,
   ],
 
-  // Rules definition
   rules: {
-    // Top-level rule: a source file contains zero or more declarations
     source_file: $ => repeat($._declaration),
 
     _declaration: $ => choice(
       $.function_declaration,
       $.struct_declaration,
       $.effect_declaration
-      // Add rules for enum, trait declarations later
+      // TODO: coroutine_declaration.
     ),
 
     // --- Effect Declaration ---
@@ -41,10 +44,7 @@ module.exports = grammar({
       'effect',
       field('name', $.identifier),
       field('parameters', optional($.generic_parameter_list)),
-      '{',
-      optional(sepBy(',', $.operation_signature)),
-      optional(','), // Optional trailing comma for the operations list itself
-      '}'
+      delimited("{", $.operation_signature, ",", "}")
     ),
 
     operation_signature: $ => seq(
@@ -60,15 +60,9 @@ module.exports = grammar({
       'fn',
       field('name', $.identifier),
       field('parameters', optional($.generic_parameter_list)),
-      field('args', $.fn_args),
+      delimited('(', field("args", $.fn_arg), ',', ')'),
       optional(seq('->', field('return_type', $._type))),
       field('body', choice($.block_expression, ';'))
-    ),
-
-    fn_args: $ => seq(
-      '(',
-      optional(sepBy(',', $.fn_arg)),
-      ')'
     ),
 
     fn_arg: $ => seq( // Corresponds to TypedBinding
@@ -83,20 +77,11 @@ module.exports = grammar({
       'struct',
       field('name', $.identifier),
       field('parameters', optional($.generic_parameter_list)),
-      field('fields', $.struct_field_list),
+      delimited("{", field('fields', $.struct_field_declaration), ",", "}"),
       // TODO: What about unit structs?
     ),
 
-
-    struct_field_list: $ => seq(
-      '{',
-      optional(sepBy(',', $.struct_field_declaration)),
-      optional(','), // Optional trailing comma for the field list itself
-      '}'
-    ),
-
     struct_field_declaration: $ => seq(
-      // TODO: Add visibility modifiers (pub, etc.) later if needed
       field('name', $.identifier),
       ':',
       field('type', $._type)
@@ -116,11 +101,9 @@ module.exports = grammar({
 
     function_type: $ => seq(
       'fn',
-      '(',
-      optional(sepBy(',', $._type)),
-      ')',
+      delimited("(", field("arg_types", $._type), ",", ")"),
       '->',
-      $._type
+      field("return_type", $._type),
     ),
 
     named_type: $ => $.identifier, // Simple identifier for now
@@ -140,13 +123,6 @@ module.exports = grammar({
       '=',
       field('value', $._expression),
       ';'
-    ),
-
-    // Soft binding used in `let` and lambda parameters
-    soft_binding: $ => seq(
-        optional('mut'),
-        field('name', $.identifier),
-        optional(seq(':', field('type', $._type)))
     ),
 
     assignment_statement: $ => seq(
@@ -189,19 +165,14 @@ module.exports = grammar({
     variable: $ => $._l_value,
 
     _l_value: $ => choice(
+        // TODO: Deref, Field access, etc.
         $.identifier
     ),
 
     call_expression: $ => prec.left(1, seq(
       field('function', $._expression),
-      field('arguments', $.argument_list)
+      delimited("(", field("call_args", $._expression), ",", ")")
     )),
-
-    argument_list: $ => seq(
-        '(',
-        optional(sepBy(',', $._expression)),
-        ')'
-    ),
 
     if_expression: $ => seq(
       'if',
@@ -211,13 +182,9 @@ module.exports = grammar({
     ),
 
     lambda_expression: $ => seq(
-      '|',
-      field('lambda_args', optional($.soft_bindings)),
-      '|',
-      field('body', $._expression)
+      delimited("|", field("lambda_args", $.soft_binding), ",", "|"),
+      field('body', $._expression),
     ),
-
-    soft_bindings: $ => sepBy1(',', $.soft_binding),
 
     block_expression: $ => seq(
       '{',
@@ -258,14 +225,17 @@ module.exports = grammar({
     // --- Comment ---
     comment: $ => token(seq('//', /.*/)),
 
-    // Other helpers. 
-    generic_parameter_list: $ => seq(
-      '<',
-      sepBy1(',', field('parameter_name', $.identifier)), // Simple identifiers for generic params for now
-                                                          // Could be $._type for bounds later: T: MyTrait
-      optional(','), // Optional trailing comma
-      '>'
+    // --- Other helpers ---
+
+    // Soft binding used in `let` and lambda parameters
+    soft_binding: $ => seq(
+        optional('mut'),
+        field('name', $.identifier),
+        optional(seq(':', field('type', $._type)))
     ),
+
+    // TODO: Consider constraining params, e.g. T: MyTrait.
+    generic_parameter_list: $ =>  delimited("<", field("parameter_name", $.identifier), ",", ">"),
 
   }
 });

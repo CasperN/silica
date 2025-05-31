@@ -55,6 +55,12 @@ struct SourceNode<'source, 'tree> {
     source: &'source str,
     node: Node<'tree>,
 }
+impl<'s, 't> std::fmt::Debug for SourceNode<'s, 't> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {:?}", self.kind(), self.text())
+    }
+}
+
 impl<'t, 's> SourceNode<'s, 't> {
     fn new(node: Node<'t>, source: &'s str, errors: &mut Vec<ParseError<'s>>) -> Option<Self> {
         if node.is_error() || node.is_missing() {
@@ -296,17 +302,18 @@ fn parse_fn_decl<'s>(
         .map(|n| parse_generic_params(n, errors))
         .unwrap_or_default();
 
-    let args = node
-        .required_child("args", errors)
-        .map(|n| parse_fn_arg_list(n, errors))
-        .unwrap_or_default();
+    let mut args = Vec::new();
+    for arg in node.children_by_field_name("args", errors) {
+        if let Some(binding) = parse_typed_binding(arg, errors) {
+            args.push(binding);
+        }
+    }
 
     let return_type = node
         .optional_child("return_type", errors)
         .and_then(|n| parse_type(n, errors))
         .unwrap_or(Type::unit());
 
-    // Check if body is ';' (external) or a block expression
     let body = node
         .required_child("body", errors)
         .and_then(|body_node| match body_node.kind() {
@@ -321,6 +328,7 @@ fn parse_fn_decl<'s>(
                 None
             }
         });
+
     name.map(|name| {
         Declaration::Fn(FnDecl {
             forall: params,
@@ -343,26 +351,23 @@ fn parse_struct_decl<'s>(
         .unwrap_or_default();
 
     let mut fields = HashMap::new();
-    if let Some(fields_node) = node.required_child("fields", errors) {
-        for field_node in fields_node.children(errors) {
-            if field_node.kind() == "struct_field_declaration" {
-                let (field_name, field_type) = match parse_struct_field(field_node, errors) {
-                    Some((f, t)) => (f, t),
-                    None => continue,
-                };
-
-                match fields.entry(field_name.to_string()) {
-                    Entry::Occupied(_) => {
-                        errors.push(ParseError::DuplicateItem {
-                            duplicated_item: field_name,
-                            item_type: "field",
-                            context_name: struct_name.unwrap_or_default(),
-                            context_type: "struct",
-                        });
-                    }
-                    Entry::Vacant(e) => {
-                        e.insert(field_type);
-                    }
+    for field_node in node.children_by_field_name("fields", errors) {
+        if field_node.kind() == "struct_field_declaration" {
+            let (field_name, field_type) = match parse_struct_field(field_node, errors) {
+                Some((f, t)) => (f, t),
+                None => continue,
+            };
+            match fields.entry(field_name.to_string()) {
+                Entry::Occupied(_) => {
+                    errors.push(ParseError::DuplicateItem {
+                        duplicated_item: field_name,
+                        item_type: "field",
+                        context_name: struct_name.unwrap_or_default(),
+                        context_type: "struct",
+                    });
+                }
+                Entry::Vacant(e) => {
+                    e.insert(field_type);
                 }
             }
         }
@@ -416,38 +421,25 @@ fn parse_generic_params<'s>(
     params
 }
 
-fn parse_fn_arg_list<'s>(
+fn parse_typed_binding<'s>(
     node: SourceNode<'s, '_>,
     errors: &mut Vec<ParseError<'s>>,
-) -> Vec<TypedBinding> {
-    let mut args = Vec::new();
-    for child in node.children(errors) {
-        if matches!(child.kind(), "(" | "," | ")") {
-            continue;
-        }
-        if child.kind() != "fn_arg" {
-            errors.push(ParseError::UnexpectedNodeType {
-                expected: "fn_arg",
-                found: child.kind(),
-                node_text: child.text(),
-            });
-            continue;
-        }
-        let mutable = child
-            .optional_child_by_id(0, errors)
-            .map_or(false, |n| n.kind() == "mut");
-        let name = child
-            .required_child("name", errors)
-            .map(|n| n.text().to_string());
-        let ty = child
-            .required_child("type", errors)
-            .and_then(|n| parse_type(n, errors));
+) -> Option<TypedBinding> {
+    let mutable = node
+        .optional_child_by_id(0, errors)
+        .map_or(false, |n| n.kind() == "mut");
+    let name = node
+        .required_child("name", errors)
+        .map(|n| n.text().to_string());
+    let ty = node
+        .required_child("type", errors)
+        .and_then(|n| parse_type(n, errors));
 
-        if let (Some(name), Some(ty)) = (name, ty) {
-            args.push(TypedBinding { name, ty, mutable });
-        }
-    }
-    args
+    Some(TypedBinding {
+        name: name?,
+        ty: ty?,
+        mutable,
+    })
 }
 
 // --- Type Parsing ---
@@ -481,34 +473,14 @@ fn parse_type<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) ->
         }
         "function_type" => {
             let mut arg_types = Vec::new();
-            let mut return_type = Type::unit();
-            let mut found_arrow = false;
-            for child in node.children(errors) {
-                match child.kind() {
-                    "fn" | "(" | "," | ")" => {}
-                    "->" => {
-                        found_arrow = true;
-                    }
-                    // TODO: Is thie comprehensive or correct?
-                    "primitive_type" | "function_type" | "named_type" | "_type" => {
-                        if found_arrow {
-                            if let Some(ty) = parse_type(child, errors) {
-                                return_type = ty;
-                            }
-                        } else if let Some(ty) = parse_type(child, errors) {
-                            arg_types.push(ty);
-                            // TODO: Some kind of unknown type placeholder?
-                        }
-                    }
-                    found => {
-                        errors.push(ParseError::UnexpectedNodeType {
-                            expected: "type",
-                            found,
-                            node_text: child.text(),
-                        });
-                    }
+            for a in node.children_by_field_name("arg_types", errors) {
+                if let Some(t) = parse_type(a, errors) {
+                    arg_types.push(t);
                 }
             }
+            let return_type = node
+                .required_child("return_type", errors)
+                .and_then(|n| parse_type(n, errors))?;
             Some(Type::func(arg_types, return_type))
         }
         // TODO: Named type support
@@ -795,11 +767,10 @@ fn parse_lambda_expr<'s>(
     errors: &mut Vec<ParseError<'s>>,
 ) -> Option<Expression> {
     let mut bindings = Vec::new();
-    for child in node.required_child("lambda_args", errors)?.children(errors) {
-        if child.kind() == "soft_binding" {
-            if let Some(b) = parse_soft_binding(child, errors) {
-                bindings.push(b);
-            }
+    for child in node.children_by_field_name("lambda_args", errors) {
+        dbg!(child.kind());
+        if let Some(b) = parse_soft_binding(child, errors) {
+            bindings.push(b);
         }
     }
     let body = node
@@ -822,11 +793,9 @@ fn parse_call_expr<'s>(
         .and_then(|n| parse_expr(n, errors))
         .map(Box::new);
     let mut arg_exprs = Vec::new();
-    for child in node.required_child("arguments", errors)?.children(errors) {
-        if !matches!(child.kind(), "(" | ")" | ",") {
-            if let Some(expr) = parse_expr(child, errors) {
-                arg_exprs.push(expr);
-            }
+    for child in node.children_by_field_name("call_args", errors) {
+        if let Some(expr) = parse_expr(child, errors) {
+            arg_exprs.push(expr);
         }
     }
     fn_expr.map(|fn_expr| Expression::Call {
@@ -1128,7 +1097,7 @@ mod tests {
         let parsed = parse_ast_program(source_code, &mut errors);
 
         let expected_errors = vec![ParseError::Unparsable {
-            context_kind: "struct_field_list",
+            context_kind: "struct_declaration",
             text: "garbage borked 123 tokens",
         }];
         assert_eq!(errors, expected_errors);
