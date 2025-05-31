@@ -554,6 +554,11 @@ fn parse_expr<'s>(
             parse_expr(node.required_child_by_id(1, errors)?, errors)
         }
         "perform_expression" => parse_perform_expression(node, errors),
+        "propagate_expression" => {
+            node.required_child_by_id(0, errors)
+            .and_then(|node|parse_expr(node, errors))
+            .map(|e| Expression::Propagate(Box::new(e), Type::unknown()))
+        }
         // Potentially handle _primary_expression or _l_value if needed by grammar structure
         _ => {
             errors.push(ParseError::UnexpectedNodeType {
@@ -1215,6 +1220,27 @@ mod tests {
             args: vec![],
             return_type: Type::unit(),
             body: Some(block_expr(vec![perform_anon("foo", ()).into()])),
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn propagate_expression() {
+        let source_code = r#"
+        fn main() {
+            foo()?
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            return_type: Type::unit(),
+            body: Some(block_expr(vec![propagate(call_expr("foo", vec![])).into()])),
         })]));
         assert_eq!(parsed, expected_ast);
     }

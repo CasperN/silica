@@ -147,6 +147,7 @@ module.exports = grammar({
     _expression: $ => choice(
       $.perform_expression,
       $.call_expression,
+      $.propagate_expression,
       $.if_expression,
       $.lambda_expression,
       $.block_expression,
@@ -204,6 +205,8 @@ module.exports = grammar({
         field('argument', $._expression),
         ')',
     ),
+
+    propagate_expression: $ => prec.left(19, seq($._expression, "?")),
 
     // --- Literals ---
     literal: $ => choice(
