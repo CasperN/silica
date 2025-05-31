@@ -1,7 +1,7 @@
 use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 
 use crate::ast::{
-    Declaration, EffectDecl, Expression, FnDecl, LValue, Program, SoftBinding, Statement,
+    Declaration, EffectDecl, Expression, FnDecl, LValue, OpSet, Program, SoftBinding, Statement,
     StructDecl, Type, TypedBinding,
 };
 use tree_sitter::{Language, Node, Parser};
@@ -554,10 +554,15 @@ fn parse_expr<'s>(
             parse_expr(node.required_child_by_id(1, errors)?, errors)
         }
         "perform_expression" => parse_perform_expression(node, errors),
-        "propagate_expression" => {
-            node.required_child_by_id(0, errors)
-            .and_then(|node|parse_expr(node, errors))
-            .map(|e| Expression::Propagate(Box::new(e), Type::unknown()))
+        "propagate_expression" => node
+            .required_child_by_id(0, errors)
+            .and_then(|node| parse_expr(node, errors))
+            .map(|e| Expression::Propagate(Box::new(e), Type::unknown())),
+        "co_expression" => {
+            // child 0 is "co", child 1 is the actual expression being wrapped.
+            node.required_child_by_id(1, errors)
+                .and_then(|node| parse_expr(node, errors))
+                .map(|e| Expression::Co(Box::new(e), Type::unknown(), OpSet::empty_extensible()))
         }
         // Potentially handle _primary_expression or _l_value if needed by grammar structure
         _ => {
@@ -1241,6 +1246,27 @@ mod tests {
             args: vec![],
             return_type: Type::unit(),
             body: Some(block_expr(vec![propagate(call_expr("foo", vec![])).into()])),
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn co_expression() {
+        let source_code = r#"
+        fn main() {
+            co foo()
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Fn(FnDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            return_type: Type::unit(),
+            body: Some(block_expr(vec![co_expr(call_expr("foo", vec![])).into()])),
         })]));
         assert_eq!(parsed, expected_ast);
     }

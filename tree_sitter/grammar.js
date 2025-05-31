@@ -151,7 +151,8 @@ module.exports = grammar({
       $.if_expression,
       $.lambda_expression,
       $.block_expression,
-      $._primary_expression
+      $.co_expression,
+      $._primary_expression,
       // Add binary/unary operators with precedence later
     ),
 
@@ -205,6 +206,7 @@ module.exports = grammar({
         field('argument', $._expression),
         ')',
     ),
+    co_expression: $ => seq("co", $._expression),
 
     propagate_expression: $ => prec.left(19, seq($._expression, "?")),
 

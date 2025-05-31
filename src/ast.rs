@@ -311,7 +311,7 @@ impl OpSet {
     fn empty_non_extensible() -> Self {
         Self::new(OpSetI::empty_non_extensible())
     }
-    fn empty_extensible() -> Self {
+    pub fn empty_extensible() -> Self {
         Self::new(OpSetI::empty())
     }
     fn is_empty(&self) -> bool {
