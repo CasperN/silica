@@ -1,8 +1,8 @@
 use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 
 use crate::ast::{
-    Declaration, EffectDecl, Expression, FnDecl, HandleOpArm, LValue, OpSet, Program, SoftBinding,
-    Statement, StructDecl, Type, TypedBinding,
+    CoDecl, Declaration, EffectDecl, Expression, FnDecl, HandleOpArm, LValue, OpSet, OpSetI,
+    Program, SoftBinding, Statement, StructDecl, Type, TypedBinding,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -218,6 +218,7 @@ pub fn parse_ast_program<'s>(source: &'s str, errors: &mut Vec<ParseError<'s>>) 
             "function_declaration" => parse_fn_decl(child, errors),
             "struct_declaration" => parse_struct_decl(child, errors),
             "effect_declaration" => parse_effect_decl(child, errors),
+            "coroutine_declaration" => parse_co_decl(child, errors),
             other_kind => {
                 errors.push(ParseError::UnexpectedNodeType {
                     expected: "function/struct/effect declaration",
@@ -337,6 +338,94 @@ fn parse_fn_decl<'s>(
             body,
         })
     })
+}
+fn parse_co_decl<'s>(
+    node: SourceNode<'s, '_>,
+    errors: &mut Vec<ParseError<'s>>,
+) -> Option<Declaration> {
+    let name = node.required_child("name", errors)?.text().to_string();
+    let params = node
+        .optional_child("parameters", errors)
+        .map(|n| parse_generic_params(n, errors))
+        .unwrap_or_default();
+
+    let mut args = Vec::new();
+    for arg in node.children_by_field_name("args", errors) {
+        if let Some(binding) = parse_typed_binding(arg, errors) {
+            args.push(binding);
+        }
+    }
+
+    let return_type = node
+        .optional_child("return_type", errors)
+        .and_then(|n| parse_type(n, errors))
+        .unwrap_or(Type::unit());
+    let ops = node
+        .optional_child("effects", errors)
+        .and_then(|n| parse_effects(n, errors))
+        .unwrap_or(OpSetI::empty_non_extensible());
+
+    let body = node
+        .required_child("body", errors)
+        .and_then(|body_node| match body_node.kind() {
+            "block_expression" => parse_block_expr(body_node, errors),
+            ";" => None, // External function
+            found => {
+                errors.push(ParseError::UnexpectedNodeType {
+                    expected: "block_expression or ;",
+                    found,
+                    node_text: body_node.text(),
+                });
+                None
+            }
+        });
+
+    Some(Declaration::Co(CoDecl {
+        forall: params,
+        name,
+        args,
+        return_type,
+        ops,
+        body,
+    }))
+}
+
+fn parse_effects<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) -> Option<OpSetI> {
+    let mut anonymous_ops = Vec::new();
+    for e in node.children_by_field_name("effects", errors) {
+        match e.kind() {
+            "anonymous_op_type" => {
+                let op_name = e
+                    .required_child("name", errors)
+                    .map(|n| n.text().to_string());
+                let perform_type = e
+                    .required_child("perform_type", errors)
+                    .and_then(|n| parse_type(n, errors));
+                let resume_type = e
+                    .required_child("resume_type", errors)
+                    .and_then(|n| parse_type(n, errors));
+                if let (Some(o), Some(p), Some(r)) = (op_name, perform_type, resume_type) {
+                    anonymous_ops.push((o, p, r));
+                }
+            }
+            found => {
+                errors.push(ParseError::UnexpectedNodeType {
+                    expected: "effect",
+                    found,
+                    node_text: e.text(),
+                });
+            }
+        }
+    }
+    let mut opset = OpSetI::empty();
+    for (name, perform_type, resume_type) in anonymous_ops {
+        // TODO: Unification errors should not happen during parse. For now, we simply die instead
+        // of surfacing such an error. We need to (1) make ast::Type support unresolved types that
+        // the parser can produce, then (2) Convert from such unresolved effects to OpSets later.
+        opset.unify_add_anonymous_effect_or_die(&name, &perform_type, &resume_type);
+    }
+    opset.mark_done_extending();
+    Some(opset)
 }
 
 fn parse_struct_decl<'s>(
@@ -1551,6 +1640,54 @@ mod tests {
                 Type::unknown(),
             )
             .into()])),
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn co_function() {
+        let source_code = r#"
+        co main() -> unit ! foo(i64 -> f64);
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let mut ops = OpSetI::empty();
+        ops.unify_add_anonymous_effect_or_die("foo", &Type::int(), &Type::float())
+            .mark_done_extending();
+
+        let expected_errors = vec![];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Co(CoDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            ops,
+            return_type: Type::unit(),
+            body: None,
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn co_function_implicit_return_type() {
+        let source_code = r#"
+        co main() ! foo(i64 -> f64);
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let mut ops = OpSetI::empty();
+        ops.unify_add_anonymous_effect_or_die("foo", &Type::int(), &Type::float())
+            .mark_done_extending();
+
+        let expected_errors = vec![];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Co(CoDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            ops,
+            return_type: Type::unit(),
+            body: None,
         })]));
         assert_eq!(parsed, expected_ast);
     }

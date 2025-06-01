@@ -374,7 +374,7 @@ impl OpSetI {
         x.mark_done_extending();
         x
     }
-    fn mark_done_extending(&mut self) -> &mut Self {
+    pub fn mark_done_extending(&mut self) -> &mut Self {
         self.done_extending = true;
         self
     }
@@ -437,6 +437,17 @@ impl OpSetI {
         } else {
             panic!("Expected {effect_name} effect in {self:?}");
         }
+    }
+
+    // TODO: Should not be public. Made public as a hack to construct OpSets in the parser.
+    pub fn unify_add_anonymous_effect_or_die(
+        &mut self,
+        name: &str,
+        perform_type: &Type,
+        resume_type: &Type,
+    ) -> &mut Self {
+        self.unify_add_anonymous_effect(name, perform_type, resume_type)
+            .unwrap()
     }
 
     fn unify_add_anonymous_effect(

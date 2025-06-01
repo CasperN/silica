@@ -35,8 +35,8 @@ module.exports = grammar({
     _declaration: $ => choice(
       $.function_declaration,
       $.struct_declaration,
-      $.effect_declaration
-      // TODO: coroutine_declaration.
+      $.effect_declaration,
+      $.coroutine_declaration,
     ),
 
     // --- Effect Declaration ---
@@ -60,16 +60,20 @@ module.exports = grammar({
       'fn',
       field('name', $.identifier),
       field('parameters', optional($.generic_parameter_list)),
-      delimited('(', field("args", $.fn_arg), ',', ')'),
+      delimited('(', field("args", $.typed_binding), ',', ')'),
       optional(seq('->', field('return_type', $._type))),
       field('body', choice($.block_expression, ';'))
     ),
 
-    fn_arg: $ => seq( // Corresponds to TypedBinding
-      optional('mut'),
+    // --- Coroutine Declaration ---
+    coroutine_declaration: $ => seq(
+      'co',
       field('name', $.identifier),
-      ':',
-      field('type', $._type)
+      field('parameters', optional($.generic_parameter_list)),
+      delimited('(', field("args", $.typed_binding), ',', ')'),
+      optional(seq('->', field('return_type', $._type))),
+      optional(field('effects', $.effects)),
+      field('body', choice($.block_expression, ';'))
     ),
 
     // --- Struct Declaration ---
@@ -290,15 +294,37 @@ module.exports = grammar({
 
     // --- Other helpers ---
 
-    // Soft binding used in `let` and lambda parameters
     soft_binding: $ => seq(
       optional('mut'),
       field('name', $.identifier),
       optional(seq(':', field('type', $._type)))
     ),
 
-    // TODO: Consider constraining params, e.g. T: MyTrait.
+    typed_binding: $ => seq(
+      optional('mut'),
+      field('name', $.identifier),
+      ':',
+      field('type', $._type)
+    ),
+
+    // TODO: Constraining params, e.g. T: MyTrait.
     generic_parameter_list: $ => delimited("<", field("parameter_name", $.identifier), ",", ">"),
 
+    _effect_type: $ => choice(
+      $.anonymous_op_type,
+    ),
+    anonymous_op_type: $ => seq(
+      field("name", $.identifier),
+      "(",
+      field("perform_type", $._type),
+      "->",
+      field("resume_type", $._type),
+      ")"
+    ),
+
+    effects: $ => seq(
+      "!",
+      sepBy(",", field("effects", $._effect_type)),
+    ),
   }
 });
