@@ -1,8 +1,8 @@
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 use crate::ast::{
-    Binding, CoDecl, Declaration, EffectDecl, Expression, FnDecl, HandleOpArm, LValue, OpSet,
-    OpSetI, Program, Statement, StructDecl, Type,
+    Binding, CoDecl, Declaration, Expression, FnDecl, HandleOpArm, LValue, OpSet, OpSetI, Program,
+    Statement, Type,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -236,6 +236,9 @@ pub enum ParsedOp {
     },
 }
 impl ParsedOp {
+    pub fn anon(name: &str, p: ParsedType, r: ParsedType) -> Self {
+        Self::Anonymous(name.to_string(), p, r)
+    }
     // Does not contain ParsedType::Unspecified.
     fn is_specified(&self) -> bool {
         match self {
@@ -290,6 +293,13 @@ impl ParsedStructDecl {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParsedEffectDecl {
+    pub name: String,
+    pub params: Vec<String>,
+    pub ops: Vec<ParsedOp>,
+}
+
 // *************************************************************************************************
 //  Parse functions
 // *************************************************************************************************
@@ -335,7 +345,8 @@ fn parse_effect_decl<'s>(
         .map(|n| parse_generic_params(n, errors))
         .unwrap_or_default();
 
-    let mut ops = HashMap::new();
+    let mut seen_anonymous_ops = HashSet::new();
+    let mut ops = Vec::new();
     for child_node in node.children(errors) {
         if child_node.kind() == "operation_signature" {
             let op_name = child_node
@@ -343,26 +354,23 @@ fn parse_effect_decl<'s>(
                 .map(|n| n.text());
             let perform_type = child_node
                 .required_child("perform_type", errors)
-                .and_then(|n| parse_type(n, errors));
+                .and_then(|n| parse_type2(n, errors));
             let resume_type = child_node
                 .required_child("resume_type", errors)
-                .and_then(|n| parse_type(n, errors));
+                .and_then(|n| parse_type2(n, errors));
 
             if let (Some(op_name), Some(perform_type), Some(resume_type)) =
                 (op_name, perform_type, resume_type)
             {
-                match ops.entry(op_name.to_string()) {
-                    Entry::Occupied(_) => {
-                        errors.push(ParseError::DuplicateItem {
-                            duplicated_item: op_name,
-                            item_type: "operation name",
-                            context_name: name.unwrap_or_default(),
-                            context_type: "effect",
-                        });
-                    }
-                    Entry::Vacant(e) => {
-                        e.insert((perform_type, resume_type));
-                    }
+                if !seen_anonymous_ops.insert(op_name) {
+                    errors.push(ParseError::DuplicateItem {
+                        duplicated_item: op_name,
+                        item_type: "operation name",
+                        context_name: name.unwrap_or_default(),
+                        context_type: "effect",
+                    });
+                } else {
+                    ops.push(ParsedOp::anon(op_name, perform_type, resume_type));
                 }
             }
         } else {
@@ -370,7 +378,7 @@ fn parse_effect_decl<'s>(
         }
     }
     name.map(|name| {
-        Declaration::Effect(EffectDecl {
+        Declaration::Effect(ParsedEffectDecl {
             name: name.to_string(),
             params,
             ops,
@@ -1329,15 +1337,13 @@ mod tests {
     #[test]
     fn declare_effect() {
         let source = r"effect IntState { get: unit -> i64, set: i64 -> unit }";
-        let program = Program(vec![Declaration::Effect(EffectDecl {
+        let program = Program(vec![Declaration::Effect(ParsedEffectDecl {
             name: "IntState".to_string(),
             params: vec![],
-            ops: [
-                ("get".to_string(), (Type::unit(), Type::int())),
-                ("set".to_string(), (Type::int(), Type::unit())),
-            ]
-            .into_iter()
-            .collect(),
+            ops: vec![
+                ParsedOp::anon("get", ParsedType::Unit, ParsedType::Int),
+                ParsedOp::anon("set", ParsedType::Int, ParsedType::Unit),
+            ],
         })]);
         let mut errors = vec![];
         let parsed = parse_ast_program(source, &mut errors);
@@ -1348,15 +1354,13 @@ mod tests {
     #[test]
     fn declare_generic_effect() {
         let source = r"effect State<T> { get: unit -> T, set: T -> unit }";
-        let program = Program(vec![Declaration::Effect(EffectDecl {
+        let program = Program(vec![Declaration::Effect(ParsedEffectDecl {
             name: "State".to_string(),
-            params: ["T".to_string()].into_iter().collect(),
-            ops: [
-                ("get".to_string(), (Type::unit(), Type::param("T"))),
-                ("set".to_string(), (Type::param("T"), Type::unit())),
-            ]
-            .into_iter()
-            .collect(),
+            params: vec!["T".to_string()],
+            ops: vec![
+                ParsedOp::anon("get", ParsedType::Unit, ParsedType::named("T")),
+                ParsedOp::anon("set", ParsedType::named("T"), ParsedType::Unit),
+            ],
         })]);
         let mut errors = vec![];
         let parsed = parse_ast_program(source, &mut errors);
@@ -1471,15 +1475,13 @@ mod tests {
         ];
         assert_eq!(errors, expected_errors);
 
-        let expected_ast = Some(Program(vec![Declaration::Effect(EffectDecl {
+        let expected_ast = Some(Program(vec![Declaration::Effect(ParsedEffectDecl {
             name: "State".to_string(),
-            params: ["T".to_string()].into_iter().collect(),
-            ops: [
-                ("get".to_string(), (Type::unit(), Type::param("T"))),
-                ("set".to_string(), (Type::param("T"), Type::unit())),
-            ]
-            .into_iter()
-            .collect(),
+            params: vec!["T".to_string()],
+            ops: vec![
+                ParsedOp::anon("get", ParsedType::Unit, ParsedType::named("T")),
+                ParsedOp::anon("set", ParsedType::named("T"), ParsedType::Unit),
+            ],
         })]));
         assert_eq!(parsed, expected_ast);
     }

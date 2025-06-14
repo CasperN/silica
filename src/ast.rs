@@ -1,6 +1,6 @@
 // Abstract syntax tree and type checking.
 #![allow(clippy::result_large_err)]
-use crate::parse::{self, ParsedOp, ParsedStructDecl, ParsedType};
+use crate::parse::{self, ParsedEffectDecl, ParsedOp, ParsedStructDecl, ParsedType};
 use crate::union_find::UnionFindRef;
 use std::cell::{Ref, RefMut};
 use std::collections::hash_map::Entry;
@@ -504,16 +504,18 @@ impl OpSetI {
 //  Resolve Types
 // *************************************************************************************************
 
+// TODO: Resolved structs and effects shouldn't have UNSPECIFIED in there.
+
 fn resolve_struct(
     mut shadow: ShadowTypeContext,
-    decl: &ParsedStructDecl,
+    parsed: &ParsedStructDecl,
 ) -> Result<StructDecl, Error> {
     let mut fields = HashMap::new();
-    for param in decl.params.iter() {
+    for param in parsed.params.iter() {
         shadow.insert_type_param(param);
     }
-    for (field_name, field_ty) in decl.fields.iter() {
-        let ty = resolve_type(&shadow.context(), field_ty)?;
+    for (field_name, field_ty) in parsed.fields.iter() {
+        let ty = resolve_type(shadow.context(), field_ty)?;
         if fields.insert(field_name.clone(), ty).is_some() {
             panic!("Duplicate field name {field_name} that should have been caught earlier.");
         }
@@ -521,9 +523,36 @@ fn resolve_struct(
 
     shadow.finish();
     Ok(StructDecl {
-        params: decl.params.clone(),
-        name: decl.name.clone(),
+        params: parsed.params.clone(),
+        name: parsed.name.clone(),
         fields,
+    })
+}
+
+fn resolve_effect(
+    mut shadow: ShadowTypeContext,
+    parsed: &ParsedEffectDecl,
+) -> Result<EffectDecl, Error> {
+    for param in parsed.params.iter() {
+        shadow.insert_type_param(param);
+    }
+    let mut ops = HashMap::new();
+    for op in parsed.ops.iter() {
+        match op {
+            ParsedOp::Anonymous(name, p_ty, r_ty) => {
+                let p_ty = resolve_type(shadow.context(), p_ty)?;
+                let r_ty = resolve_type(shadow.context(), r_ty)?;
+                if ops.insert(name.clone(), (p_ty, r_ty)).is_some() {
+                    panic!("Duplicate anonymous op {name} that should have been caught earlier.");
+                }
+            }
+            ParsedOp::NamedEffect { .. } => todo!(),
+        }
+    }
+    Ok(EffectDecl {
+        name: parsed.name.clone(),
+        params: parsed.params.clone(),
+        ops,
     })
 }
 
@@ -1027,7 +1056,7 @@ pub enum Declaration {
     Fn(FnDecl),
     Co(CoDecl),
     Struct(parse::ParsedStructDecl),
-    Effect(EffectDecl), // enums, traits, etc
+    Effect(parse::ParsedEffectDecl), // enums, traits, etc
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -1744,6 +1773,8 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 }
             }
             Declaration::Effect(effect_declaration) => {
+                let effect_declaration =
+                    resolve_effect(shadow.context().shadow(), effect_declaration)?;
                 let redefined = shadow.define_effect(effect_declaration.clone());
                 if redefined {
                     return Err(Error::DuplicateTopLevelName(
@@ -2858,7 +2889,14 @@ mod tests {
         ops.mark_done_extending();
 
         let program = &mut Program(vec![
-            Declaration::Effect(state_effect),
+            Declaration::Effect(ParsedEffectDecl {
+                name: "State".to_string(),
+                params: vec!["T".to_string()],
+                ops: vec![
+                    ParsedOp::anon("get", ParsedType::Unit, ParsedType::named("T")),
+                    ParsedOp::anon("set", ParsedType::named("T"), ParsedType::Unit),
+                ],
+            }),
             Declaration::Co(CoDecl {
                 forall: vec![],
                 name: "main".to_string(),
