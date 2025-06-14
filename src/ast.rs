@@ -3,7 +3,7 @@
 use crate::union_find::UnionFindRef;
 use std::cell::{Ref, RefMut};
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 // *************************************************************************************************
@@ -35,7 +35,7 @@ enum TypeI {
     Co(Type, OpSet),
 
     // TODO: Consider deleting -- only top level decls should be polymorphic.
-    Forall(BTreeSet<String>, Type),
+    Forall(Vec<String>, Type),
 
     // Unknown type variable. Unifies with any other type.
     // Should not appear in generic types.
@@ -80,7 +80,7 @@ impl Type {
     pub fn unknown() -> Self {
         Self::new(TypeI::Unknown(vec![]))
     }
-    pub fn forall(params: BTreeSet<String>, ty: Type) -> Self {
+    pub fn forall(params: Vec<String>, ty: Type) -> Self {
         Self::new(TypeI::Forall(params, ty))
     }
     pub fn struct_(s: StructInstance) -> Self {
@@ -212,42 +212,6 @@ impl Type {
     }
     fn is_polymorphic(&self) -> bool {
         matches!(&*self.clone().inner(), TypeI::Forall(_, _))
-    }
-    fn insert_type_params(&self, output: &mut BTreeSet<String>) {
-        match &*self.clone().inner() {
-            TypeI::Int
-            | TypeI::Bool
-            | TypeI::Float
-            | TypeI::Unit
-            | TypeI::Never
-            | TypeI::Unknown(_) => {}
-            TypeI::Param(b) => {
-                output.insert(b.clone());
-            }
-            TypeI::Fn(arg_types, ret_ty) => {
-                for arg_type in arg_types.iter() {
-                    arg_type.insert_type_params(output);
-                }
-                ret_ty.insert_type_params(output);
-            }
-            // Free type variables are only asked for by struct generalization.
-            // but we don't expect generic members.
-            TypeI::Forall(_, _) => panic!(
-                "Free type variables are only asked for by struct generalization... \
-                but we don't expect generic members."
-            ),
-            TypeI::StructInstance(StructInstance { params, decl: _ }) => {
-                for param in params.values() {
-                    param.insert_type_params(output)
-                }
-            }
-            TypeI::Co(ty, ops) => {
-                ty.insert_type_params(output);
-                for ty in ops.clone().inner().iter_types() {
-                    ty.insert_type_params(output);
-                }
-            }
-        }
     }
     // A concrete type will be unchanged under unification.
     fn is_concrete(&self) -> bool {
@@ -669,9 +633,7 @@ fn resolve_type(context: &TypeContext, ty: &ParsedType) -> Result<Type, Error> {
                         decl: decl.clone(),
                     }))
                 }
-                _ => {
-                    Err(Error::ExpectedNamedType(name.clone()))
-                }
+                _ => Err(Error::ExpectedNamedType(name.clone())),
             }
         }
     }
@@ -979,10 +941,10 @@ impl SoftBinding {
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct FnDecl {
-    pub forall: BTreeSet<String>,
+    pub forall: Vec<String>,
     pub name: String,
     pub args: Vec<TypedBinding>,
-    pub return_type: Type,  // TODO: This should be the parsed type...
+    pub return_type: Type, // TODO: This should be the parsed type...
     // If no body is provided, its assumed to be external.
     pub body: Option<Expression>,
 }
@@ -999,7 +961,7 @@ impl FnDecl {
 // A coroutine function.
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct CoDecl {
-    pub forall: BTreeSet<String>,
+    pub forall: Vec<String>,
     pub name: String,
     pub args: Vec<TypedBinding>,
     pub return_type: Type,
@@ -1019,19 +981,16 @@ impl CoDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructDecl {
     pub name: String,
-    pub params: BTreeSet<String>,
+    pub params: Vec<String>,
     pub fields: HashMap<String, Type>,
 }
 impl StructDecl {
-    fn new(name: &str, fields: &[(&str, Type)]) -> Self {
+    fn new(name: &str, fields: &[(&str, Type)], params: &[&str]) -> Self {
         let fields: HashMap<String, Type> = fields
             .iter()
             .map(|(name, ty)| (name.to_string(), ty.clone()))
             .collect();
-        let mut params = BTreeSet::new();
-        for field_type in fields.values() {
-            field_type.insert_type_params(&mut params);
-        }
+        let params = params.iter().map(|p| p.to_string()).collect();
         StructDecl {
             name: name.to_string(),
             params,
@@ -1043,7 +1002,7 @@ impl StructDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectDecl {
     pub name: String,
-    pub params: BTreeSet<String>,
+    pub params: Vec<String>,
     pub ops: HashMap<String, (Type, Type)>,
 }
 impl EffectDecl {
@@ -1212,7 +1171,12 @@ impl<'a> ShadowTypeContext<'a> {
         self.insert_variable(name, ty, mutable);
     }
     fn insert_soft_binding(&mut self, binding: SoftBinding) -> Type {
-        let SoftBinding { name, ty, mutable, parsed_type: _ } = binding;
+        let SoftBinding {
+            name,
+            ty,
+            mutable,
+            parsed_type: _,
+        } = binding;
         self.insert_variable(name, ty.clone(), mutable);
         ty
     }
@@ -1882,10 +1846,7 @@ impl From<LValue> for Statement {
 pub mod test_helpers {
     use super::*;
 
-    pub fn let_stmt(
-        name: &str,
-        value: impl Into<Expression>,
-    ) -> Statement {
+    pub fn let_stmt(name: &str, value: impl Into<Expression>) -> Statement {
         Statement::Let {
             binding: SoftBinding::new(name),
             value: value.into(),
@@ -1898,15 +1859,16 @@ pub mod test_helpers {
         value: impl Into<Expression>,
     ) -> Statement {
         Statement::Let {
-            binding: SoftBinding { name: name.to_string(),
-                parsed_type: ParsedType::Unspecified, ty: type_, mutable },
+            binding: SoftBinding {
+                name: name.to_string(),
+                parsed_type: ParsedType::Unspecified,
+                ty: type_,
+                mutable,
+            },
             value: value.into(),
         }
     }
-    pub fn let_mut_stmt(
-        name: &str,
-        value: impl Into<Expression>,
-    ) -> Statement {
+    pub fn let_mut_stmt(name: &str, value: impl Into<Expression>) -> Statement {
         Statement::Let {
             binding: SoftBinding::new_mut(name),
             value: value.into(),
@@ -2041,7 +2003,7 @@ mod tests {
     fn two_plus_two() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -2051,17 +2013,14 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
                 body: Some(block_expr(vec![
                     let_stmt("a", 2),
                     let_stmt("b", 2),
-                    let_stmt(
-                        "c",
-                        call_expr("plus", vec!["a".into(), "b".into()]),
-                    ),
+                    let_stmt("c", call_expr("plus", vec!["a".into(), "b".into()])),
                     "c".into(),
                 ])),
             }),
@@ -2071,7 +2030,7 @@ mod tests {
     #[test]
     fn shadow_earlier_variables() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::bool_(),
@@ -2088,7 +2047,7 @@ mod tests {
     #[test]
     fn assign_to_mutable_binding() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![TypedBinding::new("a", Type::int(), true)], // mutable.
             return_type: Type::unit(),
@@ -2099,14 +2058,11 @@ mod tests {
     #[test]
     fn error_assign_wrong_type_to_mutable_binding() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::unit(),
-            body: Some(block_expr(vec![
-                let_mut_stmt("a", 2),
-                assign_stmt("a", ()),
-            ])),
+            body: Some(block_expr(vec![let_mut_stmt("a", 2), assign_stmt("a", ())])),
         })]);
         assert_eq!(
             typecheck_program(program),
@@ -2116,14 +2072,11 @@ mod tests {
     #[test]
     fn error_assign_to_immutable_binding() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::unit(),
-            body: Some(block_expr(vec![
-                let_stmt("a", 2),
-                assign_stmt("a", 3),
-            ])),
+            body: Some(block_expr(vec![let_stmt("a", 2), assign_stmt("a", 3)])),
         })]);
         assert_eq!(
             typecheck_program(program),
@@ -2134,14 +2087,14 @@ mod tests {
     fn if_expression_unifies() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "round".to_string(),
                 args: vec![TypedBinding::new("a", Type::float(), false)],
                 return_type: Type::int(),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -2159,7 +2112,7 @@ mod tests {
     fn use_lambda() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -2169,7 +2122,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -2193,7 +2146,7 @@ mod tests {
     fn return_lambda() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -2203,7 +2156,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::func(vec![Type::int()], Type::int()),
@@ -2225,7 +2178,7 @@ mod tests {
     fn return_in_lambda() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -2235,7 +2188,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::func(vec![Type::int()], Type::int()),
@@ -2261,14 +2214,14 @@ mod tests {
         // id(2) + id(2)
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::from_iter(["T".to_string()].into_iter()),
+                forall: vec!["T".to_string()],
                 name: "id".to_string(),
                 args: vec![TypedBinding::new("a", Type::param("T"), false)],
                 return_type: Type::param("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -2278,7 +2231,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -2299,14 +2252,14 @@ mod tests {
         // id(2) + id(2)
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::from_iter(["T".to_string()].into_iter()),
+                forall: vec!["T".to_string()],
                 name: "id".to_string(),
                 args: vec![TypedBinding::new("a", Type::param("T"), false)],
                 return_type: Type::param("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::float(),
@@ -2324,14 +2277,14 @@ mod tests {
         // id(2) + id(2)
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::from_iter(["T".to_string()].into_iter()),
+                forall: vec!["T".to_string()],
                 name: "id".to_string(),
                 args: vec![TypedBinding::new("a", Type::param("T"), false)],
                 return_type: Type::param("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -2341,7 +2294,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::func(vec![Type::int()], Type::int()),
@@ -2362,7 +2315,7 @@ mod tests {
     #[test]
     fn return_in_one_branch() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::int(),
@@ -2376,7 +2329,7 @@ mod tests {
     #[test]
     fn error_return_wrong_type_in_one_branch() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::int(),
@@ -2393,7 +2346,7 @@ mod tests {
     #[test]
     fn error_infinite_type() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::int(),
@@ -2418,7 +2371,7 @@ mod tests {
     #[test]
     fn empty_block_has_type_unit() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::unit(),
@@ -2429,7 +2382,7 @@ mod tests {
     #[test]
     fn block_with_just_lets_has_type_unit() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::unit(),
@@ -2446,7 +2399,7 @@ mod tests {
     fn factorial_fn() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "mul".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -2456,7 +2409,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "sub".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -2466,7 +2419,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "leq".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -2476,7 +2429,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "factorial".to_string(),
                 args: vec![TypedBinding::new("x", Type::int(), false)],
                 return_type: Type::int(),
@@ -2506,7 +2459,7 @@ mod tests {
         let program = &mut Program(vec![
             // Declare external fn apply(f: fn(Int)->Int, x: Int) -> Int;
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "apply".to_string(),
                 args: vec![
                     TypedBinding::new("f", fn_int_to_int.clone(), false),
@@ -2517,7 +2470,7 @@ mod tests {
             }),
             // Declare external fn make_adder(y: Int) -> fn(Int)->Int;
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "make_adder".to_string(),
                 args: vec![TypedBinding::new("y", Type::int(), false)],
                 return_type: fn_int_to_int.clone(),
@@ -2528,7 +2481,7 @@ mod tests {
             //   apply(add5, 10)
             // }
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -2548,12 +2501,13 @@ mod tests {
         let pair = StructDecl::new(
             "Pair",
             &[("left", Type::param("T")), ("right", Type::param("U"))],
+            &["T", "U"],
         );
 
         let program = &mut Program(vec![
             Declaration::Struct(pair),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -2580,12 +2534,13 @@ mod tests {
         let pair = StructDecl::new(
             "Pair",
             &[("left", Type::param("T")), ("right", Type::param("U"))],
+            &["T", "U"],
         );
 
         let program = &mut Program(vec![
             Declaration::Struct(pair),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -2613,7 +2568,7 @@ mod tests {
     #[test]
     fn field_access_not_a_struct() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::bool_(),
@@ -2635,19 +2590,20 @@ mod tests {
         let pair = StructDecl::new(
             "Pair",
             &[("left", Type::param("T")), ("right", Type::param("U"))],
+            &["T", "U"],
         );
 
         let program = &mut Program(vec![
             Declaration::Struct(pair),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::from_iter(["T".to_string()].into_iter()),
+                forall: vec!["T".to_string()],
                 name: "default".to_string(),
                 args: vec![],
                 return_type: Type::param("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -2655,10 +2611,7 @@ mod tests {
                     // Initialize `p` with some polymorphic default fn.
                     let_mut_stmt("p", call_expr("default", vec![])),
                     // Use and constrain "p" before its type is known.
-                    let_stmt(
-                        "r",
-                        if_expr(field("p", "left"), field("p", "right"), 42),
-                    ),
+                    let_stmt("r", if_expr(field("p", "left"), field("p", "right"), 42)),
                     // Assign to "p" to give it a type.
                     assign_stmt(
                         "p",
@@ -2683,19 +2636,20 @@ mod tests {
         let pair = StructDecl::new(
             "Pair",
             &[("left", Type::param("T")), ("right", Type::param("U"))],
+            &["T", "U"],
         );
 
         let program = &mut Program(vec![
             Declaration::Struct(pair),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::from_iter(["T".to_string()].into_iter()),
+                forall: vec!["T".to_string()],
                 name: "default".to_string(),
                 args: vec![],
                 return_type: Type::param("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -2703,10 +2657,7 @@ mod tests {
                     // Initialize `p` with some polymorphic default fn.
                     let_mut_stmt("p", call_expr("default", vec![])),
                     // Use and constrain "p" before its type is known.
-                    let_stmt(
-                        "r",
-                        if_expr(field("p", "left"), field("p", "whoopsie"), 42),
-                    ),
+                    let_stmt("r", if_expr(field("p", "left"), field("p", "whoopsie"), 42)),
                     // Assign to "p" to give it a type.
                     assign_stmt(
                         "p",
@@ -2733,6 +2684,7 @@ mod tests {
         let pair = StructDecl::new(
             "Pair",
             &[("left", Type::param("T")), ("right", Type::param("U"))],
+            &["T", "U"],
         );
         let pair_type = |left_type, right_type| {
             Type::struct_(StructInstance {
@@ -2746,7 +2698,7 @@ mod tests {
         let program = &mut Program(vec![
             Declaration::Struct(pair.clone()),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::from_iter(["T".to_string(), "U".to_string()]),
+                forall: vec!["T".to_string(), "U".to_string()],
                 name: "make_pair".to_string(),
                 args: vec![TypedBinding::new("a", Type::param("T"), false)],
                 return_type: Type::func(
@@ -2767,7 +2719,7 @@ mod tests {
                 .into()])),
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: pair_type(
@@ -2800,7 +2752,7 @@ mod tests {
             .unwrap();
         ops.mark_done_extending();
         let program = &mut Program(vec![Declaration::Co(CoDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::bool_(),
@@ -2816,7 +2768,7 @@ mod tests {
     fn perform_named_effects() {
         let state_effect = EffectDecl {
             name: "State".to_string(),
-            params: BTreeSet::from_iter(["T".to_string()]),
+            params: vec!["T".to_string()],
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param("T"))),
                 ("set".into(), (Type::param("T"), Type::unit())),
@@ -2845,7 +2797,7 @@ mod tests {
         let program = &mut Program(vec![
             Declaration::Effect(state_effect),
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -2865,7 +2817,7 @@ mod tests {
     fn two_state_effects_ok_because_one_is_named() {
         let state_effect = EffectDecl {
             name: "State".to_string(),
-            params: BTreeSet::from_iter(["T".to_string()]),
+            params: vec!["T".to_string()],
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param("T"))),
                 ("set".into(), (Type::param("T"), Type::unit())),
@@ -2890,7 +2842,7 @@ mod tests {
     fn conflicting_parametric_effects_both_unnamed() {
         let state_effect = EffectDecl {
             name: "State".to_string(),
-            params: BTreeSet::from_iter(["T".to_string()]),
+            params: vec!["T".to_string()],
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param("T"))),
                 ("set".into(), (Type::param("T"), Type::unit())),
@@ -2917,7 +2869,7 @@ mod tests {
     fn empty_opset_is_identity_under_unification() {
         let state_effect = EffectDecl {
             name: "State".to_string(),
-            params: BTreeSet::from_iter(["T".to_string()]),
+            params: vec!["T".to_string()],
             ops: HashMap::from_iter([
                 ("get".into(), (Type::unit(), Type::param("T"))),
                 ("set".into(), (Type::param("T"), Type::unit())),
@@ -2964,7 +2916,7 @@ mod tests {
 
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -2975,7 +2927,7 @@ mod tests {
                 ])),
             }),
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "propagates_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -2997,7 +2949,7 @@ mod tests {
         ops.mark_done_extending();
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -3008,7 +2960,7 @@ mod tests {
                 ])),
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "cannot_propagate_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -3033,7 +2985,7 @@ mod tests {
         ops.mark_done_extending();
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -3044,7 +2996,7 @@ mod tests {
                 ])),
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "propagates_foo".to_string(),
                 args: vec![],
                 return_type: Type::func(vec![], Type::co(Type::bool_(), ops)),
@@ -3090,7 +3042,7 @@ mod tests {
 
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -3101,7 +3053,7 @@ mod tests {
                 ])),
             }),
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_bar".to_string(),
                 args: vec![],
                 return_type: Type::float(),
@@ -3112,19 +3064,13 @@ mod tests {
                 ])),
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "propagates_foo".to_string(),
                 args: vec![],
                 return_type: Type::co(Type::unit(), foo_bar_ops),
                 body: Some(block_expr(vec![co_expr(block_expr(vec![
-                    let_stmt(
-                        "f",
-                        propagate(call_expr("performs_foo", vec![])),
-                    ),
-                    let_stmt(
-                        "b",
-                        propagate(call_expr("performs_bar", vec![])),
-                    ),
+                    let_stmt("f", propagate(call_expr("performs_foo", vec![]))),
+                    let_stmt("b", propagate(call_expr("performs_bar", vec![]))),
                 ]))
                 .into()])),
             }),
@@ -3157,7 +3103,7 @@ mod tests {
 
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -3168,7 +3114,7 @@ mod tests {
                 ])),
             }),
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_bar".to_string(),
                 args: vec![],
                 return_type: Type::float(),
@@ -3179,7 +3125,7 @@ mod tests {
                 ])),
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::co(Type::unit(), foo_bar_ops.clone()),
@@ -3187,10 +3133,7 @@ mod tests {
                     let_stmt(
                         "lambda",
                         lambda_expr(
-                            vec![
-                                SoftBinding::new("f"),
-                                SoftBinding::new("b"),
-                            ],
+                            vec![SoftBinding::new("f"), SoftBinding::new("b")],
                             co_expr(block_expr(vec![
                                 propagate("f").into(),
                                 propagate("b").into(),
@@ -3236,7 +3179,7 @@ mod tests {
 
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -3247,7 +3190,7 @@ mod tests {
                 ])),
             }),
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_bar".to_string(),
                 args: vec![],
                 return_type: Type::float(),
@@ -3258,7 +3201,7 @@ mod tests {
                 ])),
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 // The returned co should not be empty. ERROR!
@@ -3267,10 +3210,7 @@ mod tests {
                     let_stmt(
                         "lambda",
                         lambda_expr(
-                            vec![
-                                SoftBinding::new("f"),
-                                SoftBinding::new("b"),
-                            ],
+                            vec![SoftBinding::new("f"), SoftBinding::new("b")],
                             co_expr(block_expr(vec![
                                 propagate("f").into(),
                                 propagate("b").into(),
@@ -3313,7 +3253,7 @@ mod tests {
             .mark_done_extending();
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
@@ -3324,7 +3264,7 @@ mod tests {
                 ])),
             }),
             Declaration::Co(CoDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "performs_bar".to_string(),
                 args: vec![],
                 return_type: Type::float(),
@@ -3335,7 +3275,7 @@ mod tests {
                 ])),
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 // The returned co should have foo and bar. ERROR.
@@ -3344,10 +3284,7 @@ mod tests {
                     let_stmt(
                         "lambda",
                         lambda_expr(
-                            vec![
-                                SoftBinding::new("f"),
-                                SoftBinding::new("b"),
-                            ],
+                            vec![SoftBinding::new("f"), SoftBinding::new("b")],
                             co_expr(block_expr(vec![
                                 propagate("f").into(),
                                 propagate("b").into(),
@@ -3382,7 +3319,7 @@ mod tests {
             .mark_done_extending();
 
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             // The returned co should not be empty. ERROR!
@@ -3407,7 +3344,7 @@ mod tests {
             .mark_done_extending();
 
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::co(Type::bool_(), foo_ops),
@@ -3461,14 +3398,14 @@ mod tests {
     fn error_expression_type_not_inferred() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::from_iter(["T".to_string()].into_iter()),
+                forall: vec!["T".to_string()],
                 name: "default".to_string(),
                 args: vec![],
                 return_type: Type::param("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::unit(),
@@ -3486,15 +3423,12 @@ mod tests {
     #[test]
     fn propagate_co() {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: BTreeSet::new(),
+            forall: vec![],
             name: "main".to_string(),
             args: vec![],
             return_type: Type::int(),
             body: Some(block_expr(vec![
-                let_stmt(
-                    "performs_bar",
-                    co_expr(perform_anon("bar", 53)),
-                ),
+                let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
                 propagate("performs_bar").into(),
             ])),
         })]);
@@ -3505,7 +3439,7 @@ mod tests {
     fn handle_two_anonymous_effects() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -3515,19 +3449,13 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
                 body: Some(block_expr(vec![
-                    let_stmt(
-                        "performs_foo",
-                        co_expr(perform_anon("foo", 53)),
-                    ),
-                    let_stmt(
-                        "performs_bar",
-                        co_expr(perform_anon("bar", 53)),
-                    ),
+                    let_stmt("performs_foo", co_expr(perform_anon("foo", 53))),
+                    let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
                     let_stmt(
                         "both",
                         co_expr(call_expr(
@@ -3563,7 +3491,7 @@ mod tests {
     fn handle_two_anonymous_effects_resuming() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "something".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -3573,19 +3501,13 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::bool_(),
                 body: Some(block_expr(vec![
-                    let_stmt(
-                        "performs_foo",
-                        co_expr(perform_anon("foo", 53.42)),
-                    ),
-                    let_stmt(
-                        "performs_bar",
-                        co_expr(perform_anon("bar", 53)),
-                    ),
+                    let_stmt("performs_foo", co_expr(perform_anon("foo", 53.42))),
+                    let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
                     let_stmt(
                         "calls_something",
                         co_expr(call_expr(
@@ -3621,7 +3543,7 @@ mod tests {
     fn handles_foo_but_not_bar() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -3631,7 +3553,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -3664,7 +3586,7 @@ mod tests {
     fn handles_bar_incorrectly() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -3674,7 +3596,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -3714,7 +3636,7 @@ mod tests {
     fn handles_irrelevant() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -3724,7 +3646,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -3767,7 +3689,7 @@ mod tests {
     fn handle_return_arm_unifies() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "something".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -3777,19 +3699,13 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
                 body: Some(block_expr(vec![
-                    let_stmt(
-                        "performs_foo",
-                        co_expr(perform_anon("foo", 53.42)),
-                    ),
-                    let_stmt(
-                        "performs_bar",
-                        co_expr(perform_anon("bar", 53)),
-                    ),
+                    let_stmt("performs_foo", co_expr(perform_anon("foo", 53.42))),
+                    let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
                     let_stmt(
                         "calls_something",
                         co_expr(call_expr(
@@ -3800,10 +3716,7 @@ mod tests {
                     Expression::Handle {
                         co: Box::new("calls_something".into()),
                         ty: Type::unknown(),
-                        return_arm: Some((
-                            SoftBinding::new("r"),
-                            Box::new(12.into()),
-                        )),
+                        return_arm: Some((SoftBinding::new("r"), Box::new(12.into()))),
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
@@ -3828,7 +3741,7 @@ mod tests {
     fn handle_return_arm_does_not_unify() {
         let program = &mut Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "something".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -3838,19 +3751,13 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
                 body: Some(block_expr(vec![
-                    let_stmt(
-                        "performs_foo",
-                        co_expr(perform_anon("foo", 53.42)),
-                    ),
-                    let_stmt(
-                        "performs_bar",
-                        co_expr(perform_anon("bar", 53)),
-                    ),
+                    let_stmt("performs_foo", co_expr(perform_anon("foo", 53.42))),
+                    let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
                     let_stmt(
                         "calls_something",
                         co_expr(call_expr(
@@ -3861,10 +3768,7 @@ mod tests {
                     Expression::Handle {
                         co: Box::new("calls_something".into()),
                         ty: Type::unknown(),
-                        return_arm: Some((
-                            SoftBinding::new("r"),
-                            Box::new(12.into()),
-                        )),
+                        return_arm: Some((SoftBinding::new("r"), Box::new(12.into()))),
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),

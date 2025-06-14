@@ -1,8 +1,8 @@
-use std::collections::{hash_map::Entry, BTreeSet, HashMap};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 use crate::ast::{
     CoDecl, Declaration, EffectDecl, Expression, FnDecl, HandleOpArm, LValue, OpSet, OpSetI,
-    Program, SoftBinding, Statement, StructDecl, Type, TypedBinding, ParsedType,
+    ParsedType, Program, SoftBinding, Statement, StructDecl, Type, TypedBinding,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -483,14 +483,15 @@ fn parse_struct_field<'s>(
 fn parse_generic_params<'s>(
     node: SourceNode<'s, '_>,
     errors: &mut Vec<ParseError<'s>>,
-) -> BTreeSet<String> {
-    let mut params = BTreeSet::new();
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut params = Vec::new();
     for child in node.children(errors) {
         match child.kind() {
             "<" | "," | ">" => continue,
             "identifier" => {
                 let parameter = child.text();
-                if !params.insert(parameter.to_string()) {
+                if !seen.insert(parameter) {
                     errors.push(ParseError::DuplicateItem {
                         duplicated_item: parameter,
                         item_type: "parameter",
@@ -498,6 +499,7 @@ fn parse_generic_params<'s>(
                         context_type: "generic parameter list",
                     });
                 }
+                params.push(parameter.to_string());
             }
             other => errors.push(ParseError::UnexpectedNodeType {
                 expected: "identifier",
@@ -585,7 +587,7 @@ fn parse_type<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) ->
 }
 fn parse_type2<'s>(
     node: SourceNode<'s, '_>,
-    errors: &mut Vec<ParseError<'s>>
+    errors: &mut Vec<ParseError<'s>>,
 ) -> Option<ParsedType> {
     match node.kind() {
         "primitive_type" => {
@@ -962,7 +964,12 @@ fn parse_soft_binding<'s>(
         .and_then(|n| parse_type2(n, errors))
         .unwrap_or(ParsedType::Unspecified);
 
-    name.map(|name| SoftBinding { name, parsed_type: ty, ty: Type::unknown(), mutable })
+    name.map(|name| SoftBinding {
+        name,
+        parsed_type: ty,
+        ty: Type::unknown(),
+        mutable,
+    })
 }
 
 fn parse_l_value<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) -> Option<LValue> {
@@ -1113,7 +1120,7 @@ mod tests {
         assert_eq!(
             parse_ast_program(source_code, &mut errors),
             Some(Program(vec![Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -1136,7 +1143,7 @@ mod tests {
         ";
         let program = Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -1146,7 +1153,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::int(),
@@ -1181,7 +1188,7 @@ mod tests {
         ";
         let program = Program(vec![
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
                     TypedBinding::new("a", Type::int(), false),
@@ -1191,7 +1198,7 @@ mod tests {
                 body: None,
             }),
             Declaration::Fn(FnDecl {
-                forall: BTreeSet::new(),
+                forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
                 return_type: Type::func(vec![Type::int()], Type::int()),
@@ -1216,7 +1223,7 @@ mod tests {
     fn declare_struct() {
         let source = r"struct FooBar { foo: i64, bar: f64 }";
         let program = Program(vec![Declaration::Struct(StructDecl {
-            params: BTreeSet::new(),
+            params: vec![],
             name: "FooBar".to_string(),
             fields: HashMap::from_iter(
                 [
@@ -1254,7 +1261,7 @@ mod tests {
     fn declare_generic_struct() {
         let source = r"struct FooBar<F, B> { foo: F, bar: B }";
         let program = Program(vec![Declaration::Struct(StructDecl {
-            params: BTreeSet::new(),
+            params: vec![],
             name: "FooBar".to_string(),
             fields: HashMap::from_iter(
                 [
@@ -1274,7 +1281,7 @@ mod tests {
         let source = r"effect IntState { get: unit -> i64, set: i64 -> unit }";
         let program = Program(vec![Declaration::Effect(EffectDecl {
             name: "IntState".to_string(),
-            params: BTreeSet::default(),
+            params: vec![],
             ops: [
                 ("get".to_string(), (Type::unit(), Type::int())),
                 ("set".to_string(), (Type::int(), Type::unit())),
@@ -1365,7 +1372,7 @@ mod tests {
 
         let expected_ast = Some(Program(vec![Declaration::Struct(StructDecl {
             name: "Point".to_string(),
-            params: BTreeSet::new(),
+            params: vec![],
             fields: [("x".to_string(), Type::int())].into_iter().collect(),
         })]));
         assert_eq!(parsed, expected_ast);
@@ -1389,7 +1396,7 @@ mod tests {
 
         let expected_ast = Some(Program(vec![Declaration::Struct(StructDecl {
             name: "Point".to_string(),
-            params: BTreeSet::new(),
+            params: vec![],
             fields: [("x".to_string(), Type::int())].into_iter().collect(),
         })]));
         assert_eq!(parsed, expected_ast);
