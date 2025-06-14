@@ -1,8 +1,8 @@
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 use crate::ast::{
-    CoDecl, Declaration, EffectDecl, Expression, FnDecl, HandleOpArm, LValue, OpSet, OpSetI,
-    ParsedType, Program, SoftBinding, Statement, StructDecl, Type, TypedBinding,
+    Binding, CoDecl, Declaration, EffectDecl, Expression, FnDecl, HandleOpArm, LValue, OpSet,
+    OpSetI, ParsedType, Program, Statement, StructDecl, Type,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -304,7 +304,7 @@ fn parse_fn_decl<'s>(
 
     let mut args = Vec::new();
     for arg in node.children_by_field_name("args", errors) {
-        if let Some(binding) = parse_typed_binding(arg, errors) {
+        if let Some(binding) = parse_binding(arg, errors) {
             args.push(binding);
         }
     }
@@ -351,7 +351,7 @@ fn parse_co_decl<'s>(
 
     let mut args = Vec::new();
     for arg in node.children_by_field_name("args", errors) {
-        if let Some(binding) = parse_typed_binding(arg, errors) {
+        if let Some(binding) = parse_binding(arg, errors) {
             args.push(binding);
         }
     }
@@ -511,28 +511,8 @@ fn parse_generic_params<'s>(
     params
 }
 
-fn parse_typed_binding<'s>(
-    node: SourceNode<'s, '_>,
-    errors: &mut Vec<ParseError<'s>>,
-) -> Option<TypedBinding> {
-    let mutable = node
-        .optional_child_by_id(0, errors)
-        .map_or(false, |n| n.kind() == "mut");
-    let name = node
-        .required_child("name", errors)
-        .map(|n| n.text().to_string());
-    let ty = node
-        .required_child("type", errors)
-        .and_then(|n| parse_type(n, errors));
-
-    Some(TypedBinding {
-        name: name?,
-        ty: ty?,
-        mutable,
-    })
-}
-
 // --- Type Parsing ---
+// TODO: Deprecate this in favor of parse_type2.
 fn parse_type<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) -> Option<Type> {
     match node.kind() {
         "primitive_type" => {
@@ -671,7 +651,7 @@ fn parse_let_statement<'s>(
 ) -> Option<Statement> {
     let binding = node
         .required_child("binding", errors)
-        .and_then(|n| parse_soft_binding(n, errors));
+        .and_then(|n| parse_binding(n, errors));
     let value = node
         .optional_child("value", errors)
         .and_then(|n| parse_expr(n, errors));
@@ -766,7 +746,7 @@ fn parse_handle_expression<'s>(
                 }
                 let binding = arm
                     .required_child("binding", errors)
-                    .and_then(|node| parse_soft_binding(node, errors));
+                    .and_then(|node| parse_binding(node, errors));
                 let expr = arm
                     .required_child("expr", errors)
                     .and_then(|node| parse_expr(node, errors));
@@ -784,7 +764,7 @@ fn parse_handle_expression<'s>(
                     .map(|node| node.text().to_string());
                 let binding = arm
                     .required_child("binding", errors)
-                    .and_then(|node| parse_soft_binding(node, errors));
+                    .and_then(|node| parse_binding(node, errors));
                 let expr = arm
                     .required_child("expr", errors)
                     .and_then(|node| parse_expr(node, errors));
@@ -949,10 +929,11 @@ fn parse_block_expr<'s>(
     })
 }
 
-fn parse_soft_binding<'s>(
+// Parses both soft and typed bindings from the Grammar.
+fn parse_binding<'s>(
     node: SourceNode<'s, '_>,
     errors: &mut Vec<ParseError<'s>>,
-) -> Option<SoftBinding> {
+) -> Option<Binding> {
     let mutable = node
         .optional_child_by_id(0, errors)
         .map_or(false, |n| n.kind() == "mut");
@@ -964,7 +945,7 @@ fn parse_soft_binding<'s>(
         .and_then(|n| parse_type2(n, errors))
         .unwrap_or(ParsedType::Unspecified);
 
-    name.map(|name| SoftBinding {
+    name.map(|name| Binding {
         name,
         parsed_type: ty,
         ty: Type::unknown(),
@@ -1065,7 +1046,7 @@ fn parse_lambda_expr<'s>(
     let mut bindings = Vec::new();
     for child in node.children_by_field_name("lambda_args", errors) {
         dbg!(child.kind());
-        if let Some(b) = parse_soft_binding(child, errors) {
+        if let Some(b) = parse_binding(child, errors) {
             bindings.push(b);
         }
     }
@@ -1103,7 +1084,7 @@ fn parse_call_expr<'s>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::HashMap;
 
     use super::*;
     use crate::ast::{test_helpers::*, StructDecl};
@@ -1146,8 +1127,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -1161,7 +1142,7 @@ mod tests {
                     let_stmt(
                         "plus_two",
                         lambda_expr(
-                            vec![SoftBinding::new("x")],
+                            vec![Binding::new("x")],
                             call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
@@ -1191,8 +1172,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -1206,7 +1187,7 @@ mod tests {
                     let_stmt(
                         "plus_two",
                         lambda_expr(
-                            vec![SoftBinding::new("x")],
+                            vec![Binding::new("x")],
                             call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
@@ -1244,9 +1225,10 @@ mod tests {
         let program = Program(vec![Declaration::Fn(FnDecl {
             forall: ["T".to_string()].into_iter().collect(),
             name: "id".to_string(),
-            args: vec![TypedBinding {
+            args: vec![Binding {
                 name: "x".to_string(),
-                ty: Type::param("T"),
+                parsed_type: ParsedType::Named("T".to_string(), vec![]),
+                ty: Type::unknown(),
                 mutable: false,
             }],
             return_type: Type::param("T"),
@@ -1646,13 +1628,13 @@ mod tests {
             body: Some(block_expr(vec![Expression::Handle {
                 co: Box::new(call_expr("foo", vec![])),
                 return_arm: Some((
-                    SoftBinding::new("x"),
+                    Binding::new("x"),
                     Box::new(call_expr("bar", vec!["x".into(), "x".into()])),
                 )),
                 op_arms: vec![
                     HandleOpArm {
                         op_name: "foo".to_string(),
-                        performed_variable: SoftBinding {
+                        performed_variable: Binding {
                             name: "y".into(),
                             parsed_type: ParsedType::Unit,
                             ty: Type::unknown(),
@@ -1662,7 +1644,7 @@ mod tests {
                     },
                     HandleOpArm {
                         op_name: "bar".to_string(),
-                        performed_variable: SoftBinding::new("z"),
+                        performed_variable: Binding::new("z"),
                         body: block_expr(vec![resume_stmt(call_expr("z", vec![1.into()]))]),
                     },
                 ],

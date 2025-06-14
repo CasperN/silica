@@ -523,9 +523,33 @@ pub enum ParsedOp {
     Anonymous(String, ParsedType, ParsedType),
     NamedEffect {
         name: Option<String>,
-        effect: String,
+        effect: String, // TODO: Parameterized effects?
         op_name: Option<String>,
     },
+}
+impl ParsedOp {
+    // Does not contain ParsedType::Unspecified.
+    fn is_specified(&self) -> bool {
+        match self {
+            Self::Anonymous(_name, p_ty, r_ty) => p_ty.is_specified() && r_ty.is_specified(),
+            Self::NamedEffect { .. } => true,
+        }
+    }
+}
+
+impl ParsedType {
+    fn func(args: impl AsRef<[Self]>, ret: Self) -> Self {
+        Self::Fn(args.as_ref().to_vec(), Box::new(ret))
+    }
+    fn is_specified(&self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::Bool | Self::Float | Self::Int | Self::Never | Self::Unit => true,
+            Self::Fn(args, ret) => ret.is_specified() && args.iter().all(|a| a.is_specified()),
+            Self::Named(_name, params) => params.iter().all(|p| p.is_specified()),
+            Self::Co(ret, ops) => ret.is_specified() && ops.iter().all(|op| op.is_specified()),
+        }
+    }
 }
 
 fn resolve_type(context: &TypeContext, ty: &ParsedType) -> Result<Type, Error> {
@@ -633,7 +657,16 @@ fn resolve_type(context: &TypeContext, ty: &ParsedType) -> Result<Type, Error> {
                         decl: decl.clone(),
                     }))
                 }
-                _ => Err(Error::ExpectedNamedType(name.clone())),
+                Some(NamedItem::TypeParam(param)) => {
+                    if !parsed_params.is_empty() {
+                        return Err(Error::HigherKindedTypesNotSupported(
+                            name.to_string(),
+                            parsed_params.to_vec(),
+                        ));
+                    }
+                    Ok(Type::param(param))
+                }
+                found => Err(Error::ExpectedNamedType(name.clone(), found.cloned())),
             }
         }
     }
@@ -821,7 +854,7 @@ pub enum Expression {
         ty: Type,
     },
     Lambda {
-        bindings: Vec<SoftBinding>,
+        bindings: Vec<Binding>,
         body: Box<Expression>,
         lambda_type: Type,
     },
@@ -836,7 +869,7 @@ pub enum Expression {
     Handle {
         co: Box<Expression>,
         // Initially arm, finally arm.
-        return_arm: Option<(SoftBinding, Box<Expression>)>,
+        return_arm: Option<(Binding, Box<Expression>)>,
         op_arms: Vec<HandleOpArm>,
         ty: Type,
     }, // TODO: UFCS/method-call, ref/deref.
@@ -846,7 +879,7 @@ pub enum Expression {
 pub struct HandleOpArm {
     pub op_name: String,
     // TODO: This only handles anonymous effects. What about named effects?
-    pub performed_variable: SoftBinding,
+    pub performed_variable: Binding,
     pub body: Expression,
 }
 
@@ -888,39 +921,20 @@ impl Expression {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
     Assign(LValue, Expression),
-    Let {
-        binding: SoftBinding,
-        value: Expression,
-    },
+    Let { binding: Binding, value: Expression },
     Expression(Expression),
     Return(Expression),
     Resume(Expression),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct TypedBinding {
-    pub name: String,
-    pub ty: Type,
-    pub mutable: bool,
-}
-impl TypedBinding {
-    pub fn new(name: impl Into<String>, ty: impl Into<Type>, mutable: bool) -> Self {
-        Self {
-            name: name.into(),
-            ty: ty.into(),
-            mutable,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct SoftBinding {
+pub struct Binding {
     pub name: String,
     pub parsed_type: ParsedType,
     pub ty: Type,
     pub mutable: bool,
 }
-impl SoftBinding {
+impl Binding {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -937,13 +951,32 @@ impl SoftBinding {
             mutable: true,
         }
     }
+    pub fn new_typed(name: impl Into<String>, parsed_type: ParsedType) -> Self {
+        Self {
+            name: name.into(),
+            parsed_type,
+            ty: Type::unknown(),
+            mutable: false,
+        }
+    }
+    pub fn new_typed_mut(name: impl Into<String>, parsed_type: ParsedType) -> Self {
+        Self {
+            name: name.into(),
+            parsed_type,
+            ty: Type::unknown(),
+            mutable: true,
+        }
+    }
+    pub fn has_specified_type(&self) -> bool {
+        self.parsed_type.is_specified()
+    }
 }
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct FnDecl {
     pub forall: Vec<String>,
     pub name: String,
-    pub args: Vec<TypedBinding>,
+    pub args: Vec<Binding>,
     pub return_type: Type, // TODO: This should be the parsed type...
     // If no body is provided, its assumed to be external.
     pub body: Option<Expression>,
@@ -963,7 +996,7 @@ impl FnDecl {
 pub struct CoDecl {
     pub forall: Vec<String>,
     pub name: String,
-    pub args: Vec<TypedBinding>,
+    pub args: Vec<Binding>,
     pub return_type: Type,
     pub ops: OpSetI,
     // If no body is provided, its assumed to be external.
@@ -1057,14 +1090,15 @@ impl EffectInstance {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 enum NamedItem {
     Variable(VariableInfo),
     Struct(Rc<StructDecl>),
     Effect(Rc<EffectDecl>),
+    TypeParam(String),
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 struct VariableInfo {
     ty: Type,
     mutable: bool,
@@ -1078,10 +1112,6 @@ struct VariableInfo {
 #[derive(Debug, Default, PartialEq)]
 struct TypeContext {
     names: HashMap<String, NamedItem>,
-    next_type_var: u32,
-    // TODO: the return type and op-set need indicators to say whether they are being inferred or
-    // checked. FnDecls are checked, lambdas and such are inferred. OpSetI perhaps should be optional
-    // too, to distinguish between "this perform is not allowed" and "this is not a coroutine."
     return_type: Type,
     resume_type: Option<Type>,
     ops: OpSet,
@@ -1155,23 +1185,22 @@ struct ShadowTypeContext<'a> {
     finished: bool,
 }
 impl<'a> ShadowTypeContext<'a> {
-    fn insert_variable(&mut self, name: String, ty: Type, mutable: bool) {
-        let info = NamedItem::Variable(VariableInfo { ty, mutable });
+    fn insert_named_item(&mut self, name: String, item: NamedItem) {
         if let Entry::Vacant(entry) = self.shadowed_variables.entry(name.clone()) {
-            let original = self.type_context.names.insert(name, info);
+            let original = self.type_context.names.insert(name, item);
             entry.insert(original);
         } else {
             // The original was already saved in `shadowed_variables`,
             // no need to touch that.
-            self.type_context.names.insert(name, info);
+            self.type_context.names.insert(name, item);
         }
     }
-    fn insert_binding(&mut self, binding: TypedBinding) {
-        let TypedBinding { name, ty, mutable } = binding;
-        self.insert_variable(name, ty, mutable);
+    fn insert_variable(&mut self, name: String, ty: Type, mutable: bool) {
+        let info = NamedItem::Variable(VariableInfo { ty, mutable });
+        self.insert_named_item(name, info);
     }
-    fn insert_soft_binding(&mut self, binding: SoftBinding) -> Type {
-        let SoftBinding {
+    fn insert_binding(&mut self, binding: Binding) -> Type {
+        let Binding {
             name,
             ty,
             mutable,
@@ -1179,6 +1208,10 @@ impl<'a> ShadowTypeContext<'a> {
         } = binding;
         self.insert_variable(name, ty.clone(), mutable);
         ty
+    }
+    fn insert_type_param(&mut self, name: &str) {
+        let item = NamedItem::TypeParam(name.to_string());
+        self.insert_named_item(name.to_string(), item)
     }
     fn set_resume_type(&mut self, ty: &Type) {
         if self.shadowed_return_type.is_some() {
@@ -1273,6 +1306,7 @@ enum Error {
     DuplicateOpName(String),
     NoMatchingOpInEffectDecl(String, EffectDecl),
     NamedEffectInstanceMismatch(EffectInstance, EffectInstance),
+    DeclMustHaveConcreteTypes(String),
     FnDeclMustHaveConcreteTypes(FnDecl),
     CoDeclMustHaveConcreteTypes(CoDecl),
     StructDeclMustHaveConcreteTypes(StructDecl),
@@ -1283,7 +1317,8 @@ enum Error {
     ExpressisonTypeNotInferred(Expression),
     UnexpectedResume(Expression),
     ParameterCountMismatch(String, Vec<ParsedType>),
-    ExpectedNamedType(String),
+    HigherKindedTypesNotSupported(String, Vec<ParsedType>),
+    ExpectedNamedType(String, Option<NamedItem>),
     ExpectedNamedEffect(String),
     DuplicateNamedEffect(String),
 }
@@ -1291,6 +1326,8 @@ enum Error {
 // *************************************************************************************************
 //  Inference
 // *************************************************************************************************
+
+// TODO: Break up type checking and type inference, i.e. bidirectional type checking?
 
 // Infers the type of the given expression in the given context.
 // Mutates the expression to set the type.
@@ -1380,7 +1417,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             let mut shadow = context
                 .enter_activation_frame(lambda_return_type.clone(), OpSet::empty_non_extensible());
             for binding in bindings.iter() {
-                shadow.insert_soft_binding(binding.clone());
+                shadow.insert_binding(binding.clone());
             }
             infer(shadow.context(), body)?;
             unify(&body.get_type(), &lambda_return_type)?;
@@ -1474,7 +1511,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             // Infer the return arm.
             if let Some((binding, expr)) = return_arm {
                 let mut shadow = context.shadow();
-                let original_return_ty = shadow.insert_soft_binding(binding.clone());
+                let original_return_ty = shadow.insert_binding(binding.clone());
                 unify(&original_return_ty, &co_return_ty)?;
 
                 infer(shadow.context(), expr)?;
@@ -1488,7 +1525,7 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             // Infer the op arms.
             for arm in op_arms.iter_mut() {
                 let mut shadow = context.shadow();
-                let p_var_ty = shadow.insert_soft_binding(arm.performed_variable.clone());
+                let p_var_ty = shadow.insert_binding(arm.performed_variable.clone());
                 let (p_ty, r_ty) = co_ops.inner().get_anonymous_op(&arm.op_name).unwrap();
                 unify(&p_ty, &p_var_ty)?;
                 shadow.set_resume_type(&r_ty);
@@ -1671,11 +1708,22 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
     for declaration in program.0.iter() {
         match declaration {
             Declaration::Fn(fn_decl) => {
-                if !(fn_decl.args.iter().all(|binding| binding.ty.is_concrete())
-                    && fn_decl.return_type.is_concrete())
-                {
-                    return Err(Error::FnDeclMustHaveConcreteTypes(fn_decl.clone()));
+                let local_context = shadow.context();
+                let mut local_shadow = local_context.shadow();
+                for param in fn_decl.forall.iter() {
+                    local_shadow.insert_type_param(param);
                 }
+
+                for binding in fn_decl.args.iter() {
+                    unify(
+                        &binding.ty,
+                        &resolve_type(local_shadow.context(), &binding.parsed_type)?,
+                    )?;
+                    if !binding.ty.is_concrete() {
+                        return Err(Error::FnDeclMustHaveConcreteTypes(fn_decl.clone()));
+                    }
+                }
+                local_shadow.finish();
                 if shadow.context_contains(&fn_decl.name) {
                     return Err(Error::DuplicateTopLevelName(fn_decl.name.clone()));
                 }
@@ -1686,12 +1734,21 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 shadow.insert_variable(fn_decl.name.clone(), fn_decl.as_type(), false);
             }
             Declaration::Co(co_decl) => {
-                if !(co_decl.args.iter().all(|binding| binding.ty.is_concrete())
-                    && co_decl.return_type.is_concrete()
-                    && co_decl.ops.is_concrete())
-                {
-                    return Err(Error::CoDeclMustHaveConcreteTypes(co_decl.clone()));
+                let local_context = shadow.context();
+                let mut local_shadow = local_context.shadow();
+                for param in co_decl.forall.iter() {
+                    local_shadow.insert_type_param(param);
                 }
+                for binding in co_decl.args.iter() {
+                    unify(
+                        &binding.ty,
+                        &resolve_type(local_shadow.context(), &binding.parsed_type)?,
+                    )?;
+                    if !binding.ty.is_concrete() {
+                        return Err(Error::CoDeclMustHaveConcreteTypes(co_decl.clone()));
+                    }
+                }
+                local_shadow.finish();
                 if shadow.context_contains(&co_decl.name) {
                     return Err(Error::DuplicateTopLevelName(co_decl.name.clone()));
                 }
@@ -1848,7 +1905,7 @@ pub mod test_helpers {
 
     pub fn let_stmt(name: &str, value: impl Into<Expression>) -> Statement {
         Statement::Let {
-            binding: SoftBinding::new(name),
+            binding: Binding::new(name),
             value: value.into(),
         }
     }
@@ -1859,7 +1916,7 @@ pub mod test_helpers {
         value: impl Into<Expression>,
     ) -> Statement {
         Statement::Let {
-            binding: SoftBinding {
+            binding: Binding {
                 name: name.to_string(),
                 parsed_type: ParsedType::Unspecified,
                 ty: type_,
@@ -1870,7 +1927,7 @@ pub mod test_helpers {
     }
     pub fn let_mut_stmt(name: &str, value: impl Into<Expression>) -> Statement {
         Statement::Let {
-            binding: SoftBinding::new_mut(name),
+            binding: Binding::new_mut(name),
             value: value.into(),
         }
     }
@@ -1908,7 +1965,7 @@ pub mod test_helpers {
             ty: Type::unknown(),
         }
     }
-    pub fn lambda_expr(bindings: Vec<SoftBinding>, body: impl Into<Expression>) -> Expression {
+    pub fn lambda_expr(bindings: Vec<Binding>, body: impl Into<Expression>) -> Expression {
         Expression::Lambda {
             bindings,
             body: Box::new(body.into()),
@@ -2006,8 +2063,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -2049,7 +2106,7 @@ mod tests {
         let program = &mut Program(vec![Declaration::Fn(FnDecl {
             forall: vec![],
             name: "main".to_string(),
-            args: vec![TypedBinding::new("a", Type::int(), true)], // mutable.
+            args: vec![Binding::new_typed_mut("a", ParsedType::Int)],
             return_type: Type::unit(),
             body: Some(block_expr(vec![assign_stmt("a", 3)])),
         })]);
@@ -2089,7 +2146,7 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "round".to_string(),
-                args: vec![TypedBinding::new("a", Type::float(), false)],
+                args: vec![Binding::new_typed("a", ParsedType::Float)],
                 return_type: Type::int(),
                 body: None,
             }),
@@ -2115,8 +2172,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -2130,7 +2187,7 @@ mod tests {
                     let_stmt(
                         "plus_two",
                         lambda_expr(
-                            vec![SoftBinding::new("x")],
+                            vec![Binding::new("x")],
                             call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
@@ -2149,8 +2206,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -2164,7 +2221,7 @@ mod tests {
                     let_stmt(
                         "plus_two",
                         lambda_expr(
-                            vec![SoftBinding::new("x")],
+                            vec![Binding::new("x")],
                             call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
@@ -2181,8 +2238,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -2196,7 +2253,7 @@ mod tests {
                     let_stmt(
                         "plus_two",
                         lambda_expr(
-                            vec![SoftBinding::new("x")],
+                            vec![Binding::new("x")],
                             block_expr(vec![return_stmt(call_expr(
                                 "plus",
                                 vec![2.into(), "x".into()],
@@ -2216,7 +2273,10 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec!["T".to_string()],
                 name: "id".to_string(),
-                args: vec![TypedBinding::new("a", Type::param("T"), false)],
+                args: vec![Binding::new_typed(
+                    "a",
+                    ParsedType::Named("T".to_string(), vec![]),
+                )],
                 return_type: Type::param("T"),
                 body: None,
             }),
@@ -2224,8 +2284,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -2254,7 +2314,10 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec!["T".to_string()],
                 name: "id".to_string(),
-                args: vec![TypedBinding::new("a", Type::param("T"), false)],
+                args: vec![Binding::new_typed(
+                    "a",
+                    ParsedType::Named("T".to_string(), vec![]),
+                )],
                 return_type: Type::param("T"),
                 body: None,
             }),
@@ -2279,7 +2342,10 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec!["T".to_string()],
                 name: "id".to_string(),
-                args: vec![TypedBinding::new("a", Type::param("T"), false)],
+                args: vec![Binding::new_typed(
+                    "a",
+                    ParsedType::Named("T".to_string(), vec![]),
+                )],
                 return_type: Type::param("T"),
                 body: None,
             }),
@@ -2287,8 +2353,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -2354,10 +2420,7 @@ mod tests {
                 // Explicit return in true branch, implicit return in false.
                 let_stmt(
                     "x",
-                    lambda_expr(
-                        vec![SoftBinding::new("x")],
-                        call_expr("x", vec!["x".into()]),
-                    ),
+                    lambda_expr(vec![Binding::new("x")], call_expr("x", vec!["x".into()])),
                 ),
                 2.into(),
             ])),
@@ -2402,8 +2465,8 @@ mod tests {
                 forall: vec![],
                 name: "mul".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -2412,8 +2475,8 @@ mod tests {
                 forall: vec![],
                 name: "sub".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -2422,8 +2485,8 @@ mod tests {
                 forall: vec![],
                 name: "leq".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::bool_(),
                 body: None,
@@ -2431,7 +2494,7 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "factorial".to_string(),
-                args: vec![TypedBinding::new("x", Type::int(), false)],
+                args: vec![Binding::new_typed("x", ParsedType::Int)],
                 return_type: Type::int(),
                 body: Some(if_expr(
                     call_expr("leq", vec!["x".into(), 1.into()]),
@@ -2462,8 +2525,8 @@ mod tests {
                 forall: vec![],
                 name: "apply".to_string(),
                 args: vec![
-                    TypedBinding::new("f", fn_int_to_int.clone(), false),
-                    TypedBinding::new("x", Type::int(), false),
+                    Binding::new_typed("f", ParsedType::func([ParsedType::Int], ParsedType::Int)),
+                    Binding::new_typed("x", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None, // External
@@ -2472,7 +2535,7 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "make_adder".to_string(),
-                args: vec![TypedBinding::new("y", Type::int(), false)],
+                args: vec![Binding::new_typed("y", ParsedType::Int)],
                 return_type: fn_int_to_int.clone(),
                 body: None, // External
             }),
@@ -2700,13 +2763,16 @@ mod tests {
             Declaration::Fn(FnDecl {
                 forall: vec!["T".to_string(), "U".to_string()],
                 name: "make_pair".to_string(),
-                args: vec![TypedBinding::new("a", Type::param("T"), false)],
+                args: vec![Binding::new_typed(
+                    "a",
+                    ParsedType::Named("T".to_string(), vec![]),
+                )],
                 return_type: Type::func(
                     vec![Type::param("U")],
                     pair_type(Type::param("T"), Type::param("U")),
                 ),
                 body: Some(block_expr(vec![lambda_expr(
-                    vec![SoftBinding::new("b")],
+                    vec![Binding::new("b")],
                     Expression::LiteralStruct {
                         name: "Pair".to_string(),
                         fields: HashMap::from_iter([
@@ -3133,7 +3199,7 @@ mod tests {
                     let_stmt(
                         "lambda",
                         lambda_expr(
-                            vec![SoftBinding::new("f"), SoftBinding::new("b")],
+                            vec![Binding::new("f"), Binding::new("b")],
                             co_expr(block_expr(vec![
                                 propagate("f").into(),
                                 propagate("b").into(),
@@ -3210,7 +3276,7 @@ mod tests {
                     let_stmt(
                         "lambda",
                         lambda_expr(
-                            vec![SoftBinding::new("f"), SoftBinding::new("b")],
+                            vec![Binding::new("f"), Binding::new("b")],
                             co_expr(block_expr(vec![
                                 propagate("f").into(),
                                 propagate("b").into(),
@@ -3284,7 +3350,7 @@ mod tests {
                     let_stmt(
                         "lambda",
                         lambda_expr(
-                            vec![SoftBinding::new("f"), SoftBinding::new("b")],
+                            vec![Binding::new("f"), Binding::new("b")],
                             co_expr(block_expr(vec![
                                 propagate("f").into(),
                                 propagate("b").into(),
@@ -3442,8 +3508,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -3470,12 +3536,12 @@ mod tests {
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: 42.into(), // Ignore the effect.
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: 42.into(), // Ignore the effect.
                             },
                         ],
@@ -3494,8 +3560,8 @@ mod tests {
                 forall: vec![],
                 name: "something".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::float(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Float),
                 ],
                 return_type: Type::bool_(),
                 body: None,
@@ -3522,12 +3588,12 @@ mod tests {
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: block_expr(vec![resume_stmt("x")]),
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: block_expr(vec![resume_stmt("x")]),
                             },
                         ],
@@ -3546,8 +3612,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -3571,7 +3637,7 @@ mod tests {
                         return_arm: None,
                         op_arms: vec![HandleOpArm {
                             op_name: "foo".to_string(),
-                            performed_variable: SoftBinding::new("x"),
+                            performed_variable: Binding::new("x"),
                             body: "x".into(),
                         }],
                     }
@@ -3589,8 +3655,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -3615,12 +3681,12 @@ mod tests {
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: "x".into(),
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: "x".into(),
                             },
                         ],
@@ -3639,8 +3705,8 @@ mod tests {
                 forall: vec![],
                 name: "plus".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::int(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Int),
                 ],
                 return_type: Type::int(),
                 body: None,
@@ -3662,12 +3728,12 @@ mod tests {
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: "x".into(),
                             },
                             HandleOpArm {
                                 op_name: "irrelevant".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: block_expr(vec![
                                     resume_stmt(()), // Give the resume a unit type.
                                     "x".into(),      // Returned x makes perform type an int.
@@ -3692,8 +3758,8 @@ mod tests {
                 forall: vec![],
                 name: "something".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::float(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Float),
                 ],
                 return_type: Type::bool_(),
                 body: None,
@@ -3716,16 +3782,16 @@ mod tests {
                     Expression::Handle {
                         co: Box::new("calls_something".into()),
                         ty: Type::unknown(),
-                        return_arm: Some((SoftBinding::new("r"), Box::new(12.into()))),
+                        return_arm: Some((Binding::new("r"), Box::new(12.into()))),
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: block_expr(vec![resume_stmt("x")]),
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: block_expr(vec![42.into()]),
                             },
                         ],
@@ -3744,8 +3810,8 @@ mod tests {
                 forall: vec![],
                 name: "something".to_string(),
                 args: vec![
-                    TypedBinding::new("a", Type::int(), false),
-                    TypedBinding::new("b", Type::float(), false),
+                    Binding::new_typed("a", ParsedType::Int),
+                    Binding::new_typed("b", ParsedType::Float),
                 ],
                 return_type: Type::bool_(),
                 body: None,
@@ -3768,17 +3834,17 @@ mod tests {
                     Expression::Handle {
                         co: Box::new("calls_something".into()),
                         ty: Type::unknown(),
-                        return_arm: Some((SoftBinding::new("r"), Box::new(12.into()))),
+                        return_arm: Some((Binding::new("r"), Box::new(12.into()))),
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 // Never type.
                                 body: block_expr(vec![resume_stmt("x")]),
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
-                                performed_variable: SoftBinding::new("x"),
+                                performed_variable: Binding::new("x"),
                                 body: block_expr(vec![
                                     42.32.into(), // Not an int!
                                 ]),
