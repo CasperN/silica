@@ -2,7 +2,7 @@ use std::collections::{hash_map::Entry, BTreeSet, HashMap};
 
 use crate::ast::{
     CoDecl, Declaration, EffectDecl, Expression, FnDecl, HandleOpArm, LValue, OpSet, OpSetI,
-    Program, SoftBinding, Statement, StructDecl, Type, TypedBinding,
+    Program, SoftBinding, Statement, StructDecl, Type, TypedBinding, ParsedType,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -583,6 +583,63 @@ fn parse_type<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) ->
         }
     }
 }
+fn parse_type2<'s>(
+    node: SourceNode<'s, '_>,
+    errors: &mut Vec<ParseError<'s>>
+) -> Option<ParsedType> {
+    match node.kind() {
+        "primitive_type" => {
+            match node.text() {
+                // TODO: Update `Type`
+                // "i8" => Some(Type::I8), // Assuming these variants exist in ast::Type
+                // "u8" => Some(Type::U8),
+                // "i16" => Some(Type::I16),
+                // "u16" => Some(Type::U16),
+                // "i32" => Some(Type::I32),
+                // "u32" => Some(Type::U32),
+                // "i64" => Some(Type::I64), // Was Type::int()
+                // "u64" => Some(Type::U64),
+                // "i128" => Some(Type::I128),
+                // "u128" => Some(Type::U128),
+                // "isize" => Some(Type::Isize),
+                // "usize" => Some(Type::Usize),
+                // "f64" => Some(Type::F64), // Was Type::Float
+                "f64" => Some(ParsedType::Float),
+                "i64" => Some(ParsedType::Int),
+                "bool" => Some(ParsedType::Bool),
+                "unit" => Some(ParsedType::Unit),
+                "!" => Some(ParsedType::Never),
+                "_" => Some(ParsedType::Unspecified),
+                other => {
+                    errors.push(ParseError::UnknownPrimitiveType(other));
+                    None
+                }
+            }
+        }
+        "function_type" => {
+            let mut arg_types = Vec::new();
+            for a in node.children_by_field_name("arg_types", errors) {
+                if let Some(t) = parse_type2(a, errors) {
+                    arg_types.push(t);
+                }
+            }
+            let return_type = node
+                .required_child("return_type", errors)
+                .and_then(|n| parse_type2(n, errors))?;
+            Some(ParsedType::Fn(arg_types, Box::new(return_type)))
+        }
+        // TODO: Parameterized, named type support
+        "named_type" | "identifier" => Some(ParsedType::Named(node.text().to_string(), vec![])),
+        _ => {
+            errors.push(ParseError::UnexpectedNodeType {
+                expected: "type",
+                found: node.kind(),
+                node_text: node.text(),
+            });
+            None
+        }
+    }
+}
 
 // --- Statement Parsing ---
 fn parse_statement<'s>(
@@ -902,9 +959,10 @@ fn parse_soft_binding<'s>(
         .map(|n| n.text().to_string());
     let ty = node
         .optional_child("type", errors)
-        .and_then(|n| parse_type(n, errors));
+        .and_then(|n| parse_type2(n, errors))
+        .unwrap_or(ParsedType::Unspecified);
 
-    name.map(|name| SoftBinding { name, ty, mutable })
+    name.map(|name| SoftBinding { name, parsed_type: ty, ty: Type::unknown(), mutable })
 }
 
 fn parse_l_value<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) -> Option<LValue> {
@@ -1095,14 +1153,12 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
-                        None,
-                        false,
                         lambda_expr(
-                            vec![SoftBinding::new("x", None, false)],
+                            vec![SoftBinding::new("x")],
                             call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
-                    let_stmt("b", None, true, 2),
+                    let_mut_stmt("b", 2),
                     assign_stmt("b", call_expr("plus_two", vec!["b".into()])),
                     "b".into(),
                 ])),
@@ -1142,10 +1198,8 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
-                        None,
-                        false,
                         lambda_expr(
-                            vec![SoftBinding::new("x", None, false)],
+                            vec![SoftBinding::new("x")],
                             call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
@@ -1585,30 +1639,23 @@ mod tests {
             body: Some(block_expr(vec![Expression::Handle {
                 co: Box::new(call_expr("foo", vec![])),
                 return_arm: Some((
-                    SoftBinding {
-                        name: "x".to_string(),
-                        mutable: false,
-                        ty: None,
-                    },
+                    SoftBinding::new("x"),
                     Box::new(call_expr("bar", vec!["x".into(), "x".into()])),
                 )),
                 op_arms: vec![
                     HandleOpArm {
                         op_name: "foo".to_string(),
                         performed_variable: SoftBinding {
-                            name: "y".to_string(),
+                            name: "y".into(),
+                            parsed_type: ParsedType::Unit,
+                            ty: Type::unknown(),
                             mutable: true,
-                            ty: Some(Type::unit()),
                         },
                         body: call_expr("baz", vec!["y".into()]),
                     },
                     HandleOpArm {
                         op_name: "bar".to_string(),
-                        performed_variable: SoftBinding {
-                            name: "z".to_string(),
-                            ty: None,
-                            mutable: false,
-                        },
+                        performed_variable: SoftBinding::new("z"),
                         body: block_expr(vec![resume_stmt(call_expr("z", vec![1.into()]))]),
                     },
                 ],

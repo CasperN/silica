@@ -536,6 +536,148 @@ impl OpSetI {
 }
 
 // *************************************************************************************************
+//  Parsed Types
+// *************************************************************************************************
+
+// TODO: Get rid of strings here.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub enum ParsedType {
+    #[default]
+    Unspecified,
+    Unit,
+    Int,
+    Bool,
+    Float,
+    Never,
+    Fn(Vec<ParsedType>, Box<ParsedType>),
+    Co(Box<ParsedType>, Vec<ParsedOp>),
+    Named(String, Vec<ParsedType>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedOp {
+    Anonymous(String, ParsedType, ParsedType),
+    NamedEffect {
+        name: Option<String>,
+        effect: String,
+        op_name: Option<String>,
+    },
+}
+
+fn resolve_type(context: &TypeContext, ty: &ParsedType) -> Result<Type, Error> {
+    match ty {
+        ParsedType::Unspecified => Ok(Type::unknown()),
+        ParsedType::Unit => Ok(Type::unit()),
+        ParsedType::Int => Ok(Type::int()),
+        ParsedType::Bool => Ok(Type::bool_()),
+        ParsedType::Float => Ok(Type::float()),
+        ParsedType::Never => Ok(Type::never()),
+        ParsedType::Fn(args, ret) => {
+            let mut resolved_args = Vec::new();
+            for arg in args {
+                resolved_args.push(resolve_type(context, arg)?);
+            }
+            let ret = resolve_type(context, ret)?;
+            Ok(Type::func(resolved_args, ret))
+        }
+        ParsedType::Co(ret, ops) => {
+            let ret = resolve_type(context, ret)?;
+            let mut anonymous_ops = HashMap::new();
+            let mut named_effects = HashMap::new();
+
+            for op in ops {
+                match op {
+                    ParsedOp::Anonymous(op_name, p_ty, r_ty) => {
+                        let perform_type = resolve_type(context, p_ty)?;
+                        let resume_type = resolve_type(context, r_ty)?;
+                        if anonymous_ops
+                            .insert(op_name.clone(), (perform_type, resume_type))
+                            .is_some()
+                        {
+                            return Err(Error::DuplicateOpName(op_name.clone()));
+                        }
+                    }
+                    ParsedOp::NamedEffect {
+                        name,
+                        effect,
+                        op_name,
+                    } => {
+                        if let Some(NamedItem::Effect(decl)) = context.names.get(effect) {
+                            let name = name.clone().unwrap_or_else(|| decl.name.clone());
+                            match named_effects.entry(name) {
+                                Entry::Vacant(entry) => {
+                                    let ops: HashSet<String> = if let Some(op_name) = op_name {
+                                        [op_name.clone()].into_iter().collect()
+                                    } else {
+                                        // If no op_name is specified, add all of them.
+                                        decl.ops.keys().cloned().collect()
+                                    };
+                                    assert!(decl.params.is_empty());
+                                    let instance = EffectInstance {
+                                        params: BTreeMap::new(),
+                                        decl: decl.clone(),
+                                    };
+                                    entry.insert((instance, ops));
+                                }
+                                Entry::Occupied(mut entry) => {
+                                    let (_decl, ops) = entry.get_mut();
+                                    if let Some(op_name) = op_name {
+                                        if ops.insert(op_name.clone()) {
+                                            return Err(Error::DuplicateOpName(op_name.clone()));
+                                        }
+                                    } else {
+                                        return Err(Error::DuplicateNamedEffect(effect.clone()));
+                                    }
+                                }
+                            }
+                        } else {
+                            return Err(Error::ExpectedNamedEffect(effect.clone()));
+                        }
+                    }
+                }
+            }
+            let opset = OpSet::new(OpSetI {
+                anonymous_ops,
+                named_effects,
+                super_sets: Vec::new(),
+                done_extending: true,
+            });
+            Ok(Type::co(ret, opset))
+        }
+        ParsedType::Named(name, parsed_params) => {
+            match context.names.get(name) {
+                // TODO: Type parameters, like foo<T> need to be supported by type context and
+                // resolved here.
+                Some(NamedItem::Struct(decl)) => {
+                    if decl.params.len() != parsed_params.len() {
+                        return Err(Error::ParameterCountMismatch(
+                            name.clone(),
+                            parsed_params.clone(),
+                        ));
+                    }
+                    // TODO: Params in struct decl should be in order, not sorted :/
+                    // This is pretty wrong, unless params so happen to be sorted.
+                    let mut params = BTreeMap::new();
+                    for (parsed_param, name) in parsed_params.iter().zip(decl.params.iter()) {
+                        let ty = resolve_type(context, parsed_param)?;
+                        if params.insert(name.clone(), ty).is_some() {
+                            panic!("fixme.")
+                        }
+                    }
+                    Ok(Type::struct_(StructInstance {
+                        params,
+                        decl: decl.clone(),
+                    }))
+                }
+                _ => {
+                    Err(Error::ExpectedNamedType(name.clone()))
+                }
+            }
+        }
+    }
+}
+
+// *************************************************************************************************
 //  Unification
 // *************************************************************************************************
 
@@ -812,15 +954,25 @@ impl TypedBinding {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SoftBinding {
     pub name: String,
-    pub ty: Option<Type>,
+    pub parsed_type: ParsedType,
+    pub ty: Type,
     pub mutable: bool,
 }
 impl SoftBinding {
-    pub fn new(name: impl Into<String>, ty: impl Into<Option<Type>>, mutable: bool) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            ty: ty.into(),
-            mutable,
+            parsed_type: ParsedType::Unspecified,
+            ty: Type::unknown(),
+            mutable: false,
+        }
+    }
+    pub fn new_mut(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            parsed_type: ParsedType::Unspecified,
+            ty: Type::unknown(),
+            mutable: true,
         }
     }
 }
@@ -830,7 +982,7 @@ pub struct FnDecl {
     pub forall: BTreeSet<String>,
     pub name: String,
     pub args: Vec<TypedBinding>,
-    pub return_type: Type,
+    pub return_type: Type,  // TODO: This should be the parsed type...
     // If no body is provided, its assumed to be external.
     pub body: Option<Expression>,
 }
@@ -1060,8 +1212,7 @@ impl<'a> ShadowTypeContext<'a> {
         self.insert_variable(name, ty, mutable);
     }
     fn insert_soft_binding(&mut self, binding: SoftBinding) -> Type {
-        let SoftBinding { name, ty, mutable } = binding;
-        let ty = ty.unwrap_or_else(Type::unknown);
+        let SoftBinding { name, ty, mutable, parsed_type: _ } = binding;
         self.insert_variable(name, ty.clone(), mutable);
         ty
     }
@@ -1155,8 +1306,7 @@ enum Error {
         effect_or_instance: Option<String>,
         op_name: String,
     },
-    DuplicateAnonymousOpName(String),
-    OpSetNameConflict(String),
+    DuplicateOpName(String),
     NoMatchingOpInEffectDecl(String, EffectDecl),
     NamedEffectInstanceMismatch(EffectInstance, EffectInstance),
     FnDeclMustHaveConcreteTypes(FnDecl),
@@ -1168,6 +1318,10 @@ enum Error {
     InapplicableConstraint(Type, Constraint),
     ExpressisonTypeNotInferred(Expression),
     UnexpectedResume(Expression),
+    ParameterCountMismatch(String, Vec<ParsedType>),
+    ExpectedNamedType(String),
+    ExpectedNamedEffect(String),
+    DuplicateNamedEffect(String),
 }
 
 // *************************************************************************************************
@@ -1402,14 +1556,12 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                     }
                     Statement::Let { binding, value } => {
                         let context = shadow.context();
+                        unify(&binding.ty, &resolve_type(context, &binding.parsed_type)?)?;
                         infer(context, value)?;
-                        let value_type = value.get_type().clone();
-                        if let Some(binding_ty) = &binding.ty {
-                            unify(binding_ty, &value_type)?;
-                        }
+                        unify(&binding.ty, &value.get_type())?;
                         shadow.insert_variable(
                             binding.name.clone(),
-                            value_type.clone(),
+                            value.get_type(),
                             binding.mutable,
                         );
                         last_statement_type = Type::unit();
@@ -1732,16 +1884,31 @@ pub mod test_helpers {
 
     pub fn let_stmt(
         name: &str,
-        ty: impl Into<Option<Type>>,
+        value: impl Into<Expression>,
+    ) -> Statement {
+        Statement::Let {
+            binding: SoftBinding::new(name),
+            value: value.into(),
+        }
+    }
+    pub fn full_let_stmt(
+        name: &str,
+        type_: Type,
         mutable: bool,
         value: impl Into<Expression>,
     ) -> Statement {
         Statement::Let {
-            binding: SoftBinding {
-                name: name.to_string(),
-                ty: ty.into(),
-                mutable,
-            },
+            binding: SoftBinding { name: name.to_string(),
+                parsed_type: ParsedType::Unspecified, ty: type_, mutable },
+            value: value.into(),
+        }
+    }
+    pub fn let_mut_stmt(
+        name: &str,
+        value: impl Into<Expression>,
+    ) -> Statement {
+        Statement::Let {
+            binding: SoftBinding::new_mut(name),
             value: value.into(),
         }
     }
@@ -1889,12 +2056,10 @@ mod tests {
                 args: vec![],
                 return_type: Type::int(),
                 body: Some(block_expr(vec![
-                    let_stmt("a", None, false, 2),
-                    let_stmt("b", None, false, 2),
+                    let_stmt("a", 2),
+                    let_stmt("b", 2),
                     let_stmt(
                         "c",
-                        None,
-                        false,
                         call_expr("plus", vec!["a".into(), "b".into()]),
                     ),
                     "c".into(),
@@ -1911,9 +2076,9 @@ mod tests {
             args: vec![],
             return_type: Type::bool_(),
             body: Some(block_expr(vec![
-                let_stmt("a", None, false, 2),
-                let_stmt("a", None, false, 2.0),
-                let_stmt("a", None, false, true),
+                let_stmt("a", 2),
+                let_stmt("a", 2.0),
+                let_stmt("a", true),
                 "a".into(),
             ])),
         })]);
@@ -1939,7 +2104,7 @@ mod tests {
             args: vec![],
             return_type: Type::unit(),
             body: Some(block_expr(vec![
-                let_stmt("a", None, true, 2),
+                let_mut_stmt("a", 2),
                 assign_stmt("a", ()),
             ])),
         })]);
@@ -1956,7 +2121,7 @@ mod tests {
             args: vec![],
             return_type: Type::unit(),
             body: Some(block_expr(vec![
-                let_stmt("a", None, false, 2),
+                let_stmt("a", 2),
                 assign_stmt("a", 3),
             ])),
         })]);
@@ -1981,9 +2146,9 @@ mod tests {
                 args: vec![],
                 return_type: Type::int(),
                 body: Some(block_expr(vec![
-                    let_stmt("a", None, false, true),
-                    let_stmt("b", None, false, 2),
-                    let_stmt("c", None, false, 2.0),
+                    let_stmt("a", true),
+                    let_stmt("b", 2),
+                    let_stmt("c", 2.0),
                     Statement::Expression(if_expr("a", "b", call_expr("round", vec!["c".into()]))),
                 ])),
             }),
@@ -2011,14 +2176,12 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
-                        None,
-                        false,
                         lambda_expr(
-                            vec![SoftBinding::new("x", None, false)],
+                            vec![SoftBinding::new("x")],
                             call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
-                    let_stmt("b", None, true, 2),
+                    let_mut_stmt("b", 2),
                     assign_stmt("b", call_expr("plus_two", vec!["b".into()])),
                     "b".into(),
                 ])),
@@ -2047,10 +2210,8 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
-                        None,
-                        false,
                         lambda_expr(
-                            vec![SoftBinding::new("x", None, false)],
+                            vec![SoftBinding::new("x")],
                             call_expr("plus", vec![2.into(), "x".into()]),
                         ),
                     ),
@@ -2081,10 +2242,8 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
-                        None,
-                        false,
                         lambda_expr(
-                            vec![SoftBinding::new("x", None, false)],
+                            vec![SoftBinding::new("x")],
                             block_expr(vec![return_stmt(call_expr(
                                 "plus",
                                 vec![2.into(), "x".into()],
@@ -2152,8 +2311,8 @@ mod tests {
                 args: vec![],
                 return_type: Type::float(),
                 body: Some(block_expr(vec![
-                    let_stmt("x", None, false, call_expr("id", vec![12.34.into()])),
-                    let_stmt("b", None, false, call_expr("id", vec![false.into()])),
+                    let_stmt("x", call_expr("id", vec![12.34.into()])),
+                    let_stmt("b", call_expr("id", vec![false.into()])),
                     if_expr("b", "x", 23.45).into(),
                 ])),
             }),
@@ -2242,14 +2401,8 @@ mod tests {
                 // Explicit return in true branch, implicit return in false.
                 let_stmt(
                     "x",
-                    None,
-                    false,
                     lambda_expr(
-                        vec![SoftBinding {
-                            name: "x".to_string(),
-                            ty: None,
-                            mutable: false,
-                        }],
+                        vec![SoftBinding::new("x")],
                         call_expr("x", vec!["x".into()]),
                     ),
                 ),
@@ -2281,9 +2434,9 @@ mod tests {
             args: vec![],
             return_type: Type::unit(),
             body: Some(block_expr(vec![
-                let_stmt("x", None, false, 1),
-                let_stmt("y", None, false, false),
-                let_stmt("z", None, false, 19.95),
+                let_stmt("x", 1),
+                let_stmt("y", false),
+                let_stmt("z", 19.95),
             ])),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
@@ -2381,7 +2534,7 @@ mod tests {
                 return_type: Type::int(),
                 body: Some(block_expr(vec![
                     // let add_5 = make_adder(5)
-                    let_stmt("add5", None, false, call_expr("make_adder", vec![5.into()])),
+                    let_stmt("add5", call_expr("make_adder", vec![5.into()])),
                     // apply(add5, 10)
                     call_expr("apply", vec!["add5".into(), 10.into()]).into(),
                 ])),
@@ -2407,8 +2560,6 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "p",
-                        None,
-                        false,
                         Expression::LiteralStruct {
                             name: "Pair".to_string(),
                             fields: HashMap::from_iter([
@@ -2441,8 +2592,6 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "p",
-                        None,
-                        false,
                         Expression::LiteralStruct {
                             name: "Pair".to_string(),
                             fields: HashMap::from_iter([
@@ -2469,7 +2618,7 @@ mod tests {
             args: vec![],
             return_type: Type::bool_(),
             body: Some(block_expr(vec![
-                let_stmt("p", None, false, ()),
+                let_stmt("p", ()),
                 field("p", "whoopsie").into(),
             ])),
         })]);
@@ -2504,12 +2653,10 @@ mod tests {
                 return_type: Type::int(),
                 body: Some(block_expr(vec![
                     // Initialize `p` with some polymorphic default fn.
-                    let_stmt("p", None, true, call_expr("default", vec![])),
+                    let_mut_stmt("p", call_expr("default", vec![])),
                     // Use and constrain "p" before its type is known.
                     let_stmt(
                         "r",
-                        None,
-                        false,
                         if_expr(field("p", "left"), field("p", "right"), 42),
                     ),
                     // Assign to "p" to give it a type.
@@ -2554,12 +2701,10 @@ mod tests {
                 return_type: Type::int(),
                 body: Some(block_expr(vec![
                     // Initialize `p` with some polymorphic default fn.
-                    let_stmt("p", None, true, call_expr("default", vec![])),
+                    let_mut_stmt("p", call_expr("default", vec![])),
                     // Use and constrain "p" before its type is known.
                     let_stmt(
                         "r",
-                        None,
-                        false,
                         if_expr(field("p", "left"), field("p", "whoopsie"), 42),
                     ),
                     // Assign to "p" to give it a type.
@@ -2609,7 +2754,7 @@ mod tests {
                     pair_type(Type::param("T"), Type::param("U")),
                 ),
                 body: Some(block_expr(vec![lambda_expr(
-                    vec![SoftBinding::new("b", None, false)],
+                    vec![SoftBinding::new("b")],
                     Expression::LiteralStruct {
                         name: "Pair".to_string(),
                         fields: HashMap::from_iter([
@@ -2632,14 +2777,10 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "bool_int",
-                        None,
-                        false,
                         call_expr(call_expr("make_pair", vec![true.into()]), vec![123.into()]),
                     ),
                     let_stmt(
                         "int_float",
-                        None,
-                        false,
                         call_expr(call_expr("make_pair", vec![123.into()]), vec![12.3.into()]),
                     ),
                     call_expr(
@@ -2665,7 +2806,7 @@ mod tests {
             return_type: Type::bool_(),
             ops,
             body: Some(block_expr(vec![
-                let_stmt("p", None, false, perform_anon("foo", 1)),
+                let_stmt("p", perform_anon("foo", 1)),
                 "p".into(),
             ])),
         })]);
@@ -2710,9 +2851,9 @@ mod tests {
                 return_type: Type::bool_(),
                 ops,
                 body: Some(block_expr(vec![
-                    let_stmt("x", Type::int(), false, perform("int_state", "get", ())),
+                    full_let_stmt("x", Type::int(), false, perform("int_state", "get", ())),
                     perform("int_state", "set", "x").into(),
-                    let_stmt("y", Type::bool_(), false, perform("bool_state", "get", ())),
+                    full_let_stmt("y", Type::bool_(), false, perform("bool_state", "get", ())),
                     perform("bool_state", "set", "y").into(),
                     "y".into(),
                 ])),
@@ -2829,7 +2970,7 @@ mod tests {
                 return_type: Type::bool_(),
                 ops: foo_ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
                 ])),
             }),
@@ -2862,7 +3003,7 @@ mod tests {
                 return_type: Type::bool_(),
                 ops: ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
                 ])),
             }),
@@ -2898,7 +3039,7 @@ mod tests {
                 return_type: Type::bool_(),
                 ops: ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
                 ])),
             }),
@@ -2910,8 +3051,6 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "x",
-                        None,
-                        false,
                         lambda_expr(
                             vec![],
                             co_expr(block_expr(vec![return_stmt(propagate(call_expr(
@@ -2957,7 +3096,7 @@ mod tests {
                 return_type: Type::bool_(),
                 ops: foo_ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
                 ])),
             }),
@@ -2968,7 +3107,7 @@ mod tests {
                 return_type: Type::float(),
                 ops: bar_ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("bar", ())),
+                    let_stmt("p", perform_anon("bar", ())),
                     "p".into(),
                 ])),
             }),
@@ -2980,14 +3119,10 @@ mod tests {
                 body: Some(block_expr(vec![co_expr(block_expr(vec![
                     let_stmt(
                         "f",
-                        None,
-                        false,
                         propagate(call_expr("performs_foo", vec![])),
                     ),
                     let_stmt(
                         "b",
-                        None,
-                        false,
                         propagate(call_expr("performs_bar", vec![])),
                     ),
                 ]))
@@ -3028,7 +3163,7 @@ mod tests {
                 return_type: Type::bool_(),
                 ops: foo_ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
                 ])),
             }),
@@ -3039,7 +3174,7 @@ mod tests {
                 return_type: Type::float(),
                 ops: bar_ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("bar", ())),
+                    let_stmt("p", perform_anon("bar", ())),
                     "p".into(),
                 ])),
             }),
@@ -3051,20 +3186,10 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "lambda",
-                        None,
-                        false,
                         lambda_expr(
                             vec![
-                                SoftBinding {
-                                    name: "f".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
-                                SoftBinding {
-                                    name: "b".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                SoftBinding::new("f"),
+                                SoftBinding::new("b"),
                             ],
                             co_expr(block_expr(vec![
                                 propagate("f").into(),
@@ -3117,7 +3242,7 @@ mod tests {
                 return_type: Type::bool_(),
                 ops: foo_ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
                 ])),
             }),
@@ -3128,7 +3253,7 @@ mod tests {
                 return_type: Type::float(),
                 ops: bar_ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("bar", ())),
+                    let_stmt("p", perform_anon("bar", ())),
                     "p".into(),
                 ])),
             }),
@@ -3141,20 +3266,10 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "lambda",
-                        None,
-                        false,
                         lambda_expr(
                             vec![
-                                SoftBinding {
-                                    name: "f".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
-                                SoftBinding {
-                                    name: "b".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                SoftBinding::new("f"),
+                                SoftBinding::new("b"),
                             ],
                             co_expr(block_expr(vec![
                                 propagate("f").into(),
@@ -3204,7 +3319,7 @@ mod tests {
                 return_type: Type::bool_(),
                 ops: foo_ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("foo", 1)),
+                    let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
                 ])),
             }),
@@ -3215,7 +3330,7 @@ mod tests {
                 return_type: Type::float(),
                 ops: bar_ops.clone(),
                 body: Some(block_expr(vec![
-                    let_stmt("p", None, false, perform_anon("bar", ())),
+                    let_stmt("p", perform_anon("bar", ())),
                     "p".into(),
                 ])),
             }),
@@ -3228,20 +3343,10 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "lambda",
-                        None,
-                        false,
                         lambda_expr(
                             vec![
-                                SoftBinding {
-                                    name: "f".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
-                                SoftBinding {
-                                    name: "b".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                SoftBinding::new("f"),
+                                SoftBinding::new("b"),
                             ],
                             co_expr(block_expr(vec![
                                 propagate("f").into(),
@@ -3368,7 +3473,7 @@ mod tests {
                 args: vec![],
                 return_type: Type::unit(),
                 body: Some(block_expr(vec![
-                    let_stmt("foo", None, false, call_expr("default", vec![])),
+                    let_stmt("foo", call_expr("default", vec![])),
                     return_stmt(()),
                 ])),
             }),
@@ -3388,8 +3493,6 @@ mod tests {
             body: Some(block_expr(vec![
                 let_stmt(
                     "performs_bar",
-                    None,
-                    false,
                     co_expr(perform_anon("bar", 53)),
                 ),
                 propagate("performs_bar").into(),
@@ -3419,20 +3522,14 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo",
-                        None,
-                        false,
                         co_expr(perform_anon("foo", 53)),
                     ),
                     let_stmt(
                         "performs_bar",
-                        None,
-                        false,
                         co_expr(perform_anon("bar", 53)),
                     ),
                     let_stmt(
                         "both",
-                        None,
-                        false,
                         co_expr(call_expr(
                             "plus",
                             vec![propagate("performs_bar"), propagate("performs_foo")],
@@ -3445,20 +3542,12 @@ mod tests {
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: 42.into(), // Ignore the effect.
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: 42.into(), // Ignore the effect.
                             },
                         ],
@@ -3491,20 +3580,14 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo",
-                        None,
-                        false,
                         co_expr(perform_anon("foo", 53.42)),
                     ),
                     let_stmt(
                         "performs_bar",
-                        None,
-                        false,
                         co_expr(perform_anon("bar", 53)),
                     ),
                     let_stmt(
                         "calls_something",
-                        None,
-                        false,
                         co_expr(call_expr(
                             "something",
                             vec![propagate("performs_bar"), propagate("performs_foo")],
@@ -3517,20 +3600,12 @@ mod tests {
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: block_expr(vec![resume_stmt("x")]),
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: block_expr(vec![resume_stmt("x")]),
                             },
                         ],
@@ -3563,10 +3638,8 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo_and_bar",
-                        None,
-                        false,
                         co_expr(block_expr(vec![
-                            let_stmt("bar", Type::bool_(), false, perform_anon("bar", 4.2)),
+                            full_let_stmt("bar", Type::bool_(), false, perform_anon("bar", 4.2)),
                             perform_anon("foo", 53).into(),
                         ])),
                     ),
@@ -3576,11 +3649,7 @@ mod tests {
                         return_arm: None,
                         op_arms: vec![HandleOpArm {
                             op_name: "foo".to_string(),
-                            performed_variable: SoftBinding {
-                                name: "x".to_string(),
-                                ty: None,
-                                mutable: false,
-                            },
+                            performed_variable: SoftBinding::new("x"),
                             body: "x".into(),
                         }],
                     }
@@ -3612,10 +3681,8 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo_and_bar",
-                        None,
-                        false,
                         co_expr(block_expr(vec![
-                            let_stmt("bar", Type::bool_(), false, perform_anon("bar", 4.2)),
+                            full_let_stmt("bar", Type::bool_(), false, perform_anon("bar", 4.2)),
                             perform_anon("foo", 53).into(),
                         ])),
                     ),
@@ -3626,20 +3693,12 @@ mod tests {
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: "x".into(),
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: "x".into(),
                             },
                         ],
@@ -3672,8 +3731,6 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo",
-                        None,
-                        false,
                         co_expr(block_expr(vec![perform_anon("foo", 53).into()])),
                     ),
                     Expression::Handle {
@@ -3683,20 +3740,12 @@ mod tests {
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: "x".into(),
                             },
                             HandleOpArm {
                                 op_name: "irrelevant".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: block_expr(vec![
                                     resume_stmt(()), // Give the resume a unit type.
                                     "x".into(),      // Returned x makes perform type an int.
@@ -3735,20 +3784,14 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo",
-                        None,
-                        false,
                         co_expr(perform_anon("foo", 53.42)),
                     ),
                     let_stmt(
                         "performs_bar",
-                        None,
-                        false,
                         co_expr(perform_anon("bar", 53)),
                     ),
                     let_stmt(
                         "calls_something",
-                        None,
-                        false,
                         co_expr(call_expr(
                             "something",
                             vec![propagate("performs_bar"), propagate("performs_foo")],
@@ -3758,30 +3801,18 @@ mod tests {
                         co: Box::new("calls_something".into()),
                         ty: Type::unknown(),
                         return_arm: Some((
-                            SoftBinding {
-                                name: "r".to_string(),
-                                ty: None,
-                                mutable: false,
-                            },
+                            SoftBinding::new("r"),
                             Box::new(12.into()),
                         )),
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: block_expr(vec![resume_stmt("x")]),
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: block_expr(vec![42.into()]),
                             },
                         ],
@@ -3814,20 +3845,14 @@ mod tests {
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo",
-                        None,
-                        false,
                         co_expr(perform_anon("foo", 53.42)),
                     ),
                     let_stmt(
                         "performs_bar",
-                        None,
-                        false,
                         co_expr(perform_anon("bar", 53)),
                     ),
                     let_stmt(
                         "calls_something",
-                        None,
-                        false,
                         co_expr(call_expr(
                             "something",
                             vec![propagate("performs_bar"), propagate("performs_foo")],
@@ -3837,31 +3862,19 @@ mod tests {
                         co: Box::new("calls_something".into()),
                         ty: Type::unknown(),
                         return_arm: Some((
-                            SoftBinding {
-                                name: "r".to_string(),
-                                ty: None,
-                                mutable: false,
-                            },
+                            SoftBinding::new("r"),
                             Box::new(12.into()),
                         )),
                         op_arms: vec![
                             HandleOpArm {
                                 op_name: "foo".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 // Never type.
                                 body: block_expr(vec![resume_stmt("x")]),
                             },
                             HandleOpArm {
                                 op_name: "bar".to_string(),
-                                performed_variable: SoftBinding {
-                                    name: "x".to_string(),
-                                    ty: None,
-                                    mutable: false,
-                                },
+                                performed_variable: SoftBinding::new("x"),
                                 body: block_expr(vec![
                                     42.32.into(), // Not an int!
                                 ]),
