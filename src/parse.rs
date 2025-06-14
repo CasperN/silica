@@ -2,7 +2,7 @@ use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 use crate::ast::{
     Binding, CoDecl, Declaration, EffectDecl, Expression, FnDecl, HandleOpArm, LValue, OpSet,
-    OpSetI, ParsedType, Program, Statement, StructDecl, Type,
+    OpSetI, Program, Statement, StructDecl, Type,
 };
 use tree_sitter::{Language, Node, Parser};
 
@@ -205,6 +205,94 @@ pub enum ParseError<'source> {
 
 // Helper type alias for results
 type ParseResult<'source, T> = Result<T, ParseError<'source>>;
+
+// *************************************************************************************************
+//  Parsed Types
+// *************************************************************************************************
+
+// TODO: Get rid of strings here.
+// TODO Rename this to just parse::Type?
+#[derive(Default, Debug, Clone, PartialEq)]
+pub enum ParsedType {
+    #[default]
+    Unspecified,
+    Unit,
+    Int,
+    Bool,
+    Float,
+    Never,
+    Fn(Vec<ParsedType>, Box<ParsedType>),
+    Co(Box<ParsedType>, Vec<ParsedOp>),
+    Named(String, Vec<ParsedType>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParsedOp {
+    Anonymous(String, ParsedType, ParsedType),
+    NamedEffect {
+        name: Option<String>,
+        effect: String, // TODO: Parameterized effects?
+        op_name: Option<String>,
+    },
+}
+impl ParsedOp {
+    // Does not contain ParsedType::Unspecified.
+    fn is_specified(&self) -> bool {
+        match self {
+            Self::Anonymous(_name, p_ty, r_ty) => p_ty.is_specified() && r_ty.is_specified(),
+            Self::NamedEffect { .. } => true,
+        }
+    }
+}
+
+impl ParsedType {
+    pub fn func(args: impl AsRef<[Self]>, ret: Self) -> Self {
+        Self::Fn(args.as_ref().to_vec(), Box::new(ret))
+    }
+    pub fn named(name: &str) -> Self {
+        Self::Named(name.to_string(), vec![])
+    }
+    pub fn is_specified(&self) -> bool {
+        match self {
+            Self::Unspecified => false,
+            Self::Bool | Self::Float | Self::Int | Self::Never | Self::Unit => true,
+            Self::Fn(args, ret) => ret.is_specified() && args.iter().all(|a| a.is_specified()),
+            Self::Named(_name, params) => params.iter().all(|p| p.is_specified()),
+            Self::Co(ret, ops) => ret.is_specified() && ops.iter().all(|op| op.is_specified()),
+        }
+    }
+}
+
+// TODO: str instead of string?
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ParsedStructDecl {
+    pub(crate) name: String,
+    pub(crate) params: Vec<String>,
+    pub(crate) fields: Vec<(String, ParsedType)>,
+}
+impl ParsedStructDecl {
+    pub fn new(name: impl Into<String>, fields: &[(&str, ParsedType)]) -> Self {
+        Self::parameterized(name, &[], fields)
+    }
+    pub fn parameterized(
+        name: impl Into<String>,
+        params: &[&str],
+        fields: &[(&str, ParsedType)],
+    ) -> Self {
+        Self {
+            name: name.into(),
+            params: params.iter().map(|p| p.to_string()).collect(),
+            fields: fields
+                .iter()
+                .map(|(n, t)| (n.to_string(), t.clone()))
+                .collect(),
+        }
+    }
+}
+
+// *************************************************************************************************
+//  Parse functions
+// *************************************************************************************************
 
 /// Converts a tree-sitter Tree into an ast::Program
 pub fn parse_ast_program<'s>(source: &'s str, errors: &mut Vec<ParseError<'s>>) -> Option<Program> {
@@ -432,52 +520,38 @@ fn parse_struct_decl<'s>(
     node: SourceNode<'s, '_>,
     errors: &mut Vec<ParseError<'s>>,
 ) -> Option<Declaration> {
-    let struct_name = node.required_child("name", errors).map(|n| n.text());
+    let struct_name = node.required_child("name", errors).map(|n| n.text())?;
     let params = node
-        .optional_child("generic_parameters", errors)
+        .optional_child("parameters", errors)
         .map(|node| parse_generic_params(node, errors))
         .unwrap_or_default();
 
-    let mut fields = HashMap::new();
+    let mut seen_field_names = HashSet::new();
+    let mut fields = Vec::new();
     for field_node in node.children_by_field_name("fields", errors) {
-        if field_node.kind() == "struct_field_declaration" {
-            let (field_name, field_type) = match parse_struct_field(field_node, errors) {
-                Some((f, t)) => (f, t),
-                None => continue,
-            };
-            match fields.entry(field_name.to_string()) {
-                Entry::Occupied(_) => {
-                    errors.push(ParseError::DuplicateItem {
-                        duplicated_item: field_name,
-                        item_type: "field",
-                        context_name: struct_name.unwrap_or_default(),
-                        context_type: "struct",
-                    });
-                }
-                Entry::Vacant(e) => {
-                    e.insert(field_type);
-                }
+        let field_name = field_node.required_child("name", errors).map(|n| n.text());
+        let field_ty = field_node
+            .required_child("type", errors)
+            .and_then(|n| parse_type2(n, errors))
+            .unwrap_or_default();
+        if let Some(field_name) = field_name {
+            if !seen_field_names.insert(field_name) {
+                errors.push(ParseError::DuplicateItem {
+                    duplicated_item: field_name,
+                    item_type: "field",
+                    context_name: struct_name,
+                    context_type: "struct",
+                });
+            } else {
+                fields.push((field_name.to_string(), field_ty));
             }
         }
     }
-    struct_name.map(|s| {
-        Declaration::Struct(StructDecl {
-            params,
-            name: s.to_string(),
-            fields,
-        })
-    })
-}
-
-fn parse_struct_field<'s>(
-    node: SourceNode<'s, '_>,
-    errors: &mut Vec<ParseError<'s>>,
-) -> Option<(&'s str, Type)> {
-    let name = node.required_child("name", errors).map(|n| n.text());
-    let ty = node
-        .required_child("type", errors)
-        .and_then(|n| parse_type(n, errors));
-    Some((name?, ty?))
+    Some(Declaration::Struct(ParsedStructDecl {
+        name: struct_name.to_string(),
+        params,
+        fields,
+    }))
 }
 
 fn parse_generic_params<'s>(
@@ -512,7 +586,7 @@ fn parse_generic_params<'s>(
 }
 
 // --- Type Parsing ---
-// TODO: Deprecate this in favor of parse_type2.
+// TODO: Deprecate this in favor of
 fn parse_type<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) -> Option<Type> {
     match node.kind() {
         "primitive_type" => {
@@ -1203,16 +1277,13 @@ mod tests {
     #[test]
     fn declare_struct() {
         let source = r"struct FooBar { foo: i64, bar: f64 }";
-        let program = Program(vec![Declaration::Struct(StructDecl {
+        let program = Program(vec![Declaration::Struct(ParsedStructDecl {
             params: vec![],
             name: "FooBar".to_string(),
-            fields: HashMap::from_iter(
-                [
-                    ("foo".to_string(), Type::int()),
-                    ("bar".to_string(), Type::float()),
-                ]
-                .into_iter(),
-            ),
+            fields: vec![
+                ("foo".to_string(), ParsedType::Int),
+                ("bar".to_string(), ParsedType::Float),
+            ],
         })]);
         let mut errors = vec![];
         let parsed = parse_ast_program(source, &mut errors);
@@ -1242,17 +1313,14 @@ mod tests {
     #[test]
     fn declare_generic_struct() {
         let source = r"struct FooBar<F, B> { foo: F, bar: B }";
-        let program = Program(vec![Declaration::Struct(StructDecl {
-            params: vec![],
-            name: "FooBar".to_string(),
-            fields: HashMap::from_iter(
-                [
-                    ("foo".to_string(), Type::param("F")),
-                    ("bar".to_string(), Type::param("B")),
-                ]
-                .into_iter(),
-            ),
-        })]);
+        let program = Program(vec![Declaration::Struct(ParsedStructDecl::parameterized(
+            "FooBar",
+            &["F", "B"],
+            &[
+                ("foo", ParsedType::named("F")),
+                ("bar", ParsedType::named("B")),
+            ],
+        ))]);
         let mut errors = vec![];
         let parsed = parse_ast_program(source, &mut errors);
         assert_eq!(&errors, &[]);
@@ -1323,16 +1391,10 @@ mod tests {
                 }
             ]
         );
-        let program = Program(vec![Declaration::Struct(StructDecl {
-            name: "Foo".to_string(),
-            params: Default::default(),
-            fields: [
-                ("foo".to_string(), Type::int()),
-                ("bar".to_string(), Type::unit()),
-            ]
-            .into_iter()
-            .collect(),
-        })]);
+        let program = Program(vec![Declaration::Struct(ParsedStructDecl::new(
+            "Foo",
+            &[("foo", ParsedType::Int), ("bar", ParsedType::Unit)],
+        ))]);
         assert_eq!(parsed, Some(program));
     }
     #[test]
@@ -1352,10 +1414,13 @@ mod tests {
         }];
         assert_eq!(errors, expected_errors);
 
-        let expected_ast = Some(Program(vec![Declaration::Struct(StructDecl {
+        let expected_ast = Some(Program(vec![Declaration::Struct(ParsedStructDecl {
             name: "Point".to_string(),
             params: vec![],
-            fields: [("x".to_string(), Type::int())].into_iter().collect(),
+            fields: vec![
+                ("x".to_string(), ParsedType::Int),
+                ("y".to_string(), ParsedType::Unspecified),
+            ],
         })]));
         assert_eq!(parsed, expected_ast);
     }
@@ -1376,11 +1441,10 @@ mod tests {
         }];
         assert_eq!(errors, expected_errors);
 
-        let expected_ast = Some(Program(vec![Declaration::Struct(StructDecl {
-            name: "Point".to_string(),
-            params: vec![],
-            fields: [("x".to_string(), Type::int())].into_iter().collect(),
-        })]));
+        let expected_ast = Some(Program(vec![Declaration::Struct(ParsedStructDecl::new(
+            "Point",
+            &[("x", ParsedType::Int)],
+        ))]));
         assert_eq!(parsed, expected_ast);
     }
     #[test]

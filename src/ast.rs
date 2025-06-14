@@ -1,5 +1,6 @@
 // Abstract syntax tree and type checking.
 #![allow(clippy::result_large_err)]
+use crate::parse::{self, ParsedOp, ParsedStructDecl, ParsedType};
 use crate::union_find::UnionFindRef;
 use std::cell::{Ref, RefMut};
 use std::collections::hash_map::Entry;
@@ -500,56 +501,30 @@ impl OpSetI {
 }
 
 // *************************************************************************************************
-//  Parsed Types
+//  Resolve Types
 // *************************************************************************************************
 
-// TODO: Get rid of strings here.
-#[derive(Default, Debug, Clone, PartialEq)]
-pub enum ParsedType {
-    #[default]
-    Unspecified,
-    Unit,
-    Int,
-    Bool,
-    Float,
-    Never,
-    Fn(Vec<ParsedType>, Box<ParsedType>),
-    Co(Box<ParsedType>, Vec<ParsedOp>),
-    Named(String, Vec<ParsedType>),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ParsedOp {
-    Anonymous(String, ParsedType, ParsedType),
-    NamedEffect {
-        name: Option<String>,
-        effect: String, // TODO: Parameterized effects?
-        op_name: Option<String>,
-    },
-}
-impl ParsedOp {
-    // Does not contain ParsedType::Unspecified.
-    fn is_specified(&self) -> bool {
-        match self {
-            Self::Anonymous(_name, p_ty, r_ty) => p_ty.is_specified() && r_ty.is_specified(),
-            Self::NamedEffect { .. } => true,
+fn resolve_struct(
+    mut shadow: ShadowTypeContext,
+    decl: &ParsedStructDecl,
+) -> Result<StructDecl, Error> {
+    let mut fields = HashMap::new();
+    for param in decl.params.iter() {
+        shadow.insert_type_param(param);
+    }
+    for (field_name, field_ty) in decl.fields.iter() {
+        let ty = resolve_type(&shadow.context(), field_ty)?;
+        if fields.insert(field_name.clone(), ty).is_some() {
+            panic!("Duplicate field name {field_name} that should have been caught earlier.");
         }
     }
-}
 
-impl ParsedType {
-    fn func(args: impl AsRef<[Self]>, ret: Self) -> Self {
-        Self::Fn(args.as_ref().to_vec(), Box::new(ret))
-    }
-    fn is_specified(&self) -> bool {
-        match self {
-            Self::Unspecified => false,
-            Self::Bool | Self::Float | Self::Int | Self::Never | Self::Unit => true,
-            Self::Fn(args, ret) => ret.is_specified() && args.iter().all(|a| a.is_specified()),
-            Self::Named(_name, params) => params.iter().all(|p| p.is_specified()),
-            Self::Co(ret, ops) => ret.is_specified() && ops.iter().all(|op| op.is_specified()),
-        }
-    }
+    shadow.finish();
+    Ok(StructDecl {
+        params: decl.params.clone(),
+        name: decl.name.clone(),
+        fields,
+    })
 }
 
 fn resolve_type(context: &TypeContext, ty: &ParsedType) -> Result<Type, Error> {
@@ -1051,7 +1026,7 @@ impl EffectDecl {
 pub enum Declaration {
     Fn(FnDecl),
     Co(CoDecl),
-    Struct(StructDecl),
+    Struct(parse::ParsedStructDecl),
     Effect(EffectDecl), // enums, traits, etc
 }
 
@@ -1759,6 +1734,8 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 shadow.insert_variable(co_decl.name.clone(), co_decl.as_type(), false);
             }
             Declaration::Struct(struct_declaration) => {
+                let struct_declaration =
+                    resolve_struct(shadow.context().shadow(), struct_declaration)?;
                 let redefined = shadow.define_struct(struct_declaration.clone());
                 if redefined {
                     return Err(Error::DuplicateTopLevelName(
@@ -2561,10 +2538,13 @@ mod tests {
 
     #[test]
     fn struct_field_access() {
-        let pair = StructDecl::new(
+        let pair = ParsedStructDecl::parameterized(
             "Pair",
-            &[("left", Type::param("T")), ("right", Type::param("U"))],
             &["T", "U"],
+            &[
+                ("left", ParsedType::named("T")),
+                ("right", ParsedType::named("U")),
+            ],
         );
 
         let program = &mut Program(vec![
@@ -2594,10 +2574,13 @@ mod tests {
     }
     #[test]
     fn struct_field_access_wrong_name() {
-        let pair = StructDecl::new(
+        let pair = ParsedStructDecl::parameterized(
             "Pair",
-            &[("left", Type::param("T")), ("right", Type::param("U"))],
             &["T", "U"],
+            &[
+                ("left", ParsedType::named("T")),
+                ("right", ParsedType::named("U")),
+            ],
         );
 
         let program = &mut Program(vec![
@@ -2650,10 +2633,13 @@ mod tests {
     }
     #[test]
     fn delayed_field_access_correct_field_names() {
-        let pair = StructDecl::new(
+        let pair = ParsedStructDecl::parameterized(
             "Pair",
-            &[("left", Type::param("T")), ("right", Type::param("U"))],
             &["T", "U"],
+            &[
+                ("left", ParsedType::named("T")),
+                ("right", ParsedType::named("U")),
+            ],
         );
 
         let program = &mut Program(vec![
@@ -2696,10 +2682,13 @@ mod tests {
 
     #[test]
     fn delayed_field_access_incorrect_field_names() {
-        let pair = StructDecl::new(
+        let pair = ParsedStructDecl::parameterized(
             "Pair",
-            &[("left", Type::param("T")), ("right", Type::param("U"))],
             &["T", "U"],
+            &[
+                ("left", ParsedType::named("T")),
+                ("right", ParsedType::named("U")),
+            ],
         );
 
         let program = &mut Program(vec![
@@ -2744,14 +2733,22 @@ mod tests {
     }
     #[test]
     fn curried_pair_polymorphic_fn_test() {
-        let pair = StructDecl::new(
+        let pair = ParsedStructDecl::parameterized(
             "Pair",
-            &[("left", Type::param("T")), ("right", Type::param("U"))],
             &["T", "U"],
+            &[
+                ("left", ParsedType::named("T")),
+                ("right", ParsedType::named("U")),
+            ],
         );
+
         let pair_type = |left_type, right_type| {
             Type::struct_(StructInstance {
-                decl: Rc::new(pair.clone()),
+                decl: Rc::new(StructDecl::new(
+                    "Pair",
+                    &[("left", Type::param("T")), ("right", Type::param("U"))],
+                    &["T", "U"],
+                )),
                 params: BTreeMap::from_iter([
                     ("T".to_string(), left_type),
                     ("U".to_string(), right_type),
