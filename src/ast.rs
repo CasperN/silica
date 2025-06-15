@@ -2074,69 +2074,55 @@ mod tests {
 
     #[test]
     fn two_plus_two() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "plus".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    let_stmt("a", 2),
-                    let_stmt("b", 2),
-                    let_stmt("c", call_expr("plus", vec!["a".into(), "b".into()])),
-                    "c".into(),
-                ])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn plus(a: i64, b: i64) -> i64;
+            fn main() -> i64 {
+                let a = 2;
+                let b = 2;
+                let c = plus(a, b);
+                c
+            }
+        "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn shadow_earlier_variables() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Bool,
-            body: Some(block_expr(vec![
-                let_stmt("a", 2),
-                let_stmt("a", 2.0),
-                let_stmt("a", true),
-                "a".into(),
-            ])),
-        })]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn main() -> bool {
+                let a = 2;
+                let a = 2.0;
+                let a = true;
+                a
+            }
+        "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
 
     #[test]
     fn assign_to_mutable_binding() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![Binding::new_typed_mut("a", ParsedType::Int)],
-            return_type: ParsedType::Unit,
-            body: Some(block_expr(vec![assign_stmt("a", 3)])),
-        })]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn main(mut a: i64) -> unit {
+                a = 3;
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn error_assign_wrong_type_to_mutable_binding() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Unit,
-            body: Some(block_expr(vec![let_mut_stmt("a", 2), assign_stmt("a", ())])),
-        })]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn main() -> unit {
+                let mut a = 2;
+                a = ();
+            }
+            "#,
+        );
         assert_eq!(
             typecheck_program(program),
             Err(Error::NotUnifiable(Type::unit(), Type::int()))
@@ -2144,13 +2130,14 @@ mod tests {
     }
     #[test]
     fn error_assign_to_immutable_binding() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Unit,
-            body: Some(block_expr(vec![let_stmt("a", 2), assign_stmt("a", 3)])),
-        })]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn main() -> unit {
+                let a = 2;
+                a = 3;
+            }
+            "#,
+        );
         assert_eq!(
             typecheck_program(program),
             Err(Error::AssignToImmutableBinding("a".to_string()))
@@ -2158,268 +2145,130 @@ mod tests {
     }
     #[test]
     fn if_expression_unifies() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "round".to_string(),
-                args: vec![Binding::new_typed("a", ParsedType::Float)],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    let_stmt("a", true),
-                    let_stmt("b", 2),
-                    let_stmt("c", 2.0),
-                    Statement::Expression(if_expr("a", "b", call_expr("round", vec!["c".into()]))),
-                ])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn round(a: f64) -> i64;
+            fn main() -> i64 {
+                let a = true;
+                let b = 2;
+                let c = 2.0;
+                if a then b else round(c)
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn use_lambda() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "plus".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "plus_two",
-                        lambda_expr(
-                            vec![Binding::new("x")],
-                            call_expr("plus", vec![2.into(), "x".into()]),
-                        ),
-                    ),
-                    let_mut_stmt("b", 2),
-                    assign_stmt("b", call_expr("plus_two", vec!["b".into()])),
-                    "b".into(),
-                ])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn plus(a: i64, b: i64) -> i64;
+            fn main() -> i64 {
+                let plus_two = |x| plus(2, x);
+                let mut b = 2;
+                b = plus_two(b);
+                b
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn return_lambda() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "plus".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::func([ParsedType::Int], ParsedType::Int),
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "plus_two",
-                        lambda_expr(
-                            vec![Binding::new("x")],
-                            call_expr("plus", vec![2.into(), "x".into()]),
-                        ),
-                    ),
-                    "plus_two".into(),
-                ])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn plus(a: i64, b: i64) -> i64;
+            fn main() -> fn(i64) -> i64 {
+                let plus_two = |x| plus(2, x);
+                plus_two
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn return_in_lambda() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "plus".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::func([ParsedType::Int], ParsedType::Int),
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "plus_two",
-                        lambda_expr(
-                            vec![Binding::new("x")],
-                            block_expr(vec![return_stmt(call_expr(
-                                "plus",
-                                vec![2.into(), "x".into()],
-                            ))]),
-                        ),
-                    ),
-                    return_stmt("plus_two"),
-                ])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn plus(a: i64, b: i64) -> i64;
+            fn main() -> fn(i64) -> i64 {
+                let plus_two = |x| { return plus(2, x); };
+                return plus_two;
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn use_polymorphic_top_level_fn() {
-        // id(2) + id(2)
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec!["T".to_string()],
-                name: "id".to_string(),
-                args: vec![Binding::new_typed(
-                    "a",
-                    ParsedType::Named("T".to_string(), vec![]),
-                )],
-                return_type: ParsedType::named("T"),
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "plus".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![call_expr(
-                    "plus",
-                    vec![
-                        call_expr("id", vec![2.into()]),
-                        call_expr("id", vec![2.into()]),
-                    ],
-                )
-                .into()])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn id<T>(a: T) -> T;
+            fn plus(a: i64, b: i64) -> i64;
+            fn main() -> i64 {
+                plus(id(2), id(2))
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn use_polymorphic_top_level_fn_polymorphically() {
-        // id(2) + id(2)
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec!["T".to_string()],
-                name: "id".to_string(),
-                args: vec![Binding::new_typed(
-                    "a",
-                    ParsedType::Named("T".to_string(), vec![]),
-                )],
-                return_type: ParsedType::named("T"),
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Float,
-                body: Some(block_expr(vec![
-                    let_stmt("x", call_expr("id", vec![12.34.into()])),
-                    let_stmt("b", call_expr("id", vec![false.into()])),
-                    if_expr("b", "x", 23.45).into(),
-                ])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn id<T>(a: T) -> T;
+            fn main() -> f64 {
+                let x = id(12.34);
+                let b = id(false);
+                if b then x else 23.45
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn error_polymorphic_top_level_fn() {
-        // id(2) + id(2)
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec!["T".to_string()],
-                name: "id".to_string(),
-                args: vec![Binding::new_typed(
-                    "a",
-                    ParsedType::Named("T".to_string(), vec![]),
-                )],
-                return_type: ParsedType::named("T"),
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "plus".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::func([ParsedType::Int], ParsedType::Int),
-                body: Some(block_expr(vec![call_expr(
-                    "plus",
-                    vec![
-                        call_expr("id", vec![2.into()]),
-                        call_expr("id", vec![2.0.into()]),
-                    ],
-                )
-                .into()])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn id<T>(a: T) -> T;
+            fn plus(a: i64, b: i64) -> i64;
+            fn main() -> i64 {
+                plus(id(2), id(2.0))
+            }
+            "#,
+        );
         let t = typecheck_program(program);
         assert!(t.is_err());
     }
 
     #[test]
     fn return_in_one_branch() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Int,
-            body: Some(block_expr(vec![
-                // Explicit return in true branch, implicit return in false.
-                if_expr(true, block_expr(vec![return_stmt(2)]), 3).into(),
-            ])),
-        })]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn main() -> i64 {
+                if true then {
+                    return 2;
+                } else {
+                    3
+                }
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn error_return_wrong_type_in_one_branch() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Int,
-            body: Some(block_expr(vec![
-                // Explicit return in true branch, implicit return in false.
-                if_expr(true, block_expr(vec![return_stmt(2.5)]), 3).into(),
-            ])),
-        })]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn main() -> i64 {
+                if true then {
+                    return 2.5;
+                } else {
+                    3
+                }
+            }
+            "#,
+        );
         assert!(matches!(
             typecheck_program(program),
             Err(Error::NotUnifiable(_, _))
@@ -2427,20 +2276,14 @@ mod tests {
     }
     #[test]
     fn error_infinite_type() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Int,
-            body: Some(block_expr(vec![
-                // Explicit return in true branch, implicit return in false.
-                let_stmt(
-                    "x",
-                    lambda_expr(vec![Binding::new("x")], call_expr("x", vec!["x".into()])),
-                ),
-                2.into(),
-            ])),
-        })]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn main() -> i64 {
+                let x = |x| x(x);
+                2
+            }
+            "#,
+        );
         assert!(matches!(
             typecheck_program(program),
             Err(Error::InfiniteType(_, _))
@@ -2449,196 +2292,93 @@ mod tests {
 
     #[test]
     fn empty_block_has_type_unit() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Unit,
-            body: Some(block_expr(vec![])),
-        })]);
+        let program = &mut parse_program_or_die(
+            r#"
+        fn main() -> unit {
+            // implicit return unit
+        }
+        "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn block_with_just_lets_has_type_unit() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Unit,
-            body: Some(block_expr(vec![
-                let_stmt("x", 1),
-                let_stmt("y", false),
-                let_stmt("z", 19.95),
-            ])),
-        })]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn main() -> unit {
+                let x = 1;
+                let y = false;
+                let z = 19.95;
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
 
     #[test]
     fn factorial_fn() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "mul".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "sub".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "leq".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Bool,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "factorial".to_string(),
-                args: vec![Binding::new_typed("x", ParsedType::Int)],
-                return_type: ParsedType::Int,
-                body: Some(if_expr(
-                    call_expr("leq", vec!["x".into(), 1.into()]),
-                    1,
-                    call_expr(
-                        "mul",
-                        vec![
-                            "x".into(),
-                            call_expr(
-                                "factorial",
-                                vec![call_expr("sub", vec!["x".into(), 1.into()])],
-                            ),
-                        ],
-                    ),
-                )),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn mul(a: i64, b: i64) -> i64;
+            fn sub(a: i64, b: i64) -> i64;
+            fn leq(a: i64, b: i64) -> bool;
+
+            fn factorial(x: i64) -> i64 {
+                if leq(x, 1) then 1 else mul(x, factorial(sub(x, 1)))
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
 
     #[test]
     fn higher_order_functions() {
-        let program = &mut Program(vec![
-            // Declare external fn apply(f: fn(Int)->Int, x: Int) -> Int;
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "apply".to_string(),
-                args: vec![
-                    Binding::new_typed("f", ParsedType::func([ParsedType::Int], ParsedType::Int)),
-                    Binding::new_typed("x", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None, // External
-            }),
-            // Declare external fn make_adder(y: Int) -> fn(Int)->Int;
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "make_adder".to_string(),
-                args: vec![Binding::new_typed("y", ParsedType::Int)],
-                return_type: ParsedType::func([ParsedType::Int], ParsedType::Int),
-                body: None, // External
-            }),
-            // Declare fn main() -> Int {
-            //   let add5 = make_adder(5);
-            //   apply(add5, 10)
-            // }
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    // let add_5 = make_adder(5)
-                    let_stmt("add5", call_expr("make_adder", vec![5.into()])),
-                    // apply(add5, 10)
-                    call_expr("apply", vec!["add5".into(), 10.into()]).into(),
-                ])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            fn apply(f: fn(i64) -> i64, x: i64) -> i64;
+            fn make_adder(y: i64) -> fn(i64) -> i64;
+
+            fn main() -> i64 {
+                let add5 = make_adder(5);
+                apply(add5, 10)
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
 
     #[test]
     fn struct_field_access() {
-        let program = &mut Program(vec![
-            Declaration::Struct(StructDecl::parameterized(
-                "Pair",
-                &["T", "U"],
-                &[
-                    ("left", ParsedType::named("T")),
-                    ("right", ParsedType::named("U")),
-                ],
-            )),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "p",
-                        Expression::LiteralStruct {
-                            name: "Pair".to_string(),
-                            fields: HashMap::from_iter([
-                                ("left".into(), true.into()),
-                                ("right".into(), 123.into()),
-                            ]),
-                            ty: Type::unknown(),
-                        },
-                    ),
-                    field("p", "left").into(),
-                ])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            struct Pair<T, U> {
+                left: T,
+                right: U,
+            }
+
+            fn main() -> bool {
+                let p = Pair { left: true, right: 123 };
+                p.left
+            }
+            "#,
+        );
         assert_eq!(typecheck_program(program), Ok(()));
     }
     #[test]
     fn struct_field_access_wrong_name() {
-        let program = &mut Program(vec![
-            Declaration::Struct(StructDecl::parameterized(
-                "Pair",
-                &["T", "U"],
-                &[
-                    ("left", ParsedType::named("T")),
-                    ("right", ParsedType::named("U")),
-                ],
-            )),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "p",
-                        Expression::LiteralStruct {
-                            name: "Pair".to_string(),
-                            fields: HashMap::from_iter([
-                                ("left".into(), true.into()),
-                                ("right".into(), 123.into()),
-                            ]),
-                            ty: Type::unknown(),
-                        },
-                    ),
-                    field("p", "whoopsie").into(),
-                ])),
-            }),
-        ]);
+        let program = &mut parse_program_or_die(
+            r#"
+            struct Pair<T, U> {
+                left: T,
+                right: U,
+            }
+
+            fn main() -> bool {
+                let p = Pair { left: true, right: 123 };
+                p.whoopsie
+            }
+            "#,
+        );
         assert_eq!(
             typecheck_program(program),
             Err(Error::UnrecognizedField("whoopsie".into()))
@@ -2646,16 +2386,13 @@ mod tests {
     }
     #[test]
     fn field_access_not_a_struct() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Bool,
-            body: Some(block_expr(vec![
-                let_stmt("p", ()),
-                field("p", "whoopsie").into(),
-            ])),
-        })]);
+        let source = r#"
+        fn main() -> bool {
+            let p = ();
+            p.whoopsie
+        }
+        "#;
+        let program = &mut parse_program_or_die(source);
         assert_eq!(
             typecheck_program(program),
             Err(Error::InapplicableConstraint(
@@ -2666,50 +2403,20 @@ mod tests {
     }
     #[test]
     fn delayed_field_access_correct_field_names() {
-        let pair = StructDecl::parameterized(
-            "Pair",
-            &["T", "U"],
-            &[
-                ("left", ParsedType::named("T")),
-                ("right", ParsedType::named("U")),
-            ],
-        );
-
-        let program = &mut Program(vec![
-            Declaration::Struct(pair),
-            Declaration::Fn(FnDecl {
-                forall: vec!["T".to_string()],
-                name: "default".to_string(),
-                args: vec![],
-                return_type: ParsedType::named("T"),
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    // Initialize `p` with some polymorphic default fn.
-                    let_mut_stmt("p", call_expr("default", vec![])),
-                    // Use and constrain "p" before its type is known.
-                    let_stmt("r", if_expr(field("p", "left"), field("p", "right"), 42)),
-                    // Assign to "p" to give it a type.
-                    assign_stmt(
-                        "p",
-                        Expression::LiteralStruct {
-                            name: "Pair".to_string(),
-                            fields: HashMap::from_iter([
-                                ("left".into(), true.into()),
-                                ("right".into(), 123.into()),
-                            ]),
-                            ty: Type::unknown(),
-                        },
-                    ),
-                    "r".into(),
-                ])),
-            }),
-        ]);
+        let source = r#"
+        struct Pair<T, U> {
+            left: T,
+            right: U,
+        }
+        fn default<T>() -> T;
+        fn main() -> i64 {
+            let mut p = default();
+            let r = if p.left then p.right else 42;
+            p = Pair { left: true, right: 123 };
+            r
+        }
+        "#;
+        let program = &mut parse_program_or_die(source);
         assert_eq!(typecheck_program(program), Ok(()));
     }
 
@@ -2726,7 +2433,7 @@ mod tests {
                 // Initialize `p` with some unknown polymorphic type.
                 let mut p = default();
                 // Use `p`
-                let r = if p.left { p.whoopsie } else { p.right };
+                let r = if p.left then p.whoopsie else p.right;
                 // Only later constrain `p` and find out that it has no `whoopsie` field.
                 p = Pair { left: true, right: 123 };
                 r
@@ -2789,28 +2496,18 @@ mod tests {
     }
     #[test]
     fn two_state_effects_ok_because_one_is_named() {
-        let state_effect = EffectType {
-            name: "State".to_string(),
-            params: vec!["T".to_string()],
-            ops: HashMap::from_iter([
-                ("get".into(), (Type::unit(), Type::param("T"))),
-                ("set".into(), (Type::param("T"), Type::unit())),
-            ]),
-        };
-        let int_state_instance = EffectInstance {
-            decl: Rc::new(state_effect.clone()),
-            params: BTreeMap::from_iter([("T".to_string(), Type::int())]),
-        };
-        let bool_state_instance = EffectInstance {
-            decl: Rc::new(state_effect.clone()),
-            params: BTreeMap::from_iter([("T".to_string(), Type::bool_())]),
-        };
-        let mut ops = OpSetI::empty();
-        ops.unify_add_declared_op(Some("int_state"), &int_state_instance, "get")
-            .unwrap();
-        assert!(ops
-            .unify_add_declared_op(None, &bool_state_instance, "set")
-            .is_ok());
+        let source = r#"
+        effect State<T> {
+            get: unit -> T,
+            set: T -> unit,
+        }
+
+        co main() ! int_state: State<i64>, State<bool> {
+            perform int_state.get(());
+            perform State.set(true); // Unnamed, defaults to 'State'
+        }
+        "#;
+        assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
     }
     #[test]
     fn conflicting_parametric_effects_both_unnamed() {
@@ -2872,7 +2569,25 @@ mod tests {
         assert_eq!(ops.clone_inner(), original_ops);
         assert_eq!(was_empty.clone_inner(), original_ops);
     }
-
+    // TODO Replace above test with this one. Requires support for performing named effects.
+    // #[test]
+    // fn conflicting_parametric_effects_both_unnamed2() {
+    //     let source = r#"
+    //     effect State<T> {
+    //         get: unit -> T,
+    //         set: T -> unit,
+    //     }
+    //     fn main() {
+    //         let impossible = co {
+    //             perform State.get(()); // First usage infers T=i64 for the 'State' effect
+    //             perform State.set(true); // Second usage infers T=bool
+    //         };
+    //     }
+    //     "#;
+    //     // TODO: This probably could use a more informative error.
+    //     assert_eq!(typecheck_program(&mut parse_program_or_die(source)),
+    //                 Err(Error::NotUnifiable(Type::int(), Type::bool_())));
+    // }
     #[test]
     fn test_propagate_subset_of_effects() {
         let result = typecheck_program(&mut parse_program_or_die(
@@ -3017,21 +2732,12 @@ mod tests {
     }
     #[test]
     fn perform_in_co_error() {
-        let mut foo_ops = OpSetI::empty();
-        foo_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .mark_done_extending();
-
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            // The returned co should not be empty. ERROR!
-            return_type: ParsedType::co(ParsedType::Unit, []),
-            body: Some(block_expr(vec![co_expr(perform_anon("foo", 42)).into()])),
-        })]);
-        let result = typecheck_program(program);
+        let source = r#"
+        fn main() -> Co<unit !> {
+            co { perform foo(42) }
+        }
+        "#;
+        let result = typecheck_program(&mut parse_program_or_die(source));
         // Tried to extend the empty opset.
         assert!(
             matches!(result, Err(Error::OpSetNotExtendable(_))),
@@ -3042,23 +2748,12 @@ mod tests {
 
     #[test]
     fn perform_in_co_good() {
-        let mut foo_ops = OpSetI::empty();
-        foo_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .mark_done_extending();
-
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::co(
-                ParsedType::Bool,
-                [ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-            ),
-            body: Some(block_expr(vec![co_expr(perform_anon("foo", 42)).into()])),
-        })]);
-        assert_eq!(typecheck_program(program), Ok(()));
+        let source = r#"
+        fn main() -> Co<bool ! foo(i64 -> bool)> {
+            co { perform foo(42) }
+        }
+        "#;
+        assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
     }
 
     #[test]
@@ -3295,4 +2990,5 @@ mod tests {
     // TODO: Recursive types? Mutually recursive types? Forward declarations?
     // TODO: Need to represent Co<T ! E1, E2, E3> in parser.
     // TODO: Disallow top level unspecified, lol
+    // TODO: Top level comments in parse?
 }

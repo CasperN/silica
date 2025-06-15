@@ -197,17 +197,18 @@ module.exports = grammar({
       $.identifier
     ),
 
-    call_expression: $ => prec.left(1, seq(
+    call_expression: $ => prec.left(2, seq(
       field('function', $._expression),
       delimited("(", field("call_args", $._expression), ",", ")")
     )),
 
-    if_expression: $ => seq(
+    if_expression: $ => prec.right(1, seq(
       'if',
       field('condition', $._expression),
-      field('consequence', $.block_expression),
-      optional(seq('else', field('alternative', $.block_expression)))
-    ),
+      'then',
+      field('consequence', $._expression),
+      optional(seq('else', field('alternative', $._expression)))
+    )),
 
     lambda_expression: $ => seq(
       delimited("|", field("lambda_args", $.soft_binding), ",", "|"),
