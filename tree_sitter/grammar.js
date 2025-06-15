@@ -100,7 +100,9 @@ module.exports = grammar({
 
     primitive_type: $ => choice(
       'i8', 'u8', 'i16', 'u16', 'i32', 'u32', 'i64', 'u64', 'i128', 'u128',
-      'isize', 'usize', 'f64', 'bool', 'unit'  // TODO unit should be "()"
+      'isize', 'usize', 'f64', 'bool', 'unit',  // TODO unit should be "()"
+      "_",  // Unspecified
+      "!",  // Never
     ),
 
     function_type: $ => seq(

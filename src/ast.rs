@@ -1303,6 +1303,7 @@ enum Error {
     FnDeclMustHaveConcreteTypes(FnDecl),
     CoDeclMustHaveConcreteTypes(CoDecl),
     StructDeclMustHaveConcreteTypes(StructType),
+    EffectDeclMustHaveConcreteTypes(EffectType),
     EffectDeclMismatch(EffectType, EffectType),
     OpSetNotUnifiable(OpSetI, OpSetI),
     OpSetNotExtendable(OpSetI),
@@ -1751,23 +1752,29 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 shadow.insert_variable(co_decl.name.clone(), co_fn_ty, false);
             }
             Declaration::Struct(struct_declaration) => {
-                let struct_declaration =
-                    resolve_struct(shadow.context().shadow(), struct_declaration)?;
-                let redefined = shadow.define_struct(struct_declaration.clone());
+                let struct_type = resolve_struct(shadow.context().shadow(), struct_declaration)?;
+
+                if !struct_type.fields.values().all(|ty| ty.is_concrete()) {
+                    return Err(Error::StructDeclMustHaveConcreteTypes(struct_type));
+                }
+
+                let redefined = shadow.define_struct(struct_type.clone());
                 if redefined {
-                    return Err(Error::DuplicateTopLevelName(
-                        struct_declaration.name.clone(),
-                    ));
+                    return Err(Error::DuplicateTopLevelName(struct_type.name.clone()));
                 }
             }
             Declaration::Effect(effect_declaration) => {
-                let effect_declaration =
-                    resolve_effect(shadow.context().shadow(), effect_declaration)?;
-                let redefined = shadow.define_effect(effect_declaration.clone());
+                let effect_type = resolve_effect(shadow.context().shadow(), effect_declaration)?;
+                if !effect_type
+                    .ops
+                    .values()
+                    .all(|(p, r)| p.is_concrete() && r.is_concrete())
+                {
+                    return Err(Error::EffectDeclMustHaveConcreteTypes(effect_type));
+                }
+                let redefined = shadow.define_effect(effect_type.clone());
                 if redefined {
-                    return Err(Error::DuplicateTopLevelName(
-                        effect_declaration.name.clone(),
-                    ));
+                    return Err(Error::DuplicateTopLevelName(effect_type.name.clone()));
                 }
             }
         }
@@ -3415,6 +3422,25 @@ mod tests {
         );
         let result = typecheck_program(&mut program);
         assert_eq!(result, Err(Error::NotUnifiable(Type::float(), Type::int())));
+    }
+    #[test]
+    fn unspecified_type_in_struct() {
+        let result = typecheck_program(&mut parse_program_or_die(r" struct Foo { foo: _ } "));
+        assert!(matches!(
+            result,
+            Err(Error::StructDeclMustHaveConcreteTypes(_))
+        ));
+    }
+
+    #[test]
+    fn unspecified_type_in_effect() {
+        let result = typecheck_program(&mut parse_program_or_die(
+            r" effect Foo { foo: unit -> _ } ",
+        ));
+        assert!(matches!(
+            result,
+            Err(Error::EffectDeclMustHaveConcreteTypes(_))
+        ));
     }
 
     // TODO: Test that structs must have concrete types.

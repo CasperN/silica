@@ -392,10 +392,10 @@ fn parse_effect_decl<'s>(
                 .map(|n| n.text());
             let perform_type = child_node
                 .required_child("perform_type", errors)
-                .and_then(|n| parse_type2(n, errors));
+                .and_then(|n| parse_type(n, errors));
             let resume_type = child_node
                 .required_child("resume_type", errors)
-                .and_then(|n| parse_type2(n, errors));
+                .and_then(|n| parse_type(n, errors));
 
             if let (Some(op_name), Some(perform_type), Some(resume_type)) =
                 (op_name, perform_type, resume_type)
@@ -445,7 +445,7 @@ fn parse_fn_decl<'s>(
 
     let return_type = node
         .optional_child("return_type", errors)
-        .and_then(|n| parse_type2(n, errors))
+        .and_then(|n| parse_type(n, errors))
         .unwrap_or(ParsedType::Unit);
 
     let body = node
@@ -492,7 +492,7 @@ fn parse_co_decl<'s>(
 
     let return_type = node
         .optional_child("return_type", errors)
-        .and_then(|n| parse_type2(n, errors))
+        .and_then(|n| parse_type(n, errors))
         .unwrap_or(ParsedType::Unit);
     let ops = node
         .optional_child("effects", errors)
@@ -537,10 +537,10 @@ fn parse_effects<'s>(
                     .map(|n| n.text().to_string());
                 let perform_type = e
                     .required_child("perform_type", errors)
-                    .and_then(|n| parse_type2(n, errors));
+                    .and_then(|n| parse_type(n, errors));
                 let resume_type = e
                     .required_child("resume_type", errors)
-                    .and_then(|n| parse_type2(n, errors));
+                    .and_then(|n| parse_type(n, errors));
                 if let (Some(o), Some(p), Some(r)) = (op_name, perform_type, resume_type) {
                     parsed_ops.push(ParsedOp::anon(&o, p, r));
                 }
@@ -573,7 +573,7 @@ fn parse_struct_decl<'s>(
         let field_name = field_node.required_child("name", errors).map(|n| n.text());
         let field_ty = field_node
             .required_child("type", errors)
-            .and_then(|n| parse_type2(n, errors))
+            .and_then(|n| parse_type(n, errors))
             .unwrap_or_default();
         if let Some(field_name) = field_name {
             if !seen_field_names.insert(field_name) {
@@ -626,61 +626,7 @@ fn parse_generic_params<'s>(
     params
 }
 
-// --- Type Parsing ---
-// TODO: Deprecate this in favor of
-fn parse_type<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) -> Option<Type> {
-    match node.kind() {
-        "primitive_type" => {
-            match node.text() {
-                // TODO: Update `Type`
-                // "i8" => Some(Type::I8), // Assuming these variants exist in ast::Type
-                // "u8" => Some(Type::U8),
-                // "i16" => Some(Type::I16),
-                // "u16" => Some(Type::U16),
-                // "i32" => Some(Type::I32),
-                // "u32" => Some(Type::U32),
-                // "i64" => Some(Type::I64), // Was Type::int()
-                // "u64" => Some(Type::U64),
-                // "i128" => Some(Type::I128),
-                // "u128" => Some(Type::U128),
-                // "isize" => Some(Type::Isize),
-                // "usize" => Some(Type::Usize),
-                // "f64" => Some(Type::F64), // Was Type::Float
-                "f64" => Some(Type::float()),
-                "i64" => Some(Type::int()),
-                "bool" => Some(Type::bool_()),
-                "unit" => Some(Type::unit()),
-                other => {
-                    errors.push(ParseError::UnknownPrimitiveType(other));
-                    None
-                }
-            }
-        }
-        "function_type" => {
-            let mut arg_types = Vec::new();
-            for a in node.children_by_field_name("arg_types", errors) {
-                if let Some(t) = parse_type(a, errors) {
-                    arg_types.push(t);
-                }
-            }
-            let return_type = node
-                .required_child("return_type", errors)
-                .and_then(|n| parse_type(n, errors))?;
-            Some(Type::func(arg_types, return_type))
-        }
-        // TODO: Named type support
-        "named_type" | "identifier" => Some(Type::param(node.text())),
-        _ => {
-            errors.push(ParseError::UnexpectedNodeType {
-                expected: "type",
-                found: node.kind(),
-                node_text: node.text(),
-            });
-            None
-        }
-    }
-}
-fn parse_type2<'s>(
+fn parse_type<'s>(
     node: SourceNode<'s, '_>,
     errors: &mut Vec<ParseError<'s>>,
 ) -> Option<ParsedType> {
@@ -716,13 +662,13 @@ fn parse_type2<'s>(
         "function_type" => {
             let mut arg_types = Vec::new();
             for a in node.children_by_field_name("arg_types", errors) {
-                if let Some(t) = parse_type2(a, errors) {
+                if let Some(t) = parse_type(a, errors) {
                     arg_types.push(t);
                 }
             }
             let return_type = node
                 .required_child("return_type", errors)
-                .and_then(|n| parse_type2(n, errors))?;
+                .and_then(|n| parse_type(n, errors))?;
             Some(ParsedType::Fn(arg_types, Box::new(return_type)))
         }
         // TODO: Parameterized, named type support
@@ -1057,7 +1003,7 @@ fn parse_binding<'s>(
         .map(|n| n.text().to_string());
     let ty = node
         .optional_child("type", errors)
-        .and_then(|n| parse_type2(n, errors))
+        .and_then(|n| parse_type(n, errors))
         .unwrap_or(ParsedType::Unspecified);
 
     name.map(|name| Binding {
