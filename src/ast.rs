@@ -406,8 +406,7 @@ impl OpSetI {
         }
     }
 
-    // TODO: Should not be public. Made public as a hack to construct OpSets in the parser.
-    pub fn unify_add_anonymous_effect_or_die(
+    fn unify_add_anonymous_effect_or_die(
         &mut self,
         name: &str,
         perform_type: &Type,
@@ -869,8 +868,6 @@ pub enum LValue {
     Variable(String),
     Field(Box<Expression>, String), // Deref, Field access, etc
 }
-
-// TODO: Consider struct TypedExpression(Expression, Type) and remove the type fields.
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expression {
@@ -2015,6 +2012,7 @@ mod tests {
 
     use super::test_helpers::*;
     use super::*;
+    use crate::parse::parse_program_or_die;
 
     #[test]
     fn unify_type_vars() {
@@ -3071,195 +3069,65 @@ mod tests {
 
     #[test]
     fn test_propagate_two_sets_of_effects() {
-        let program = &mut Program(vec![
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("foo", 1)),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_bar".to_string(),
-                args: vec![],
-                return_type: ParsedType::Float,
-                ops: vec![ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("bar", ())),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "propagates_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::co(
-                    ParsedType::Unit,
-                    [
-                        ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool),
-                        ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float),
-                    ],
-                ),
-                body: Some(block_expr(vec![co_expr(block_expr(vec![
-                    let_stmt("f", propagate(call_expr("performs_foo", vec![]))),
-                    let_stmt("b", propagate(call_expr("performs_bar", vec![]))),
-                ]))
-                .into()])),
-            }),
-        ]);
-        assert_eq!(typecheck_program(program), Ok(()));
+        let mut program = parse_program_or_die(
+            r"
+            co performs_foo() -> bool ! foo(i64->bool), baz(i64 -> unit) {
+                let f = perform foo(1);
+                perform baz(42);
+                f
+            }
+            co performs_bar() -> f64 ! bar(unit -> f64), baz(i64->unit) {
+                let b = perform bar(());
+                perform baz(42);
+                b
+            }
+            co main() ! foo(i64 -> bool), bar(unit -> f64), baz(i64 -> unit) {
+                let f = performs_foo()?;
+                let b = performs_bar()?;
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
+        assert_eq!(result, Ok(()));
     }
     #[test]
     fn delayed_opset_inference_okay() {
         // test the case of |c1, c2| co { c1?; c2?; } which requires proper propagation of
         // unknown opsets. Success case.
-        let program = &mut Program(vec![
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("foo", 1)),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_bar".to_string(),
-                args: vec![],
-                return_type: ParsedType::Float,
-                ops: vec![ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("bar", ())),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::co(
-                    ParsedType::Unit,
-                    [
-                        ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool),
-                        ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float),
-                    ],
-                ),
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "lambda",
-                        lambda_expr(
-                            vec![Binding::new("f"), Binding::new("b")],
-                            co_expr(block_expr(vec![
-                                propagate("f").into(),
-                                propagate("b").into(),
-                                return_stmt(()),
-                            ])),
-                        ),
-                    ),
-                    call_expr(
-                        "lambda",
-                        vec![
-                            call_expr("performs_foo", vec![]),
-                            call_expr("performs_bar", vec![]),
-                        ],
-                    )
-                    .into(),
-                ])),
-            }),
-        ]);
-        assert_eq!(typecheck_program(program), Ok(()));
+        let mut program = parse_program_or_die(
+            r"
+            co performs_foo() -> bool ! foo(i64->bool) {
+                perform foo(1)
+            }
+            co performs_bar() -> f64 ! bar(unit -> f64) {
+                perform bar(())
+            }
+            co main() ! foo(i64 -> bool), bar(unit -> f64) {
+                let lambda = |f, b| co { f?; b?; return (); };
+                lambda(performs_foo(), performs_bar())?
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
+        assert_eq!(result, Ok(()));
     }
     #[test]
     fn delayed_opset_inference_unify_too_large() {
-        let mut foo_ops = OpSetI::empty();
-        foo_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .mark_done_extending();
-
-        let mut bar_ops = OpSetI::empty();
-        bar_ops
-            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
-            .unwrap()
-            .mark_done_extending();
-        let mut foo_bar_baz_ops = OpSetI::empty();
-        foo_bar_baz_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
-            .unwrap()
-            .unify_add_anonymous_effect("baz", &Type::float(), &Type::bool_())
-            .unwrap()
-            .mark_done_extending();
-
-        let program = &mut Program(vec![
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("foo", 1)),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_bar".to_string(),
-                args: vec![],
-                return_type: ParsedType::Float,
-                ops: vec![ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("bar", ())),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                // The returned co should not be empty. ERROR!
-                return_type: ParsedType::co(
-                    ParsedType::Unit,
-                    [
-                        ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool),
-                        ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float),
-                        ParsedOp::anon("baz", ParsedType::Float, ParsedType::Bool),
-                    ],
-                ),
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "lambda",
-                        lambda_expr(
-                            vec![Binding::new("f"), Binding::new("b")],
-                            co_expr(block_expr(vec![
-                                propagate("f").into(),
-                                propagate("b").into(),
-                                return_stmt(()),
-                            ])),
-                        ),
-                    ),
-                    call_expr(
-                        "lambda",
-                        vec![
-                            call_expr("performs_foo", vec![]),
-                            call_expr("performs_bar", vec![]),
-                        ],
-                    )
-                    .into(),
-                ])),
-            }),
-        ]);
-        let result = typecheck_program(program);
+        let mut program = parse_program_or_die(
+            r"
+            co performs_foo() -> bool ! foo(i64->bool) {
+                perform foo(1)
+            }
+            co performs_bar() -> f64 ! bar(unit -> f64) {
+                perform bar(())
+            }
+            co main() ! foo(i64 -> bool), bar(unit -> f64), baz(f64 -> bool) {
+                let lambda = |f, b| co { f?; b?; return (); };
+                lambda(performs_foo(), performs_bar())?
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
         // TODO: This test is incorrect, the program typechecks even though lambda returns a
         // coroutine that will never perform baz. This isn't unsound, but we want to catch those
         // errors.
@@ -3270,73 +3138,22 @@ mod tests {
     fn delayed_opset_inference_unify_too_small() {
         // test the case of |c1, c2| co { c1?; c2?; } which requires proper propagation of
         // unknown opsets. Unify with a too-small opset.
-        let mut foo_ops = OpSetI::empty();
-        foo_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .mark_done_extending();
-
-        let mut bar_ops = OpSetI::empty();
-        bar_ops
-            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
-            .unwrap()
-            .mark_done_extending();
-        let program = &mut Program(vec![
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("foo", 1)),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_bar".to_string(),
-                args: vec![],
-                return_type: ParsedType::Float,
-                ops: vec![ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("bar", ())),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                // The returned co should have foo and bar. ERROR.
-                return_type: ParsedType::co(
-                    ParsedType::Unit,
-                    [ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-                ),
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "lambda",
-                        lambda_expr(
-                            vec![Binding::new("f"), Binding::new("b")],
-                            co_expr(block_expr(vec![
-                                propagate("f").into(),
-                                propagate("b").into(),
-                                return_stmt(()),
-                            ])),
-                        ),
-                    ),
-                    call_expr(
-                        "lambda",
-                        vec![
-                            call_expr("performs_foo", vec![]),
-                            call_expr("performs_bar", vec![]),
-                        ],
-                    )
-                    .into(),
-                ])),
-            }),
-        ]);
-        let result = typecheck_program(program);
+        let mut program = parse_program_or_die(
+            r"
+            co performs_foo() -> bool ! foo(i64->bool) {
+                perform foo(1)
+            }
+            co performs_bar() -> f64 ! bar(unit -> f64) {
+                perform bar(())
+            }
+            co main() ! foo(i64 -> bool) {
+                let lambda = |f, b| { f?; b?; return (); };
+                // Main cannot perform bar.
+                lambda(performs_foo(), performs_bar())
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
         assert!(
             matches!(result, Err(Error::OpSetNotExtendable(_))),
             "result:`{:?}`",
@@ -3432,290 +3249,127 @@ mod tests {
     }
     #[test]
     fn error_expression_type_not_inferred() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec!["T".to_string()],
-                name: "default".to_string(),
-                args: vec![],
-                return_type: ParsedType::named("T"),
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Unit,
-                body: Some(block_expr(vec![
-                    let_stmt("foo", call_expr("default", vec![])),
-                    return_stmt(()),
-                ])),
-            }),
-        ]);
+        let mut program = parse_program_or_die(
+            r"
+            fn default<T>() -> T;
+            fn main() {
+                let foo = default();
+            }
+            ",
+        );
         assert!(matches!(
-            typecheck_program(program),
+            typecheck_program(&mut program),
             Err(Error::ExpressisonTypeNotInferred(Expression::Call { .. }))
         ));
     }
     #[test]
     fn propagate_co() {
-        let program = &mut Program(vec![Declaration::Fn(FnDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Int,
-            body: Some(block_expr(vec![
-                let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
-                propagate("performs_bar").into(),
-            ])),
-        })]);
-        let result = typecheck_program(program);
+        let mut program = parse_program_or_die(
+            r"
+            fn main() -> i64 {
+                let performs_bar = co perform bar(53);
+                performs_bar?
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
         assert!(matches!(result, Err(Error::OpSetNotExtendable(_))));
     }
     #[test]
     fn handle_two_anonymous_effects() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "plus".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    let_stmt("performs_foo", co_expr(perform_anon("foo", 53))),
-                    let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
-                    let_stmt(
-                        "both",
-                        co_expr(call_expr(
-                            "plus",
-                            vec![propagate("performs_bar"), propagate("performs_foo")],
-                        )),
-                    ),
-                    Expression::Handle {
-                        co: Box::new("both".into()),
-                        ty: Type::unknown(),
-                        return_arm: None,
-                        op_arms: vec![
-                            HandleOpArm {
-                                op_name: "foo".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: 42.into(), // Ignore the effect.
-                            },
-                            HandleOpArm {
-                                op_name: "bar".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: 42.into(), // Ignore the effect.
-                            },
-                        ],
-                    }
-                    .into(),
-                ])),
-            }),
-        ]);
-        let result = typecheck_program(program);
+        let mut program = parse_program_or_die(
+            r"
+            fn plus(a: i64, b: i64) -> i64;
+            fn main() -> i64 {
+                let performs_foo = co perform foo(53);
+                let performs_bar = co perform bar(53);
+                let calls_something = co plus(performs_bar?, performs_foo?);
+                calls_something handle {
+                    foo(x) => { resume 42 },
+                    bar(x) => { resume 42 },
+                }
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
         assert_eq!(result, Ok(()));
     }
     #[test]
     fn handle_two_anonymous_effects_resuming() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "something".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Float),
-                ],
-                return_type: ParsedType::Bool,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                body: Some(block_expr(vec![
-                    let_stmt("performs_foo", co_expr(perform_anon("foo", 53.42))),
-                    let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
-                    let_stmt(
-                        "calls_something",
-                        co_expr(call_expr(
-                            "something",
-                            vec![propagate("performs_bar"), propagate("performs_foo")],
-                        )),
-                    ),
-                    Expression::Handle {
-                        co: Box::new("calls_something".into()),
-                        ty: Type::unknown(),
-                        return_arm: None,
-                        op_arms: vec![
-                            HandleOpArm {
-                                op_name: "foo".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: block_expr(vec![resume_stmt("x")]),
-                            },
-                            HandleOpArm {
-                                op_name: "bar".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: block_expr(vec![resume_stmt("x")]),
-                            },
-                        ],
-                    }
-                    .into(),
-                ])),
-            }),
-        ]);
-        let result = typecheck_program(program);
+        let mut program = parse_program_or_die(
+            r"
+            fn something(a: i64, b: f64) -> bool;
+            fn main() -> bool {
+                let performs_foo = co perform foo(53.42);
+                let performs_bar = co perform bar(53);
+                let calls_something = co something(performs_bar?, performs_foo?);
+                calls_something handle {
+                    foo(x) => { resume x },
+                    bar(x) => { resume x },
+                }
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
         assert_eq!(result, Ok(()));
     }
     #[test]
     fn handles_foo_but_not_bar() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "plus".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "performs_foo_and_bar",
-                        co_expr(block_expr(vec![
-                            full_let_stmt("bar", Type::bool_(), false, perform_anon("bar", 4.2)),
-                            perform_anon("foo", 53).into(),
-                        ])),
-                    ),
-                    Expression::Handle {
-                        co: Box::new("performs_foo_and_bar".into()),
-                        ty: Type::unknown(),
-                        return_arm: None,
-                        op_arms: vec![HandleOpArm {
-                            op_name: "foo".to_string(),
-                            performed_variable: Binding::new("x"),
-                            body: "x".into(),
-                        }],
-                    }
-                    .into(),
-                ])),
-            }),
-        ]);
-        let result = typecheck_program(program);
+        let mut program = parse_program_or_die(
+            r"
+            fn plus(a: i64, b: i64) -> i64;
+            fn main() -> i64 {
+                let performs_foo_and_bar = co {
+                    let bar: bool = perform bar(4.2);
+                    perform foo(53)
+                };
+                performs_foo_and_bar handle {
+                    foo(x) => x,
+                    // `bar` not handled
+                }
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
+        // TODO: This is kind of an opaque error.
         assert!(matches!(result, Err(Error::OpSetNotExtendable(_))));
     }
     #[test]
     fn handles_bar_incorrectly() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "plus".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "performs_foo_and_bar",
-                        co_expr(block_expr(vec![
-                            full_let_stmt("bar", Type::bool_(), false, perform_anon("bar", 4.2)),
-                            perform_anon("foo", 53).into(),
-                        ])),
-                    ),
-                    Expression::Handle {
-                        co: Box::new("performs_foo_and_bar".into()),
-                        ty: Type::unknown(),
-                        return_arm: None,
-                        op_arms: vec![
-                            HandleOpArm {
-                                op_name: "foo".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: "x".into(),
-                            },
-                            HandleOpArm {
-                                op_name: "bar".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: "x".into(),
-                            },
-                        ],
-                    }
-                    .into(),
-                ])),
-            }),
-        ]);
-        let result = typecheck_program(program);
+        let mut program = parse_program_or_die(
+            r"
+            fn plus(a: i64, b: i64) -> i64;
+            fn main() -> i64 {
+                let performs_foo_and_bar = co {
+                    let bar: bool = perform bar(4.2);
+                    perform foo(53)
+                };
+                performs_foo_and_bar handle {
+                    foo(x) => x,
+                    bar(x) => x,
+                }
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
         assert_eq!(result, Err(Error::NotUnifiable(Type::float(), Type::int())));
     }
     #[test]
     fn handles_irrelevant() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "plus".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Int),
-                ],
-                return_type: ParsedType::Int,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "performs_foo",
-                        co_expr(block_expr(vec![perform_anon("foo", 53).into()])),
-                    ),
-                    Expression::Handle {
-                        co: Box::new("performs_foo".into()),
-                        ty: Type::unknown(),
-                        return_arm: None,
-                        op_arms: vec![
-                            HandleOpArm {
-                                op_name: "foo".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: "x".into(),
-                            },
-                            HandleOpArm {
-                                op_name: "irrelevant".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: block_expr(vec![
-                                    resume_stmt(()), // Give the resume a unit type.
-                                    "x".into(),      // Returned x makes perform type an int.
-                                ]),
-                            },
-                        ],
-                    }
-                    .into(),
-                ])),
-            }),
-        ]);
-        let result = typecheck_program(program);
+        let mut program = parse_program_or_die(
+            r"
+            fn plus(a: i64, b: i64) -> i64;
+            fn main() -> i64 {
+                let performs_foo = co perform foo(53);
+                performs_foo handle {
+                    foo(x) => x,
+                    // It can be inferred that irrelevant is unit -> i64 so typechecking passes.
+                    irrelevant(x) => { resume(()); x },
+                }
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
         // TODO: This test is incorrect. While the program typechecks, it should be rejected because
         // the "irrelevant" arm is handling an effect that will never be performed. This should be
         // at least a warning, if not an error.
@@ -3723,109 +3377,47 @@ mod tests {
     }
     #[test]
     fn handle_return_arm_unifies() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "something".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Float),
-                ],
-                return_type: ParsedType::Bool,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    let_stmt("performs_foo", co_expr(perform_anon("foo", 53.42))),
-                    let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
-                    let_stmt(
-                        "calls_something",
-                        co_expr(call_expr(
-                            "something",
-                            vec![propagate("performs_bar"), propagate("performs_foo")],
-                        )),
-                    ),
-                    Expression::Handle {
-                        co: Box::new("calls_something".into()),
-                        ty: Type::unknown(),
-                        return_arm: Some((Binding::new("r"), Box::new(12.into()))),
-                        op_arms: vec![
-                            HandleOpArm {
-                                op_name: "foo".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: block_expr(vec![resume_stmt("x")]),
-                            },
-                            HandleOpArm {
-                                op_name: "bar".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: block_expr(vec![42.into()]),
-                            },
-                        ],
-                    }
-                    .into(),
-                ])),
-            }),
-        ]);
-        let result = typecheck_program(program);
+        let mut program = parse_program_or_die(
+            r"
+            fn something(a: i64, b: f64) -> bool;
+            fn main() -> i64 {
+                let performs_foo = co perform foo(53.42);
+                let performs_bar = co perform bar(53);
+                let calls_something = co something(performs_bar?, performs_foo?);
+                calls_something handle {
+                    return r => { 12 },
+                    foo(x) => { resume x },
+                    bar(x) => { resume 42 },
+                }
+            }
+            ",
+        );
+
+        let result = typecheck_program(&mut program);
         assert_eq!(result, Ok(()));
     }
     #[test]
     fn handle_return_arm_does_not_unify() {
-        let program = &mut Program(vec![
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "something".to_string(),
-                args: vec![
-                    Binding::new_typed("a", ParsedType::Int),
-                    Binding::new_typed("b", ParsedType::Float),
-                ],
-                return_type: ParsedType::Bool,
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    let_stmt("performs_foo", co_expr(perform_anon("foo", 53.42))),
-                    let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
-                    let_stmt(
-                        "calls_something",
-                        co_expr(call_expr(
-                            "something",
-                            vec![propagate("performs_bar"), propagate("performs_foo")],
-                        )),
-                    ),
-                    Expression::Handle {
-                        co: Box::new("calls_something".into()),
-                        ty: Type::unknown(),
-                        return_arm: Some((Binding::new("r"), Box::new(12.into()))),
-                        op_arms: vec![
-                            HandleOpArm {
-                                op_name: "foo".to_string(),
-                                performed_variable: Binding::new("x"),
-                                // Never type.
-                                body: block_expr(vec![resume_stmt("x")]),
-                            },
-                            HandleOpArm {
-                                op_name: "bar".to_string(),
-                                performed_variable: Binding::new("x"),
-                                body: block_expr(vec![
-                                    42.32.into(), // Not an int!
-                                ]),
-                            },
-                        ],
-                    }
-                    .into(),
-                ])),
-            }),
-        ]);
-        let result = typecheck_program(program);
+        let mut program = parse_program_or_die(
+            r"
+            fn something(a: i64, b: f64) -> bool;
+
+            fn main() -> bool {
+                let performs_foo = co perform foo(53.42);
+                let performs_bar = co perform bar(53);
+                let calls_something = co something(performs_foo?, performs_bar?);
+                calls_something handle {
+                    foo(x) => { resume(x) },  // x is a f64, something's first arg is i64.
+                    bar(x) => { resume(42.32) },
+                }
+            }
+            ",
+        );
+        let result = typecheck_program(&mut program);
         assert_eq!(result, Err(Error::NotUnifiable(Type::float(), Type::int())));
     }
+
+    // TODO: Test that structs must have concrete types.
+    // TODO: Recursive types? Mutually recursive types? Forward declarations?
+    // TODO: Need to represent Co<T ! E1, E2, E3> in parser.
 }

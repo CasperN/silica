@@ -1197,6 +1197,17 @@ fn parse_call_expr<'s>(
     })
 }
 
+// Parses a program and panics if there were any errors.
+// Intended for use in testing.
+pub fn parse_program_or_die(source: &str) -> Program {
+    let mut errors = Vec::new();
+    let p = parse_ast_program(source, &mut errors);
+    if !errors.is_empty() {
+        panic!("Expected no errors, found: {errors:?})");
+    }
+    p.unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
