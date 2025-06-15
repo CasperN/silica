@@ -95,7 +95,8 @@ module.exports = grammar({
     _type: $ => choice(
       $.primitive_type,
       $.function_type,
-      $.named_type
+      $.named_type,
+      $.coroutine_type,
     ),
 
     primitive_type: $ => choice(
@@ -110,6 +111,13 @@ module.exports = grammar({
       delimited("(", field("arg_types", $._type), ",", ")"),
       '->',
       field("return_type", $._type),
+    ),
+
+    coroutine_type: $ => seq(
+      "Co", "<", 
+      field("return_type", $._type),
+      optional(field("effects", $.effects)),
+      ">"
     ),
 
     named_type: $ => $.identifier, // Simple identifier for now

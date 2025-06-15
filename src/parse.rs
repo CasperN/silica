@@ -671,8 +671,17 @@ fn parse_type<'s>(
                 .and_then(|n| parse_type(n, errors))?;
             Some(ParsedType::Fn(arg_types, Box::new(return_type)))
         }
-        // TODO: Parameterized, named type support
-        "named_type" | "identifier" => Some(ParsedType::Named(node.text().to_string(), vec![])),
+        "coroutine_type" => {
+            let return_type = node
+                .required_child("return_type", errors)
+                .and_then(|node| parse_type(node, errors))?;
+            let ops = node
+                .optional_child("effects", errors)
+                .and_then(|n| parse_effects(n, errors))
+                .unwrap_or_default();
+            Some(ParsedType::Co(Box::new(return_type), ops))
+        }
+        "named_type" => Some(ParsedType::Named(node.text().to_string(), vec![])),
         _ => {
             errors.push(ParseError::UnexpectedNodeType {
                 expected: "type",

@@ -2967,111 +2967,54 @@ mod tests {
         assert_eq!(ops.clone_inner(), original_ops);
         assert_eq!(was_empty.clone_inner(), original_ops);
     }
+
     #[test]
     fn test_propagate_subset_of_effects() {
-        let program = &mut Program(vec![
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("foo", 1)),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "propagates_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                ops: vec![
-                    ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool),
-                    ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float),
-                ],
-                body: Some(block_expr(vec![propagate(call_expr(
-                    "performs_foo",
-                    vec![],
-                ))
-                .into()])),
-            }),
-        ]);
-        assert_eq!(typecheck_program(program), Ok(()));
+        let result = typecheck_program(&mut parse_program_or_die(
+            r"
+            co performs_foo() -> bool ! foo(i64 -> bool) {
+                perform foo(1)
+            }
+            co propagates_foo_and_bar() -> bool ! foo(i64 -> bool), bar(unit -> f64) {
+                perform bar(());
+                performs_foo()?
+            }
+            ",
+        ));
+        assert_eq!(result, Ok(()));
     }
     #[test]
     fn test_propagate_subset_of_effects_fails_in_fn() {
-        let program = &mut Program(vec![
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("foo", 1)),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "cannot_propagate_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                body: Some(block_expr(vec![propagate(call_expr(
-                    "performs_foo",
-                    vec![],
-                ))
-                .into()])),
-            }),
-        ]);
-        // TODO: What would the real error be?
+        let result = typecheck_program(&mut parse_program_or_die(
+            r"
+            co performs_foo() -> bool ! foo(i64 -> bool) {
+                perform foo(1)
+            }
+            fn cannot_propagate_foo() -> bool {
+                performs_foo()?
+            }
+            ",
+        ));
+        // TODO: More informative error message?
         assert_eq!(
-            typecheck_program(program),
+            result,
             Err(Error::OpSetNotExtendable(OpSetI::empty_non_extensible()))
         );
     }
     #[test]
     fn test_lambda_coroutine() {
-        let program = &mut Program(vec![
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "performs_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-                body: Some(block_expr(vec![
-                    let_stmt("p", perform_anon("foo", 1)),
-                    "p".into(),
-                ])),
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "propagates_foo".to_string(),
-                args: vec![],
-                return_type: ParsedType::func(
-                    [],
-                    ParsedType::co(
-                        ParsedType::Bool,
-                        [ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-                    ),
-                ),
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "x",
-                        lambda_expr(
-                            vec![],
-                            co_expr(block_expr(vec![return_stmt(propagate(call_expr(
-                                "performs_foo",
-                                vec![],
-                            )))])),
-                        ),
-                    ),
-                    "x".into(),
-                ])),
-            }),
-        ]);
-        assert_eq!(typecheck_program(program), Ok(()));
+        let result = typecheck_program(&mut parse_program_or_die(
+            r"
+            co performs_foo() -> bool ! foo(i64 -> bool) {
+                perform foo(1)
+            }
+            fn propagates_foo() -> fn() -> Co<bool ! foo(i64 -> bool)> {
+                || co { return performs_foo()? }
+            }
+            ",
+        ));
+
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
@@ -3446,4 +3389,5 @@ mod tests {
     // TODO: Test that structs must have concrete types.
     // TODO: Recursive types? Mutually recursive types? Forward declarations?
     // TODO: Need to represent Co<T ! E1, E2, E3> in parser.
+    // TODO: Disallow top level unspecified, lol
 }
