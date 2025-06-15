@@ -556,6 +556,22 @@ fn resolve_effect(
     })
 }
 
+fn resolve_fn_type(mut shadow: ShadowTypeContext, parsed: &FnDecl) -> Result<Type, Error> {
+    let mut params = Vec::new();
+    for param in parsed.forall.iter() {
+        shadow.insert_type_param(param);
+        params.push(param.clone());
+        // TODO: what if dup?
+    }
+    let mut arg_types = Vec::new();
+    for arg_binding in parsed.args.iter() {
+        arg_types.push(resolve_type(shadow.context(), &arg_binding.parsed_type)?);
+    }
+    let ret = resolve_type(shadow.context(), &parsed.return_type)?;
+    shadow.finish();
+    Ok(Type::forall(params, Type::func(arg_types, ret)))
+}
+
 fn resolve_type(context: &TypeContext, ty: &ParsedType) -> Result<Type, Error> {
     match ty {
         ParsedType::Unspecified => Ok(Type::unknown()),
@@ -981,18 +997,9 @@ pub struct FnDecl {
     pub forall: Vec<String>,
     pub name: String,
     pub args: Vec<Binding>,
-    pub return_type: Type, // TODO: This should be the parsed type...
+    pub return_type: ParsedType,
     // If no body is provided, its assumed to be external.
     pub body: Option<Expression>,
-}
-impl FnDecl {
-    fn as_type(&self) -> Type {
-        let arg_types = self.args.iter().map(|b| b.ty.clone()).collect();
-        Type::forall(
-            self.forall.clone(),
-            Type::func(arg_types, self.return_type.clone()),
-        )
-    }
 }
 
 // A coroutine function.
@@ -1051,6 +1058,9 @@ impl EffectDecl {
     }
 }
 
+// TODO: Move this to the parser.
+// Every declaration is nontrivial in that it can reference named types, which require resolution.
+// Therefore, they need a pre and post resolution representation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Declaration {
     Fn(FnDecl),
@@ -1707,6 +1717,7 @@ fn check_statement_concrete(statement: &Statement) -> Result<(), Error> {
 
 fn typecheck_program(program: &mut Program) -> Result<(), Error> {
     // First, load declarations into typing context.
+    // TODO: Allow for circular dependencies between types at the top level.
     let mut context = TypeContext::new();
     let mut shadow = context.shadow();
     for declaration in program.0.iter() {
@@ -1731,11 +1742,8 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 if shadow.context_contains(&fn_decl.name) {
                     return Err(Error::DuplicateTopLevelName(fn_decl.name.clone()));
                 }
-                let mut arg_types = vec![];
-                for binding in fn_decl.args.iter() {
-                    arg_types.push(binding.ty.clone());
-                }
-                shadow.insert_variable(fn_decl.name.clone(), fn_decl.as_type(), false);
+                let fn_type = resolve_fn_type(shadow.context().shadow(), fn_decl)?;
+                shadow.insert_variable(fn_decl.name.clone(), fn_type, false);
             }
             Declaration::Co(co_decl) => {
                 let local_context = shadow.context();
@@ -1788,7 +1796,7 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
     for declaration in program.0.iter_mut() {
         match declaration {
             Declaration::Fn(FnDecl {
-                forall: _,
+                forall,
                 name: _,
                 args,
                 return_type,
@@ -1797,8 +1805,13 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 if body.is_none() {
                     continue; // External fn, take it for granted.
                 }
+                // Local shadow.
+                let mut shadow = shadow.context().shadow();
+                for param in forall {
+                    shadow.insert_type_param(param);
+                }
+                let return_type = resolve_type(shadow.context(), return_type)?;
                 let body = body.as_mut().unwrap();
-
                 // Declare a new shadow to insert fn variables.
                 let mut shadow = shadow
                     .context()
@@ -1807,7 +1820,7 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                     shadow.insert_binding(binding.clone());
                 }
                 infer(shadow.context(), body)?;
-                unify(return_type, &body.get_type())?;
+                unify(&return_type, &body.get_type())?;
                 shadow.finish();
                 check_expression_concrete(body)?;
             }
@@ -2074,14 +2087,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     let_stmt("a", 2),
                     let_stmt("b", 2),
@@ -2098,7 +2111,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::bool_(),
+            return_type: ParsedType::Bool,
             body: Some(block_expr(vec![
                 let_stmt("a", 2),
                 let_stmt("a", 2.0),
@@ -2115,7 +2128,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![Binding::new_typed_mut("a", ParsedType::Int)],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![assign_stmt("a", 3)])),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
@@ -2126,7 +2139,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![let_mut_stmt("a", 2), assign_stmt("a", ())])),
         })]);
         assert_eq!(
@@ -2140,7 +2153,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![let_stmt("a", 2), assign_stmt("a", 3)])),
         })]);
         assert_eq!(
@@ -2155,14 +2168,14 @@ mod tests {
                 forall: vec![],
                 name: "round".to_string(),
                 args: vec![Binding::new_typed("a", ParsedType::Float)],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     let_stmt("a", true),
                     let_stmt("b", 2),
@@ -2183,14 +2196,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
@@ -2217,14 +2230,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::func(vec![Type::int()], Type::int()),
+                return_type: ParsedType::func([ParsedType::Int], ParsedType::Int),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
@@ -2249,14 +2262,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::func(vec![Type::int()], Type::int()),
+                return_type: ParsedType::func([ParsedType::Int], ParsedType::Int),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
@@ -2285,7 +2298,7 @@ mod tests {
                     "a",
                     ParsedType::Named("T".to_string(), vec![]),
                 )],
-                return_type: Type::param("T"),
+                return_type: ParsedType::named("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
@@ -2295,14 +2308,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![call_expr(
                     "plus",
                     vec![
@@ -2326,14 +2339,14 @@ mod tests {
                     "a",
                     ParsedType::Named("T".to_string(), vec![]),
                 )],
-                return_type: Type::param("T"),
+                return_type: ParsedType::named("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::float(),
+                return_type: ParsedType::Float,
                 body: Some(block_expr(vec![
                     let_stmt("x", call_expr("id", vec![12.34.into()])),
                     let_stmt("b", call_expr("id", vec![false.into()])),
@@ -2354,7 +2367,7 @@ mod tests {
                     "a",
                     ParsedType::Named("T".to_string(), vec![]),
                 )],
-                return_type: Type::param("T"),
+                return_type: ParsedType::named("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
@@ -2364,14 +2377,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::func(vec![Type::int()], Type::int()),
+                return_type: ParsedType::func([ParsedType::Int], ParsedType::Int),
                 body: Some(block_expr(vec![call_expr(
                     "plus",
                     vec![
@@ -2392,7 +2405,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::int(),
+            return_type: ParsedType::Int,
             body: Some(block_expr(vec![
                 // Explicit return in true branch, implicit return in false.
                 if_expr(true, block_expr(vec![return_stmt(2)]), 3).into(),
@@ -2406,7 +2419,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::int(),
+            return_type: ParsedType::Int,
             body: Some(block_expr(vec![
                 // Explicit return in true branch, implicit return in false.
                 if_expr(true, block_expr(vec![return_stmt(2.5)]), 3).into(),
@@ -2423,7 +2436,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::int(),
+            return_type: ParsedType::Int,
             body: Some(block_expr(vec![
                 // Explicit return in true branch, implicit return in false.
                 let_stmt(
@@ -2445,7 +2458,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![])),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
@@ -2456,7 +2469,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![
                 let_stmt("x", 1),
                 let_stmt("y", false),
@@ -2476,7 +2489,7 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
@@ -2486,7 +2499,7 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
@@ -2496,14 +2509,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::bool_(),
+                return_type: ParsedType::Bool,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "factorial".to_string(),
                 args: vec![Binding::new_typed("x", ParsedType::Int)],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(if_expr(
                     call_expr("leq", vec!["x".into(), 1.into()]),
                     1,
@@ -2525,8 +2538,6 @@ mod tests {
 
     #[test]
     fn higher_order_functions() {
-        let fn_int_to_int = Type::func(vec![Type::int()], Type::int());
-
         let program = &mut Program(vec![
             // Declare external fn apply(f: fn(Int)->Int, x: Int) -> Int;
             Declaration::Fn(FnDecl {
@@ -2536,7 +2547,7 @@ mod tests {
                     Binding::new_typed("f", ParsedType::func([ParsedType::Int], ParsedType::Int)),
                     Binding::new_typed("x", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None, // External
             }),
             // Declare external fn make_adder(y: Int) -> fn(Int)->Int;
@@ -2544,7 +2555,7 @@ mod tests {
                 forall: vec![],
                 name: "make_adder".to_string(),
                 args: vec![Binding::new_typed("y", ParsedType::Int)],
-                return_type: fn_int_to_int.clone(),
+                return_type: ParsedType::func([ParsedType::Int], ParsedType::Int),
                 body: None, // External
             }),
             // Declare fn main() -> Int {
@@ -2555,7 +2566,7 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     // let add_5 = make_adder(5)
                     let_stmt("add5", call_expr("make_adder", vec![5.into()])),
@@ -2584,7 +2595,7 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
+                return_type: ParsedType::Bool,
                 body: Some(block_expr(vec![
                     let_stmt(
                         "p",
@@ -2620,7 +2631,7 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
+                return_type: ParsedType::Bool,
                 body: Some(block_expr(vec![
                     let_stmt(
                         "p",
@@ -2648,7 +2659,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::bool_(),
+            return_type: ParsedType::Bool,
             body: Some(block_expr(vec![
                 let_stmt("p", ()),
                 field("p", "whoopsie").into(),
@@ -2679,14 +2690,14 @@ mod tests {
                 forall: vec!["T".to_string()],
                 name: "default".to_string(),
                 args: vec![],
-                return_type: Type::param("T"),
+                return_type: ParsedType::named("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     // Initialize `p` with some polymorphic default fn.
                     let_mut_stmt("p", call_expr("default", vec![])),
@@ -2728,14 +2739,14 @@ mod tests {
                 forall: vec!["T".to_string()],
                 name: "default".to_string(),
                 args: vec![],
-                return_type: Type::param("T"),
+                return_type: ParsedType::named("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     // Initialize `p` with some polymorphic default fn.
                     let_mut_stmt("p", call_expr("default", vec![])),
@@ -2773,19 +2784,8 @@ mod tests {
             ],
         );
 
-        let pair_type = |left_type, right_type| {
-            Type::struct_(StructInstance {
-                decl: Rc::new(StructDecl::new(
-                    "Pair",
-                    &[("left", Type::param("T")), ("right", Type::param("U"))],
-                    &["T", "U"],
-                )),
-                params: BTreeMap::from_iter([
-                    ("T".to_string(), left_type),
-                    ("U".to_string(), right_type),
-                ]),
-            })
-        };
+        let pair_type =
+            |left_type, right_type| ParsedType::parameterized("Pair", &[left_type, right_type]);
         let program = &mut Program(vec![
             Declaration::Struct(pair.clone()),
             Declaration::Fn(FnDecl {
@@ -2795,9 +2795,9 @@ mod tests {
                     "a",
                     ParsedType::Named("T".to_string(), vec![]),
                 )],
-                return_type: Type::func(
-                    vec![Type::param("U")],
-                    pair_type(Type::param("T"), Type::param("U")),
+                return_type: ParsedType::func(
+                    [ParsedType::named("U")],
+                    pair_type(ParsedType::named("T"), ParsedType::named("U")),
                 ),
                 body: Some(block_expr(vec![lambda_expr(
                     vec![Binding::new("b")],
@@ -2817,8 +2817,8 @@ mod tests {
                 name: "main".to_string(),
                 args: vec![],
                 return_type: pair_type(
-                    pair_type(Type::bool_(), Type::int()),
-                    pair_type(Type::int(), Type::float()),
+                    pair_type(ParsedType::Bool, ParsedType::Int),
+                    pair_type(ParsedType::Int, ParsedType::Float),
                 ),
                 body: Some(block_expr(vec![
                     let_stmt(
@@ -3064,7 +3064,7 @@ mod tests {
                 forall: vec![],
                 name: "cannot_propagate_foo".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
+                return_type: ParsedType::Bool,
                 body: Some(block_expr(vec![propagate(call_expr(
                     "performs_foo",
                     vec![],
@@ -3100,7 +3100,13 @@ mod tests {
                 forall: vec![],
                 name: "propagates_foo".to_string(),
                 args: vec![],
-                return_type: Type::func(vec![], Type::co(Type::bool_(), ops)),
+                return_type: ParsedType::func(
+                    [],
+                    ParsedType::co(
+                        ParsedType::Bool,
+                        [ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
+                    ),
+                ),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "x",
@@ -3168,7 +3174,13 @@ mod tests {
                 forall: vec![],
                 name: "propagates_foo".to_string(),
                 args: vec![],
-                return_type: Type::co(Type::unit(), foo_bar_ops),
+                return_type: ParsedType::co(
+                    ParsedType::Unit,
+                    [
+                        ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool),
+                        ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float),
+                    ],
+                ),
                 body: Some(block_expr(vec![co_expr(block_expr(vec![
                     let_stmt("f", propagate(call_expr("performs_foo", vec![]))),
                     let_stmt("b", propagate(call_expr("performs_bar", vec![]))),
@@ -3229,7 +3241,13 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::co(Type::unit(), foo_bar_ops.clone()),
+                return_type: ParsedType::co(
+                    ParsedType::Unit,
+                    [
+                        ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool),
+                        ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float),
+                    ],
+                ),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "lambda",
@@ -3306,7 +3324,14 @@ mod tests {
                 name: "main".to_string(),
                 args: vec![],
                 // The returned co should not be empty. ERROR!
-                return_type: Type::co(Type::unit(), foo_bar_baz_ops),
+                return_type: ParsedType::co(
+                    ParsedType::Unit,
+                    [
+                        ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool),
+                        ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float),
+                        ParsedOp::anon("baz", ParsedType::Float, ParsedType::Bool),
+                    ],
+                ),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "lambda",
@@ -3380,7 +3405,10 @@ mod tests {
                 name: "main".to_string(),
                 args: vec![],
                 // The returned co should have foo and bar. ERROR.
-                return_type: Type::co(Type::unit(), foo_ops),
+                return_type: ParsedType::co(
+                    ParsedType::Unit,
+                    [ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
+                ),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "lambda",
@@ -3424,7 +3452,7 @@ mod tests {
             name: "main".to_string(),
             args: vec![],
             // The returned co should not be empty. ERROR!
-            return_type: Type::co(Type::unit(), OpSetI::empty_non_extensible()),
+            return_type: ParsedType::co(ParsedType::Unit, []),
             body: Some(block_expr(vec![co_expr(perform_anon("foo", 42)).into()])),
         })]);
         let result = typecheck_program(program);
@@ -3448,7 +3476,10 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::co(Type::bool_(), foo_ops),
+            return_type: ParsedType::co(
+                ParsedType::Bool,
+                [ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
+            ),
             body: Some(block_expr(vec![co_expr(perform_anon("foo", 42)).into()])),
         })]);
         assert_eq!(typecheck_program(program), Ok(()));
@@ -3502,14 +3533,14 @@ mod tests {
                 forall: vec!["T".to_string()],
                 name: "default".to_string(),
                 args: vec![],
-                return_type: Type::param("T"),
+                return_type: ParsedType::named("T"),
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::unit(),
+                return_type: ParsedType::Unit,
                 body: Some(block_expr(vec![
                     let_stmt("foo", call_expr("default", vec![])),
                     return_stmt(()),
@@ -3527,7 +3558,7 @@ mod tests {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::int(),
+            return_type: ParsedType::Int,
             body: Some(block_expr(vec![
                 let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
                 propagate("performs_bar").into(),
@@ -3546,14 +3577,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     let_stmt("performs_foo", co_expr(perform_anon("foo", 53))),
                     let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
@@ -3598,14 +3629,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Float),
                 ],
-                return_type: Type::bool_(),
+                return_type: ParsedType::Bool,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
+                return_type: ParsedType::Bool,
                 body: Some(block_expr(vec![
                     let_stmt("performs_foo", co_expr(perform_anon("foo", 53.42))),
                     let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
@@ -3650,14 +3681,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo_and_bar",
@@ -3693,14 +3724,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo_and_bar",
@@ -3743,14 +3774,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     let_stmt(
                         "performs_foo",
@@ -3796,14 +3827,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Float),
                 ],
-                return_type: Type::bool_(),
+                return_type: ParsedType::Bool,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     let_stmt("performs_foo", co_expr(perform_anon("foo", 53.42))),
                     let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),
@@ -3848,14 +3879,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Float),
                 ],
-                return_type: Type::bool_(),
+                return_type: ParsedType::Bool,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     let_stmt("performs_foo", co_expr(perform_anon("foo", 53.42))),
                     let_stmt("performs_bar", co_expr(perform_anon("bar", 53))),

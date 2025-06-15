@@ -252,9 +252,16 @@ impl ParsedType {
     pub fn func(args: impl AsRef<[Self]>, ret: Self) -> Self {
         Self::Fn(args.as_ref().to_vec(), Box::new(ret))
     }
+    pub fn co(ret: ParsedType, ops: impl AsRef<[ParsedOp]>) -> Self {
+        Self::Co(Box::new(ret), ops.as_ref().to_vec())
+    }
     pub fn named(name: &str) -> Self {
         Self::Named(name.to_string(), vec![])
     }
+    pub fn parameterized(name: &str, params: &[ParsedType]) -> Self {
+        Self::Named(name.to_string(), params.to_vec())
+    }
+
     pub fn is_specified(&self) -> bool {
         match self {
             Self::Unspecified => false,
@@ -407,8 +414,8 @@ fn parse_fn_decl<'s>(
 
     let return_type = node
         .optional_child("return_type", errors)
-        .and_then(|n| parse_type(n, errors))
-        .unwrap_or(Type::unit());
+        .and_then(|n| parse_type2(n, errors))
+        .unwrap_or(ParsedType::Unit);
 
     let body = node
         .required_child("body", errors)
@@ -1166,10 +1173,8 @@ fn parse_call_expr<'s>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
-    use crate::ast::{test_helpers::*, StructDecl};
+    use crate::ast::test_helpers::*;
 
     #[test]
     fn parses_simple_main() {
@@ -1186,7 +1191,7 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![2.into()]))
             })]))
         );
@@ -1212,14 +1217,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
@@ -1257,14 +1262,14 @@ mod tests {
                     Binding::new_typed("a", ParsedType::Int),
                     Binding::new_typed("b", ParsedType::Int),
                 ],
-                return_type: Type::int(),
+                return_type: ParsedType::Int,
                 body: None,
             }),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::func(vec![Type::int()], Type::int()),
+                return_type: ParsedType::func([ParsedType::Int], ParsedType::Int),
                 body: Some(block_expr(vec![
                     let_stmt(
                         "plus_two",
@@ -1310,7 +1315,7 @@ mod tests {
                 ty: Type::unknown(),
                 mutable: false,
             }],
-            return_type: Type::param("T"),
+            return_type: ParsedType::named("T"),
             body: Some(block_expr(vec!["x".into()])),
         })]);
         let mut errors = vec![];
@@ -1529,7 +1534,7 @@ mod tests {
             name: "main".to_string(),
             forall: Default::default(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![perform_anon("foo", 1).into()])),
         })]));
         assert_eq!(parsed, expected_ast);
@@ -1553,7 +1558,7 @@ mod tests {
             name: "main".to_string(),
             forall: Default::default(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![perform_anon("foo", ()).into()])),
         })]));
         assert_eq!(parsed, expected_ast);
@@ -1574,7 +1579,7 @@ mod tests {
             name: "main".to_string(),
             forall: Default::default(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![propagate(call_expr("foo", vec![])).into()])),
         })]));
         assert_eq!(parsed, expected_ast);
@@ -1595,7 +1600,7 @@ mod tests {
             name: "main".to_string(),
             forall: Default::default(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![co_expr(call_expr("foo", vec![])).into()])),
         })]));
         assert_eq!(parsed, expected_ast);
@@ -1617,7 +1622,7 @@ mod tests {
             name: "main".to_string(),
             forall: Default::default(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![Expression::LiteralStruct {
                 name: "Foo".to_string(),
                 ty: Type::unknown(),
@@ -1653,7 +1658,7 @@ mod tests {
             name: "main".to_string(),
             forall: Default::default(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![Expression::LiteralStruct {
                 name: "Foo".to_string(),
                 ty: Type::unknown(),
@@ -1690,7 +1695,7 @@ mod tests {
             name: "main".to_string(),
             forall: Default::default(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![Expression::Handle {
                 co: Box::new(call_expr("foo", vec![])),
                 return_arm: Some((
@@ -1736,7 +1741,7 @@ mod tests {
             name: "main".to_string(),
             forall: Default::default(),
             args: vec![],
-            return_type: Type::unit(),
+            return_type: ParsedType::Unit,
             body: Some(block_expr(vec![Expression::L(
                 LValue::Field(Box::new(call_expr("foo", vec![])), "bar".to_string()),
                 Type::unknown(),
