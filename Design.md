@@ -385,25 +385,7 @@ This subsection outlines areas where the design is still evolving, involves know
 ## 4. Implementation State & Plans
 
 ### 4.1 Immediate state and Immediate next steps
-* **Parser:** An initial `tree-sitter` grammar has been implemented in `grammar.js`. `parse.rs` accesses the generated parser via the Rust tree-sitter bindings and uses them to build the basic AST structures defined in `ast.rs`. This needs additional testing and integration.
-* **AST & Type Checker:** `ast.rs` implements basic AST nodes (literals, if, call, block, lambda, let, assign, structs, handle). It contains a Hindley-Milner based type inference system (`infer`, `unify`).
-  * It successfully handles basic type checking, variable scoping, and mutability checks for assignments on the current language subset. Lacks AST representation and type checking logic for core Silica features: references, effects/coroutines, enums, traits, and explicit generics.
-  * Assignments to fields is not yet implemented because I'm not sure how to determine whether an expression is mutable.
-  * Handle blocks don't have initially/finally arms.
-* **Mid Level SSA IR**
-  * `ssa.rs` defines basic data structures for an SSA IR (`SsaVar`, `Instruction`, `BasicBlock`, etc.) and includes an SSA validation pass (`typecheck_ssa`) for this basic structure.
-  * Development on this file is paused until the type checker supports effects and references.
-  * Lifetime and definite initialization analysis is planned to be implemented at this layer.
-  * Generic functions are preserved in the MIR for analysis before potential monomorphization in the LLVM backend.
-* **Implementation Plan**:
-  1.  Enhance Parser (`grammar.js`, `parse.rs`) and AST/TypeChecker (`ast.rs`) to support more language features (e.g., structs, basic references).
-      1.  The parser does not yet support structs, through the AST/Typechecker does.
-      2.  References and Effects are the likely next step for the type checker
-  2.  Implement Lowering from the type-annotated AST to the SSA/MIR form (`ssa.rs`).
-      1.  Implement last use inference
-      2.  Implement lifetime infernece and checking
-      3.  Develop LLVM backend code generation from MIR.
-* **Anticipated Implementation order of major features:** Effects should be implemented, followed by linear types, followed by references, followed by flow-sensitive transmutation, followed by defer. Initial implementation of LLVM lowering makes sense after effects and linear types are in the language. 
+TODO: Rewrite.
 
 
 ### 4.2 LLVM Coroutine Backend Strategy
@@ -515,7 +497,7 @@ Silica will adopt structured concurrency as its primary model for managing concu
   * **Allocators:** `Allocator` trait defined (using `RestrictPtr`, returning values not `Co`). Allocation/deallocation are *not* algebraic effects.
   * **Temporary Lifetime Extension:** Desired. Planned implementation via implicit MIR variables + ASAP destruction.
 
-* **Checklist:** (For AI use when reviewing/generating this document)
+* **Design Review Checklist:** (For AI use when reviewing/generating this document)
   * Check for Clarity: Ensure explanations are understandable to the target audience. Define terms. Provide rationale. Use examples.
   * Check Target Audience Readability (Rust/C++ Dev): Review explanations for novel concepts (effects, linearity, `&deinit`, immovability, `~?Type`) to ensure clarity without requiring deep PL theory. Confirm differences from Rust/C++ are explicit.
     * Crucially, when motivating algebraic effects, avoid examples like State or IO which are often seen as trivial non-issues in imperative languages. Focus on demonstrating value through patterns like generators, async/await, exceptions, transactions/retries, etc.
@@ -531,5 +513,35 @@ Silica will adopt structured concurrency as its primary model for managing concu
   *  Remember `~TypeName` denotes an *uninitialized state* concept, not Rust destructor syntax.
   *  Remember `handle` *consumes* its argument via a trait mechanism (specific trait TBD)
   *  Avoid re-introducing rejected ideas unless explicitly asked to reconsider.
+
+* **Onboarding Instructions:** Follow these instructions step by step to familiarize yourself with the Silica project.
+  1. Review this design document.
+     1. List the important features and consider the interactions between pairs of features.
+     2. List points where the design is light on details
+     3. For each of those points, think through a resolution based on the existing document.
+     4. Enumerate the source of potential complexity and think through potential resolution strategies. Note that Silica is still in development and while issues need to be surfaced, they need not be immediately solved.
+     5. Compare and contrast Silica against other languages, such as C++, Rust, Python, Koka, Ocaml, and Haskell.
+  2. Review the langauge's implementation files
+     1. See `grammar.js` for the tree-sitter grammar. 
+        1. Think through what features are missing. The grammar will only be expanded as and when the type system is capable of modeling the associated complexity.
+     2. See `parse.rs` for Rust code that uses the generated tree-sitter parser and converts it to datastructures in Rust
+     3. See `ast.rs` to see the type system, inference, and a long list of tests.
+        1. Describe the current implementation state of the type system. Compare it to the implemented features in the parser/grammar. Are there gaps?
+        2. Compare the implementation state to the overall design.
+           1. How should the type system be augmented to bring it closer to the design.
+           2. For each potential direction, what is the smallest incremental steps be
+     4. Review the TODOs in the three files.
+        1. For each TODO, describe what changes need to resolve the TODO.
+        2. For each TODO, decide whether it is stale, blocked by other features, blocked by refactoring, or if its readily fixable.
+  3. Propose a roadmap to bring the implementation closer to the intended design
+     1. Based on the gaps and TODOs identified, enumerate the major work items that should be in a roadmap
+     2. Identify dependencies and interactions between items in the roadmap, if two items are interdependent, they should be broken into smaller work items.
+     3. Ensure work items form a directed acyclic graph (a DAG) and then identify which items are unblocked and may be worked on first.
+     4. Of the unblocked work items, decide which should come first, consider ease of implementation and important to the long term goals. Prioritize progress and momentum.
+  4. Having followed these steps, reflect on these onboarding instructions and your thinking
+     1. Check your previous thinking. Enumerate corrections.
+     2. Critique these onboarding instructions. What steps should be expanded or added to better explore the language?
+     3. List out your changes to the onboarding instructions
+     4. Follow your new instructions.
 
 **Useful Search Terms:** "algebraic effects existential types", "linear types lifetimes", "affine types resource management", "scoped effect handlers", "effect tunneling", "SSA for coroutines", "definite assignment analysis", "immovable types language design", "continuation passing style compilation", "LLVM coroutine intrinsics", "Rust MIR borrow checking", "output reference types", "guaranteed copy elision semantics", "effect handlers driving computation", "asynchronous algebraic effects", "flow sensitive type systems owned types", "typestate analysis implementation", "Hindley-Milner overloading".
