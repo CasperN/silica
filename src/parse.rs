@@ -1,9 +1,6 @@
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 
-use crate::ast::{
-    Binding, CoDecl, Declaration, Expression, FnDecl, HandleOpArm, LValue, OpSet, Program,
-    Statement, Type,
-};
+use crate::ast::{Binding, Expression, HandleOpArm, LValue, OpSet, Statement, Type};
 use tree_sitter::{Language, Node, Parser};
 
 extern "C" {
@@ -276,12 +273,12 @@ impl ParsedType {
 
 // TODO: str instead of string?
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ParsedStructDecl {
+pub(crate) struct StructDecl {
     pub(crate) name: String,
     pub(crate) params: Vec<String>,
     pub(crate) fields: Vec<(String, ParsedType)>,
 }
-impl ParsedStructDecl {
+impl StructDecl {
     pub fn new(name: impl Into<String>, fields: &[(&str, ParsedType)]) -> Self {
         Self::parameterized(name, &[], fields)
     }
@@ -302,11 +299,44 @@ impl ParsedStructDecl {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ParsedEffectDecl {
+pub struct EffectDecl {
     pub name: String,
     pub params: Vec<String>,
     pub ops: Vec<ParsedOp>,
 }
+
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct FnDecl {
+    pub forall: Vec<String>,
+    pub name: String,
+    pub args: Vec<Binding>,
+    pub return_type: ParsedType,
+    // If no body is provided, its assumed to be external.
+    pub body: Option<Expression>,
+}
+
+// A coroutine function.
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct CoDecl {
+    pub forall: Vec<String>,
+    pub name: String,
+    pub args: Vec<Binding>,
+    pub return_type: ParsedType,
+    pub ops: Vec<ParsedOp>,
+    // If no body is provided, its assumed to be external.
+    pub body: Option<Expression>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Declaration {
+    Fn(FnDecl),
+    Co(CoDecl),
+    Struct(StructDecl),
+    Effect(EffectDecl), // enums, traits, etc
+}
+
+#[derive(Default, Debug, Clone, PartialEq)]
+pub struct Program(pub Vec<Declaration>);
 
 // *************************************************************************************************
 //  Parse functions
@@ -386,7 +416,7 @@ fn parse_effect_decl<'s>(
         }
     }
     name.map(|name| {
-        Declaration::Effect(ParsedEffectDecl {
+        Declaration::Effect(EffectDecl {
             name: name.to_string(),
             params,
             ops,
@@ -558,7 +588,7 @@ fn parse_struct_decl<'s>(
             }
         }
     }
-    Some(Declaration::Struct(ParsedStructDecl {
+    Some(Declaration::Struct(StructDecl {
         name: struct_name.to_string(),
         params,
         fields,
@@ -1286,7 +1316,7 @@ mod tests {
     #[test]
     fn declare_struct() {
         let source = r"struct FooBar { foo: i64, bar: f64 }";
-        let program = Program(vec![Declaration::Struct(ParsedStructDecl {
+        let program = Program(vec![Declaration::Struct(StructDecl {
             params: vec![],
             name: "FooBar".to_string(),
             fields: vec![
@@ -1322,7 +1352,7 @@ mod tests {
     #[test]
     fn declare_generic_struct() {
         let source = r"struct FooBar<F, B> { foo: F, bar: B }";
-        let program = Program(vec![Declaration::Struct(ParsedStructDecl::parameterized(
+        let program = Program(vec![Declaration::Struct(StructDecl::parameterized(
             "FooBar",
             &["F", "B"],
             &[
@@ -1338,7 +1368,7 @@ mod tests {
     #[test]
     fn declare_effect() {
         let source = r"effect IntState { get: unit -> i64, set: i64 -> unit }";
-        let program = Program(vec![Declaration::Effect(ParsedEffectDecl {
+        let program = Program(vec![Declaration::Effect(EffectDecl {
             name: "IntState".to_string(),
             params: vec![],
             ops: vec![
@@ -1355,7 +1385,7 @@ mod tests {
     #[test]
     fn declare_generic_effect() {
         let source = r"effect State<T> { get: unit -> T, set: T -> unit }";
-        let program = Program(vec![Declaration::Effect(ParsedEffectDecl {
+        let program = Program(vec![Declaration::Effect(EffectDecl {
             name: "State".to_string(),
             params: vec!["T".to_string()],
             ops: vec![
@@ -1396,7 +1426,7 @@ mod tests {
                 }
             ]
         );
-        let program = Program(vec![Declaration::Struct(ParsedStructDecl::new(
+        let program = Program(vec![Declaration::Struct(StructDecl::new(
             "Foo",
             &[("foo", ParsedType::Int), ("bar", ParsedType::Unit)],
         ))]);
@@ -1419,7 +1449,7 @@ mod tests {
         }];
         assert_eq!(errors, expected_errors);
 
-        let expected_ast = Some(Program(vec![Declaration::Struct(ParsedStructDecl {
+        let expected_ast = Some(Program(vec![Declaration::Struct(StructDecl {
             name: "Point".to_string(),
             params: vec![],
             fields: vec![
@@ -1446,7 +1476,7 @@ mod tests {
         }];
         assert_eq!(errors, expected_errors);
 
-        let expected_ast = Some(Program(vec![Declaration::Struct(ParsedStructDecl::new(
+        let expected_ast = Some(Program(vec![Declaration::Struct(StructDecl::new(
             "Point",
             &[("x", ParsedType::Int)],
         ))]));
@@ -1476,7 +1506,7 @@ mod tests {
         ];
         assert_eq!(errors, expected_errors);
 
-        let expected_ast = Some(Program(vec![Declaration::Effect(ParsedEffectDecl {
+        let expected_ast = Some(Program(vec![Declaration::Effect(EffectDecl {
             name: "State".to_string(),
             params: vec!["T".to_string()],
             ops: vec![

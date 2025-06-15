@@ -1,6 +1,8 @@
 // Abstract syntax tree and type checking.
 #![allow(clippy::result_large_err)]
-use crate::parse::{self, ParsedEffectDecl, ParsedOp, ParsedStructDecl, ParsedType};
+use crate::parse::{
+    CoDecl, Declaration, EffectDecl, FnDecl, ParsedOp, ParsedType, Program, StructDecl,
+};
 use crate::union_find::UnionFindRef;
 use std::cell::{Ref, RefMut};
 use std::collections::hash_map::Entry;
@@ -506,10 +508,7 @@ impl OpSetI {
 
 // TODO: Resolved structs and effects shouldn't have UNSPECIFIED in there.
 
-fn resolve_struct(
-    mut shadow: ShadowTypeContext,
-    parsed: &ParsedStructDecl,
-) -> Result<StructDecl, Error> {
+fn resolve_struct(mut shadow: ShadowTypeContext, parsed: &StructDecl) -> Result<StructType, Error> {
     let mut fields = HashMap::new();
     for param in parsed.params.iter() {
         shadow.insert_type_param(param);
@@ -522,17 +521,14 @@ fn resolve_struct(
     }
 
     shadow.finish();
-    Ok(StructDecl {
+    Ok(StructType {
         params: parsed.params.clone(),
         name: parsed.name.clone(),
         fields,
     })
 }
 
-fn resolve_effect(
-    mut shadow: ShadowTypeContext,
-    parsed: &ParsedEffectDecl,
-) -> Result<EffectDecl, Error> {
+fn resolve_effect(mut shadow: ShadowTypeContext, parsed: &EffectDecl) -> Result<EffectType, Error> {
     for param in parsed.params.iter() {
         shadow.insert_type_param(param);
     }
@@ -549,7 +545,7 @@ fn resolve_effect(
             ParsedOp::NamedEffect { .. } => todo!(),
         }
     }
-    Ok(EffectDecl {
+    Ok(EffectType {
         name: parsed.name.clone(),
         params: parsed.params.clone(),
         ops,
@@ -1022,42 +1018,20 @@ impl Binding {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq)]
-pub struct FnDecl {
-    pub forall: Vec<String>,
-    pub name: String,
-    pub args: Vec<Binding>,
-    pub return_type: ParsedType,
-    // If no body is provided, its assumed to be external.
-    pub body: Option<Expression>,
-}
-
-// A coroutine function.
-#[derive(Default, Debug, Clone, PartialEq)]
-pub struct CoDecl {
-    pub forall: Vec<String>,
-    pub name: String,
-    pub args: Vec<Binding>,
-    pub return_type: ParsedType,
-    pub ops: Vec<ParsedOp>,
-    // If no body is provided, its assumed to be external.
-    pub body: Option<Expression>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
-pub struct StructDecl {
+pub struct StructType {
     pub name: String,
     pub params: Vec<String>,
     pub fields: HashMap<String, Type>,
 }
-impl StructDecl {
+impl StructType {
     fn new(name: &str, fields: &[(&str, Type)], params: &[&str]) -> Self {
         let fields: HashMap<String, Type> = fields
             .iter()
             .map(|(name, ty)| (name.to_string(), ty.clone()))
             .collect();
         let params = params.iter().map(|p| p.to_string()).collect();
-        StructDecl {
+        StructType {
             name: name.to_string(),
             params,
             fields,
@@ -1066,12 +1040,12 @@ impl StructDecl {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct EffectDecl {
+pub struct EffectType {
     pub name: String,
     pub params: Vec<String>,
     pub ops: HashMap<String, (Type, Type)>,
 }
-impl EffectDecl {
+impl EffectType {
     fn unwrap_op_type(&self, op: &str) -> (Type, Type) {
         self.ops
             .get(op)
@@ -1080,24 +1054,10 @@ impl EffectDecl {
     }
 }
 
-// TODO: Move this to the parser.
-// Every declaration is nontrivial in that it can reference named types, which require resolution.
-// Therefore, they need a pre and post resolution representation.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Declaration {
-    Fn(FnDecl),
-    Co(CoDecl),
-    Struct(parse::ParsedStructDecl),
-    Effect(parse::ParsedEffectDecl), // enums, traits, etc
-}
-
-#[derive(Default, Debug, Clone, PartialEq)]
-pub struct Program(pub Vec<Declaration>);
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct StructInstance {
     params: BTreeMap<String, Type>,
-    decl: Rc<StructDecl>,
+    decl: Rc<StructType>,
 }
 impl StructInstance {
     fn field_type(&self, field: &str) -> Result<Type, Error> {
@@ -1115,7 +1075,7 @@ impl StructInstance {
 #[derive(Debug, Clone, PartialEq)]
 struct EffectInstance {
     params: BTreeMap<String, Type>,
-    decl: Rc<EffectDecl>,
+    decl: Rc<EffectType>,
 }
 impl EffectInstance {
     fn unwrap_op_type(&self, op_name: &str) -> (Type, Type) {
@@ -1129,8 +1089,8 @@ impl EffectInstance {
 #[derive(PartialEq, Debug, Clone)]
 enum NamedItem {
     Variable(VariableInfo),
-    Struct(Rc<StructDecl>),
-    Effect(Rc<EffectDecl>),
+    Struct(Rc<StructType>),
+    Effect(Rc<EffectType>),
     TypeParam(String),
 }
 
@@ -1258,7 +1218,7 @@ impl<'a> ShadowTypeContext<'a> {
     }
 
     // Defines a struct. Returns if there was a previous definition.
-    fn define_struct(&mut self, decl: StructDecl) -> bool {
+    fn define_struct(&mut self, decl: StructType) -> bool {
         let name = decl.name.clone();
         let decl = NamedItem::Struct(Rc::new(decl));
         if let Entry::Vacant(entry) = self.shadowed_variables.entry(name.clone()) {
@@ -1272,7 +1232,7 @@ impl<'a> ShadowTypeContext<'a> {
             true
         }
     }
-    fn define_effect(&mut self, decl: EffectDecl) -> bool {
+    fn define_effect(&mut self, decl: EffectType) -> bool {
         let name = decl.name.clone();
         let decl = NamedItem::Effect(Rc::new(decl));
         if let Entry::Vacant(entry) = self.shadowed_variables.entry(name.clone()) {
@@ -1340,13 +1300,13 @@ enum Error {
         op_name: String,
     },
     DuplicateOpName(String),
-    NoMatchingOpInEffectDecl(String, EffectDecl),
+    NoMatchingOpInEffectDecl(String, EffectType),
     NamedEffectInstanceMismatch(EffectInstance, EffectInstance),
     DeclMustHaveConcreteTypes(String),
     FnDeclMustHaveConcreteTypes(FnDecl),
     CoDeclMustHaveConcreteTypes(CoDecl),
-    StructDeclMustHaveConcreteTypes(StructDecl),
-    EffectDeclMismatch(EffectDecl, EffectDecl),
+    StructDeclMustHaveConcreteTypes(StructType),
+    EffectDeclMismatch(EffectType, EffectType),
     OpSetNotUnifiable(OpSetI, OpSetI),
     OpSetNotExtendable(OpSetI),
     InapplicableConstraint(Type, Constraint),
@@ -2610,17 +2570,15 @@ mod tests {
 
     #[test]
     fn struct_field_access() {
-        let pair = ParsedStructDecl::parameterized(
-            "Pair",
-            &["T", "U"],
-            &[
-                ("left", ParsedType::named("T")),
-                ("right", ParsedType::named("U")),
-            ],
-        );
-
         let program = &mut Program(vec![
-            Declaration::Struct(pair),
+            Declaration::Struct(StructDecl::parameterized(
+                "Pair",
+                &["T", "U"],
+                &[
+                    ("left", ParsedType::named("T")),
+                    ("right", ParsedType::named("U")),
+                ],
+            )),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
@@ -2646,17 +2604,15 @@ mod tests {
     }
     #[test]
     fn struct_field_access_wrong_name() {
-        let pair = ParsedStructDecl::parameterized(
-            "Pair",
-            &["T", "U"],
-            &[
-                ("left", ParsedType::named("T")),
-                ("right", ParsedType::named("U")),
-            ],
-        );
-
         let program = &mut Program(vec![
-            Declaration::Struct(pair),
+            Declaration::Struct(StructDecl::parameterized(
+                "Pair",
+                &["T", "U"],
+                &[
+                    ("left", ParsedType::named("T")),
+                    ("right", ParsedType::named("U")),
+                ],
+            )),
             Declaration::Fn(FnDecl {
                 forall: vec![],
                 name: "main".to_string(),
@@ -2705,7 +2661,7 @@ mod tests {
     }
     #[test]
     fn delayed_field_access_correct_field_names() {
-        let pair = ParsedStructDecl::parameterized(
+        let pair = StructDecl::parameterized(
             "Pair",
             &["T", "U"],
             &[
@@ -2754,17 +2710,15 @@ mod tests {
 
     #[test]
     fn delayed_field_access_incorrect_field_names() {
-        let pair = ParsedStructDecl::parameterized(
-            "Pair",
-            &["T", "U"],
-            &[
-                ("left", ParsedType::named("T")),
-                ("right", ParsedType::named("U")),
-            ],
-        );
-
         let program = &mut Program(vec![
-            Declaration::Struct(pair),
+            Declaration::Struct(StructDecl::parameterized(
+                "Pair",
+                &["T", "U"],
+                &[
+                    ("left", ParsedType::named("T")),
+                    ("right", ParsedType::named("U")),
+                ],
+            )),
             Declaration::Fn(FnDecl {
                 forall: vec!["T".to_string()],
                 name: "default".to_string(),
@@ -2805,19 +2759,17 @@ mod tests {
     }
     #[test]
     fn curried_pair_polymorphic_fn_test() {
-        let pair = ParsedStructDecl::parameterized(
-            "Pair",
-            &["T", "U"],
-            &[
-                ("left", ParsedType::named("T")),
-                ("right", ParsedType::named("U")),
-            ],
-        );
-
         let pair_type =
             |left_type, right_type| ParsedType::parameterized("Pair", &[left_type, right_type]);
         let program = &mut Program(vec![
-            Declaration::Struct(pair.clone()),
+            Declaration::Struct(StructDecl::parameterized(
+                "Pair",
+                &["T", "U"],
+                &[
+                    ("left", ParsedType::named("T")),
+                    ("right", ParsedType::named("U")),
+                ],
+            )),
             Declaration::Fn(FnDecl {
                 forall: vec!["T".to_string(), "U".to_string()],
                 name: "make_pair".to_string(),
@@ -2887,7 +2839,7 @@ mod tests {
     #[test]
     fn perform_named_effects() {
         let program = &mut Program(vec![
-            Declaration::Effect(ParsedEffectDecl {
+            Declaration::Effect(EffectDecl {
                 name: "State".to_string(),
                 params: vec!["T".to_string()],
                 ops: vec![
@@ -2927,7 +2879,7 @@ mod tests {
     }
     #[test]
     fn two_state_effects_ok_because_one_is_named() {
-        let state_effect = EffectDecl {
+        let state_effect = EffectType {
             name: "State".to_string(),
             params: vec!["T".to_string()],
             ops: HashMap::from_iter([
@@ -2952,7 +2904,7 @@ mod tests {
     }
     #[test]
     fn conflicting_parametric_effects_both_unnamed() {
-        let state_effect = EffectDecl {
+        let state_effect = EffectType {
             name: "State".to_string(),
             params: vec!["T".to_string()],
             ops: HashMap::from_iter([
@@ -2979,7 +2931,7 @@ mod tests {
     }
     #[test]
     fn empty_opset_is_identity_under_unification() {
-        let state_effect = EffectDecl {
+        let state_effect = EffectType {
             name: "State".to_string(),
             params: vec!["T".to_string()],
             ops: HashMap::from_iter([
