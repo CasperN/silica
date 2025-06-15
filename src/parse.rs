@@ -1,7 +1,7 @@
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 
 use crate::ast::{
-    Binding, CoDecl, Declaration, Expression, FnDecl, HandleOpArm, LValue, OpSet, OpSetI, Program,
+    Binding, CoDecl, Declaration, Expression, FnDecl, HandleOpArm, LValue, OpSet, Program,
     Statement, Type,
 };
 use tree_sitter::{Language, Node, Parser};
@@ -231,7 +231,8 @@ pub enum ParsedOp {
     Anonymous(String, ParsedType, ParsedType),
     NamedEffect {
         name: Option<String>,
-        effect: String, // TODO: Parameterized effects?
+        effect: String,
+        params: Vec<ParsedType>,
         op_name: Option<String>,
     },
 }
@@ -461,12 +462,12 @@ fn parse_co_decl<'s>(
 
     let return_type = node
         .optional_child("return_type", errors)
-        .and_then(|n| parse_type(n, errors))
-        .unwrap_or(Type::unit());
+        .and_then(|n| parse_type2(n, errors))
+        .unwrap_or(ParsedType::Unit);
     let ops = node
         .optional_child("effects", errors)
         .and_then(|n| parse_effects(n, errors))
-        .unwrap_or(OpSetI::empty_non_extensible());
+        .unwrap_or_default();
 
     let body = node
         .required_child("body", errors)
@@ -493,8 +494,11 @@ fn parse_co_decl<'s>(
     }))
 }
 
-fn parse_effects<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) -> Option<OpSetI> {
-    let mut anonymous_ops = Vec::new();
+fn parse_effects<'s>(
+    node: SourceNode<'s, '_>,
+    errors: &mut Vec<ParseError<'s>>,
+) -> Option<Vec<ParsedOp>> {
+    let mut parsed_ops = Vec::new();
     for e in node.children_by_field_name("effects", errors) {
         match e.kind() {
             "anonymous_op_type" => {
@@ -503,12 +507,12 @@ fn parse_effects<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>)
                     .map(|n| n.text().to_string());
                 let perform_type = e
                     .required_child("perform_type", errors)
-                    .and_then(|n| parse_type(n, errors));
+                    .and_then(|n| parse_type2(n, errors));
                 let resume_type = e
                     .required_child("resume_type", errors)
-                    .and_then(|n| parse_type(n, errors));
+                    .and_then(|n| parse_type2(n, errors));
                 if let (Some(o), Some(p), Some(r)) = (op_name, perform_type, resume_type) {
-                    anonymous_ops.push((o, p, r));
+                    parsed_ops.push(ParsedOp::anon(&o, p, r));
                 }
             }
             found => {
@@ -520,15 +524,7 @@ fn parse_effects<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>)
             }
         }
     }
-    let mut opset = OpSetI::empty();
-    for (name, perform_type, resume_type) in anonymous_ops {
-        // TODO: Unification errors should not happen during parse. For now, we simply die instead
-        // of surfacing such an error. We need to (1) make ast::Type support unresolved types that
-        // the parser can produce, then (2) Convert from such unresolved effects to OpSets later.
-        opset.unify_add_anonymous_effect_or_die(&name, &perform_type, &resume_type);
-    }
-    opset.mark_done_extending();
-    Some(opset)
+    Some(parsed_ops)
 }
 
 fn parse_struct_decl<'s>(
@@ -1758,18 +1754,14 @@ mod tests {
         let mut errors = Vec::new();
         let parsed = parse_ast_program(source_code, &mut errors);
 
-        let mut ops = OpSetI::empty();
-        ops.unify_add_anonymous_effect_or_die("foo", &Type::int(), &Type::float())
-            .mark_done_extending();
-
         let expected_errors = vec![];
         assert_eq!(errors, expected_errors);
         let expected_ast = Some(Program(vec![Declaration::Co(CoDecl {
             name: "main".to_string(),
             forall: Default::default(),
             args: vec![],
-            ops,
-            return_type: Type::unit(),
+            ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Float)],
+            return_type: ParsedType::Unit,
             body: None,
         })]));
         assert_eq!(parsed, expected_ast);
@@ -1782,18 +1774,14 @@ mod tests {
         let mut errors = Vec::new();
         let parsed = parse_ast_program(source_code, &mut errors);
 
-        let mut ops = OpSetI::empty();
-        ops.unify_add_anonymous_effect_or_die("foo", &Type::int(), &Type::float())
-            .mark_done_extending();
-
         let expected_errors = vec![];
         assert_eq!(errors, expected_errors);
         let expected_ast = Some(Program(vec![Declaration::Co(CoDecl {
             name: "main".to_string(),
             forall: Default::default(),
             args: vec![],
-            ops,
-            return_type: Type::unit(),
+            ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Float)],
+            return_type: ParsedType::Unit,
             body: None,
         })]));
         assert_eq!(parsed, expected_ast);

@@ -572,6 +572,26 @@ fn resolve_fn_type(mut shadow: ShadowTypeContext, parsed: &FnDecl) -> Result<Typ
     Ok(Type::forall(params, Type::func(arg_types, ret)))
 }
 
+fn resolve_co_fn_type(mut shadow: ShadowTypeContext, parsed: &CoDecl) -> Result<Type, Error> {
+    let mut params = Vec::new();
+    for param in parsed.forall.iter() {
+        shadow.insert_type_param(param);
+        params.push(param.clone());
+        // TODO: what if dup?
+    }
+    let mut arg_types = Vec::new();
+    for arg_binding in parsed.args.iter() {
+        arg_types.push(resolve_type(shadow.context(), &arg_binding.parsed_type)?);
+    }
+    let ret = resolve_type(shadow.context(), &parsed.return_type)?;
+    let ops = resolve_ops(shadow.context(), &parsed.ops)?;
+    shadow.finish();
+    Ok(Type::forall(
+        params,
+        Type::func(arg_types, Type::co(ret, ops)),
+    ))
+}
+
 fn resolve_type(context: &TypeContext, ty: &ParsedType) -> Result<Type, Error> {
     match ty {
         ParsedType::Unspecified => Ok(Type::unknown()),
@@ -590,66 +610,7 @@ fn resolve_type(context: &TypeContext, ty: &ParsedType) -> Result<Type, Error> {
         }
         ParsedType::Co(ret, ops) => {
             let ret = resolve_type(context, ret)?;
-            let mut anonymous_ops = HashMap::new();
-            let mut named_effects = HashMap::new();
-
-            for op in ops {
-                match op {
-                    ParsedOp::Anonymous(op_name, p_ty, r_ty) => {
-                        let perform_type = resolve_type(context, p_ty)?;
-                        let resume_type = resolve_type(context, r_ty)?;
-                        if anonymous_ops
-                            .insert(op_name.clone(), (perform_type, resume_type))
-                            .is_some()
-                        {
-                            return Err(Error::DuplicateOpName(op_name.clone()));
-                        }
-                    }
-                    ParsedOp::NamedEffect {
-                        name,
-                        effect,
-                        op_name,
-                    } => {
-                        if let Some(NamedItem::Effect(decl)) = context.names.get(effect) {
-                            let name = name.clone().unwrap_or_else(|| decl.name.clone());
-                            match named_effects.entry(name) {
-                                Entry::Vacant(entry) => {
-                                    let ops: HashSet<String> = if let Some(op_name) = op_name {
-                                        [op_name.clone()].into_iter().collect()
-                                    } else {
-                                        // If no op_name is specified, add all of them.
-                                        decl.ops.keys().cloned().collect()
-                                    };
-                                    assert!(decl.params.is_empty());
-                                    let instance = EffectInstance {
-                                        params: BTreeMap::new(),
-                                        decl: decl.clone(),
-                                    };
-                                    entry.insert((instance, ops));
-                                }
-                                Entry::Occupied(mut entry) => {
-                                    let (_decl, ops) = entry.get_mut();
-                                    if let Some(op_name) = op_name {
-                                        if ops.insert(op_name.clone()) {
-                                            return Err(Error::DuplicateOpName(op_name.clone()));
-                                        }
-                                    } else {
-                                        return Err(Error::DuplicateNamedEffect(effect.clone()));
-                                    }
-                                }
-                            }
-                        } else {
-                            return Err(Error::ExpectedNamedEffect(effect.clone()));
-                        }
-                    }
-                }
-            }
-            let opset = OpSet::new(OpSetI {
-                anonymous_ops,
-                named_effects,
-                super_sets: Vec::new(),
-                done_extending: true,
-            });
+            let opset = resolve_ops(context, ops)?;
             Ok(Type::co(ret, opset))
         }
         ParsedType::Named(name, parsed_params) => {
@@ -690,6 +651,75 @@ fn resolve_type(context: &TypeContext, ty: &ParsedType) -> Result<Type, Error> {
             }
         }
     }
+}
+
+fn resolve_ops(context: &TypeContext, ops: &[ParsedOp]) -> Result<OpSet, Error> {
+    let mut anonymous_ops = HashMap::new();
+    let mut named_effects = HashMap::new();
+
+    for op in ops {
+        match op {
+            ParsedOp::Anonymous(op_name, p_ty, r_ty) => {
+                let perform_type = resolve_type(context, p_ty)?;
+                let resume_type = resolve_type(context, r_ty)?;
+                if anonymous_ops
+                    .insert(op_name.clone(), (perform_type, resume_type))
+                    .is_some()
+                {
+                    return Err(Error::DuplicateOpName(op_name.clone()));
+                }
+            }
+            ParsedOp::NamedEffect {
+                name,
+                effect,
+                params,
+                op_name,
+            } => {
+                if let Some(NamedItem::Effect(decl)) = context.names.get(effect) {
+                    let name = name.clone().unwrap_or_else(|| decl.name.clone());
+                    match named_effects.entry(name) {
+                        Entry::Vacant(entry) => {
+                            let ops: HashSet<String> = if let Some(op_name) = op_name {
+                                [op_name.clone()].into_iter().collect()
+                            } else {
+                                // If no op_name is specified, add all of them.
+                                decl.ops.keys().cloned().collect()
+                            };
+                            // FIXME: decl.params is sorted in alphabetical order, but this "zip"
+                            // assumes it to be in declaration order.
+                            let mut resolved_params = BTreeMap::new();
+                            for (name, param) in decl.params.iter().zip(params.iter()) {
+                                resolved_params.insert(name.clone(), resolve_type(context, param)?);
+                            }
+                            let instance = EffectInstance {
+                                params: resolved_params,
+                                decl: decl.clone(),
+                            };
+                            entry.insert((instance, ops));
+                        }
+                        Entry::Occupied(mut entry) => {
+                            let (_decl, ops) = entry.get_mut();
+                            if let Some(op_name) = op_name {
+                                if ops.insert(op_name.clone()) {
+                                    return Err(Error::DuplicateOpName(op_name.clone()));
+                                }
+                            } else {
+                                return Err(Error::DuplicateNamedEffect(effect.clone()));
+                            }
+                        }
+                    }
+                } else {
+                    return Err(Error::ExpectedNamedEffect(effect.clone()));
+                }
+            }
+        }
+    }
+    Ok(OpSet::new(OpSetI {
+        anonymous_ops,
+        named_effects,
+        super_sets: Vec::new(),
+        done_extending: true,
+    }))
 }
 
 // *************************************************************************************************
@@ -1008,18 +1038,10 @@ pub struct CoDecl {
     pub forall: Vec<String>,
     pub name: String,
     pub args: Vec<Binding>,
-    pub return_type: Type,
-    pub ops: OpSetI,
+    pub return_type: ParsedType,
+    pub ops: Vec<ParsedOp>,
     // If no body is provided, its assumed to be external.
     pub body: Option<Expression>,
-}
-
-impl CoDecl {
-    fn as_type(&self) -> Type {
-        let arg_types = self.args.iter().map(|b| b.ty.clone()).collect();
-        let co_type = Type::co(self.return_type.clone(), self.ops.clone());
-        Type::forall(self.forall.clone(), Type::func(arg_types, co_type))
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1768,7 +1790,8 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 for binding in co_decl.args.iter() {
                     arg_types.push(binding.ty.clone());
                 }
-                shadow.insert_variable(co_decl.name.clone(), co_decl.as_type(), false);
+                let co_fn_ty = resolve_co_fn_type(shadow.context().shadow(), co_decl)?;
+                shadow.insert_variable(co_decl.name.clone(), co_fn_ty, false);
             }
             Declaration::Struct(struct_declaration) => {
                 let struct_declaration =
@@ -1825,27 +1848,34 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                 check_expression_concrete(body)?;
             }
             Declaration::Co(CoDecl {
-                forall: _,
+                forall,
                 name: _,
                 args,
                 return_type,
-                ops,
+                ops: parsed_ops,
                 body,
             }) => {
                 if body.is_none() {
                     continue; // External fn, take it for granted.
                 }
-                let body = body.as_mut().unwrap();
+                // Local shadow.
+                let mut shadow = shadow.context().shadow();
+                for param in forall {
+                    shadow.insert_type_param(param);
+                }
+                let return_type = resolve_type(shadow.context(), return_type)?;
+                let ops = resolve_ops(shadow.context(), parsed_ops)?;
 
+                let body = body.as_mut().unwrap();
                 // Declare a new shadow to insert fn variables.
                 let mut shadow = shadow
                     .context()
-                    .enter_activation_frame(return_type.clone(), ops.clone().into());
+                    .enter_activation_frame(return_type.clone(), ops);
                 for binding in args.iter() {
                     shadow.insert_binding(binding.clone());
                 }
                 infer(shadow.context(), body)?;
-                unify(return_type, &body.get_type())?;
+                unify(&return_type, &body.get_type())?;
                 shadow.finish();
                 check_expression_concrete(body)?;
             }
@@ -2841,16 +2871,12 @@ mod tests {
     }
     #[test]
     fn perform_anonymous_effect() {
-        let mut ops = OpSetI::empty();
-        ops.unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap();
-        ops.mark_done_extending();
         let program = &mut Program(vec![Declaration::Co(CoDecl {
             forall: vec![],
             name: "main".to_string(),
             args: vec![],
-            return_type: Type::bool_(),
-            ops,
+            return_type: ParsedType::Bool,
+            ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
             body: Some(block_expr(vec![
                 let_stmt("p", perform_anon("foo", 1)),
                 "p".into(),
@@ -2860,34 +2886,6 @@ mod tests {
     }
     #[test]
     fn perform_named_effects() {
-        let state_effect = EffectDecl {
-            name: "State".to_string(),
-            params: vec!["T".to_string()],
-            ops: HashMap::from_iter([
-                ("get".into(), (Type::unit(), Type::param("T"))),
-                ("set".into(), (Type::param("T"), Type::unit())),
-            ]),
-        };
-        let int_state_instance = EffectInstance {
-            decl: Rc::new(state_effect.clone()),
-            params: BTreeMap::from_iter([("T".to_string(), Type::int())]),
-        };
-        let bool_state_instance = EffectInstance {
-            decl: Rc::new(state_effect.clone()),
-            params: BTreeMap::from_iter([("T".to_string(), Type::bool_())]),
-        };
-
-        let mut ops = OpSetI::empty();
-        ops.unify_add_declared_op(Some("int_state"), &int_state_instance, "get")
-            .unwrap();
-        ops.unify_add_declared_op(Some("int_state"), &int_state_instance, "set")
-            .unwrap();
-        ops.unify_add_declared_op(Some("bool_state"), &bool_state_instance, "get")
-            .unwrap();
-        ops.unify_add_declared_op(Some("bool_state"), &bool_state_instance, "set")
-            .unwrap();
-        ops.mark_done_extending();
-
         let program = &mut Program(vec![
             Declaration::Effect(ParsedEffectDecl {
                 name: "State".to_string(),
@@ -2901,8 +2899,21 @@ mod tests {
                 forall: vec![],
                 name: "main".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
-                ops,
+                return_type: ParsedType::Bool,
+                ops: vec![
+                    ParsedOp::NamedEffect {
+                        name: Some("int_state".to_string()),
+                        effect: "State".to_string(),
+                        params: vec![ParsedType::Int],
+                        op_name: None,
+                    },
+                    ParsedOp::NamedEffect {
+                        name: Some("bool_state".to_string()),
+                        effect: "State".to_string(),
+                        params: vec![ParsedType::Bool],
+                        op_name: None,
+                    },
+                ],
                 body: Some(block_expr(vec![
                     full_let_stmt("x", Type::int(), false, perform("int_state", "get", ())),
                     perform("int_state", "set", "x").into(),
@@ -3001,27 +3012,13 @@ mod tests {
     }
     #[test]
     fn test_propagate_subset_of_effects() {
-        let mut foo_ops = OpSetI::empty();
-        foo_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .mark_done_extending();
-
-        let mut foo_bar_ops = OpSetI::empty();
-        foo_bar_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
-            .unwrap()
-            .mark_done_extending();
-
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
                 forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
-                ops: foo_ops.clone(),
+                return_type: ParsedType::Bool,
+                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
@@ -3031,8 +3028,11 @@ mod tests {
                 forall: vec![],
                 name: "propagates_foo".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
-                ops: foo_bar_ops,
+                return_type: ParsedType::Bool,
+                ops: vec![
+                    ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool),
+                    ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float),
+                ],
                 body: Some(block_expr(vec![propagate(call_expr(
                     "performs_foo",
                     vec![],
@@ -3044,17 +3044,13 @@ mod tests {
     }
     #[test]
     fn test_propagate_subset_of_effects_fails_in_fn() {
-        let mut ops = OpSetI::empty();
-        ops.unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap();
-        ops.mark_done_extending();
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
                 forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
-                ops: ops.clone(),
+                return_type: ParsedType::Bool,
+                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
@@ -3080,17 +3076,13 @@ mod tests {
     }
     #[test]
     fn test_lambda_coroutine() {
-        let mut ops = OpSetI::empty();
-        ops.unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap();
-        ops.mark_done_extending();
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
                 forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
-                ops: ops.clone(),
+                return_type: ParsedType::Bool,
+                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
@@ -3127,33 +3119,13 @@ mod tests {
 
     #[test]
     fn test_propagate_two_sets_of_effects() {
-        let mut foo_ops = OpSetI::empty();
-        foo_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .mark_done_extending();
-
-        let mut bar_ops = OpSetI::empty();
-        bar_ops
-            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
-            .unwrap()
-            .mark_done_extending();
-
-        let mut foo_bar_ops = OpSetI::empty();
-        foo_bar_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
-            .unwrap()
-            .mark_done_extending();
-
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
                 forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
-                ops: foo_ops.clone(),
+                return_type: ParsedType::Bool,
+                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
@@ -3163,8 +3135,8 @@ mod tests {
                 forall: vec![],
                 name: "performs_bar".to_string(),
                 args: vec![],
-                return_type: Type::float(),
-                ops: bar_ops.clone(),
+                return_type: ParsedType::Float,
+                ops: vec![ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("bar", ())),
                     "p".into(),
@@ -3194,33 +3166,13 @@ mod tests {
     fn delayed_opset_inference_okay() {
         // test the case of |c1, c2| co { c1?; c2?; } which requires proper propagation of
         // unknown opsets. Success case.
-        let mut foo_ops = OpSetI::empty();
-        foo_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .mark_done_extending();
-
-        let mut bar_ops = OpSetI::empty();
-        bar_ops
-            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
-            .unwrap()
-            .mark_done_extending();
-
-        let mut foo_bar_ops = OpSetI::empty();
-        foo_bar_ops
-            .unify_add_anonymous_effect("foo", &Type::int(), &Type::bool_())
-            .unwrap()
-            .unify_add_anonymous_effect("bar", &Type::unit(), &Type::float())
-            .unwrap()
-            .mark_done_extending();
-
         let program = &mut Program(vec![
             Declaration::Co(CoDecl {
                 forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
-                ops: foo_ops.clone(),
+                return_type: ParsedType::Bool,
+                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
@@ -3230,8 +3182,8 @@ mod tests {
                 forall: vec![],
                 name: "performs_bar".to_string(),
                 args: vec![],
-                return_type: Type::float(),
-                ops: bar_ops.clone(),
+                return_type: ParsedType::Float,
+                ops: vec![ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("bar", ())),
                     "p".into(),
@@ -3301,8 +3253,8 @@ mod tests {
                 forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
-                ops: foo_ops.clone(),
+                return_type: ParsedType::Bool,
+                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
@@ -3312,8 +3264,8 @@ mod tests {
                 forall: vec![],
                 name: "performs_bar".to_string(),
                 args: vec![],
-                return_type: Type::float(),
-                ops: bar_ops.clone(),
+                return_type: ParsedType::Float,
+                ops: vec![ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("bar", ())),
                     "p".into(),
@@ -3382,8 +3334,8 @@ mod tests {
                 forall: vec![],
                 name: "performs_foo".to_string(),
                 args: vec![],
-                return_type: Type::bool_(),
-                ops: foo_ops.clone(),
+                return_type: ParsedType::Bool,
+                ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("foo", 1)),
                     "p".into(),
@@ -3393,8 +3345,8 @@ mod tests {
                 forall: vec![],
                 name: "performs_bar".to_string(),
                 args: vec![],
-                return_type: Type::float(),
-                ops: bar_ops.clone(),
+                return_type: ParsedType::Float,
+                ops: vec![ParsedOp::anon("bar", ParsedType::Unit, ParsedType::Float)],
                 body: Some(block_expr(vec![
                     let_stmt("p", perform_anon("bar", ())),
                     "p".into(),
