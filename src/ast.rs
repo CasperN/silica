@@ -2715,172 +2715,77 @@ mod tests {
 
     #[test]
     fn delayed_field_access_incorrect_field_names() {
-        let program = &mut Program(vec![
-            Declaration::Struct(StructDecl::parameterized(
-                "Pair",
-                &["T", "U"],
-                &[
-                    ("left", ParsedType::named("T")),
-                    ("right", ParsedType::named("U")),
-                ],
-            )),
-            Declaration::Fn(FnDecl {
-                forall: vec!["T".to_string()],
-                name: "default".to_string(),
-                args: vec![],
-                return_type: ParsedType::named("T"),
-                body: None,
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Int,
-                body: Some(block_expr(vec![
-                    // Initialize `p` with some polymorphic default fn.
-                    let_mut_stmt("p", call_expr("default", vec![])),
-                    // Use and constrain "p" before its type is known.
-                    let_stmt("r", if_expr(field("p", "left"), field("p", "whoopsie"), 42)),
-                    // Assign to "p" to give it a type.
-                    assign_stmt(
-                        "p",
-                        Expression::LiteralStruct {
-                            name: "Pair".to_string(),
-                            fields: HashMap::from_iter([
-                                ("left".into(), true.into()),
-                                ("right".into(), 123.into()),
-                            ]),
-                            ty: Type::unknown(),
-                        },
-                    ),
-                    "r".into(),
-                ])),
-            }),
-        ]);
+        let result = typecheck_program(&mut parse_program_or_die(
+            r"
+            struct Pair<T, U> {
+                left: T,
+                right: U,
+            }
+            fn default<T>() -> T;
+            fn main() -> i64 {
+                // Initialize `p` with some unknown polymorphic type.
+                let mut p = default();
+                // Use `p`
+                let r = if p.left { p.whoopsie } else { p.right };
+                // Only later constrain `p` and find out that it has no `whoopsie` field.
+                p = Pair { left: true, right: 123 };
+                r
+            }
+            ",
+        ));
         assert_eq!(
-            typecheck_program(program),
+            result,
             Err(Error::UnrecognizedField("whoopsie".to_string()))
         );
     }
     #[test]
     fn curried_pair_polymorphic_fn_test() {
-        let pair_type =
-            |left_type, right_type| ParsedType::parameterized("Pair", &[left_type, right_type]);
-        let program = &mut Program(vec![
-            Declaration::Struct(StructDecl::parameterized(
-                "Pair",
-                &["T", "U"],
-                &[
-                    ("left", ParsedType::named("T")),
-                    ("right", ParsedType::named("U")),
-                ],
-            )),
-            Declaration::Fn(FnDecl {
-                forall: vec!["T".to_string(), "U".to_string()],
-                name: "make_pair".to_string(),
-                args: vec![Binding::new_typed(
-                    "a",
-                    ParsedType::Named("T".to_string(), vec![]),
-                )],
-                return_type: ParsedType::func(
-                    [ParsedType::named("U")],
-                    pair_type(ParsedType::named("T"), ParsedType::named("U")),
-                ),
-                body: Some(block_expr(vec![lambda_expr(
-                    vec![Binding::new("b")],
-                    Expression::LiteralStruct {
-                        name: "Pair".to_string(),
-                        fields: HashMap::from_iter([
-                            ("left".into(), "a".into()),
-                            ("right".into(), "b".into()),
-                        ]),
-                        ty: Type::unknown(),
-                    },
-                )
-                .into()])),
-            }),
-            Declaration::Fn(FnDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: pair_type(
-                    pair_type(ParsedType::Bool, ParsedType::Int),
-                    pair_type(ParsedType::Int, ParsedType::Float),
-                ),
-                body: Some(block_expr(vec![
-                    let_stmt(
-                        "bool_int",
-                        call_expr(call_expr("make_pair", vec![true.into()]), vec![123.into()]),
-                    ),
-                    let_stmt(
-                        "int_float",
-                        call_expr(call_expr("make_pair", vec![123.into()]), vec![12.3.into()]),
-                    ),
-                    call_expr(
-                        call_expr("make_pair", vec!["bool_int".into()]),
-                        vec!["int_float".into()],
-                    )
-                    .into(),
-                ])),
-            }),
-        ]);
-        assert_eq!(typecheck_program(program), Ok(()));
+        let result = typecheck_program(&mut parse_program_or_die(
+            r"
+            struct Pair<T, U> {
+                left: T,
+                right: U,
+            }
+            fn make_pair<T, U>(a: T) -> fn(U) -> Pair<T, U> {
+                |b| Pair { left: a, right: b }
+            }
+            fn main() -> Pair<Pair<bool, i64>, Pair<i64, f64>> {
+                let bool_int = make_pair(true)(123);
+                let int_float = make_pair(123)(12.3);
+                make_pair(bool_int)(int_float)
+            }
+            ",
+        ));
+        assert_eq!(result, Ok(()));
     }
     #[test]
     fn perform_anonymous_effect() {
-        let program = &mut Program(vec![Declaration::Co(CoDecl {
-            forall: vec![],
-            name: "main".to_string(),
-            args: vec![],
-            return_type: ParsedType::Bool,
-            ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Bool)],
-            body: Some(block_expr(vec![
-                let_stmt("p", perform_anon("foo", 1)),
-                "p".into(),
-            ])),
-        })]);
-        assert_eq!(typecheck_program(program), Ok(()));
+        let result = typecheck_program(&mut parse_program_or_die(
+            r"
+            co main() -> bool ! foo(i64 -> bool) {
+                perform foo(1)
+            }
+            ",
+        ));
+        assert_eq!(result, Ok(()));
     }
     #[test]
     fn perform_named_effects() {
-        let program = &mut Program(vec![
-            Declaration::Effect(EffectDecl {
-                name: "State".to_string(),
-                params: vec!["T".to_string()],
-                ops: vec![
-                    ParsedOp::anon("get", ParsedType::Unit, ParsedType::named("T")),
-                    ParsedOp::anon("set", ParsedType::named("T"), ParsedType::Unit),
-                ],
-            }),
-            Declaration::Co(CoDecl {
-                forall: vec![],
-                name: "main".to_string(),
-                args: vec![],
-                return_type: ParsedType::Bool,
-                ops: vec![
-                    ParsedOp::NamedEffect {
-                        name: Some("int_state".to_string()),
-                        effect: "State".to_string(),
-                        params: vec![ParsedType::Int],
-                        op_name: None,
-                    },
-                    ParsedOp::NamedEffect {
-                        name: Some("bool_state".to_string()),
-                        effect: "State".to_string(),
-                        params: vec![ParsedType::Bool],
-                        op_name: None,
-                    },
-                ],
-                body: Some(block_expr(vec![
-                    full_let_stmt("x", Type::int(), false, perform("int_state", "get", ())),
-                    perform("int_state", "set", "x").into(),
-                    full_let_stmt("y", Type::bool_(), false, perform("bool_state", "get", ())),
-                    perform("bool_state", "set", "y").into(),
-                    "y".into(),
-                ])),
-            }),
-        ]);
-        assert_eq!(typecheck_program(program), Ok(()));
+        let result = typecheck_program(&mut parse_program_or_die(
+            r"
+            effect State<T> {
+                get: unit -> T,
+                set: T -> unit,
+            }
+            co main() ! int_state: State<i64>, bool_state: State<f64> {
+                let x = perform int_state.get(());
+                perform int_state.set(42);
+                let y = perform bool_state.get(());
+                perform bool_state.set(y);
+            }
+            ",
+        ));
+        assert_eq!(result, Ok(()));
     }
     #[test]
     fn two_state_effects_ok_because_one_is_named() {

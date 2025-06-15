@@ -411,8 +411,6 @@ fn parse_effect_decl<'s>(
                     ops.push(ParsedOp::anon(op_name, perform_type, resume_type));
                 }
             }
-        } else {
-            dbg!(child_node.kind(), child_node.node);
         }
     }
     name.map(|name| {
@@ -545,6 +543,29 @@ fn parse_effects<'s>(
                     parsed_ops.push(ParsedOp::anon(&o, p, r));
                 }
             }
+            "declared_effect" => {
+                let name = e
+                    .optional_child("effect_name", errors)
+                    .map(|n| n.text().to_string());
+                let effect = e
+                    .required_child("effect_type", errors)
+                    .map(|n| n.text().to_string());
+                let params = e
+                    .optional_child("type_params", errors)
+                    .map(|node| parse_type_list(node, errors))
+                    .unwrap_or_default();
+                let op_name = e
+                    .optional_child("op_name", errors)
+                    .map(|n| n.text().to_string());
+                if let Some(effect) = effect {
+                    parsed_ops.push(ParsedOp::NamedEffect {
+                        name,
+                        effect,
+                        params,
+                        op_name,
+                    });
+                }
+            }
             found => {
                 errors.push(ParseError::UnexpectedNodeType {
                     expected: "effect",
@@ -555,6 +576,19 @@ fn parse_effects<'s>(
         }
     }
     Some(parsed_ops)
+}
+
+fn parse_type_list<'s>(
+    node: SourceNode<'s, '_>,
+    errors: &mut Vec<ParseError<'s>>,
+) -> Vec<ParsedType> {
+    let mut types = Vec::new();
+    for n in node.children_by_field_name("types", errors) {
+        if let Some(ty) = parse_type(n, errors) {
+            types.push(ty);
+        }
+    }
+    types
 }
 
 fn parse_struct_decl<'s>(
@@ -681,7 +715,16 @@ fn parse_type<'s>(
                 .unwrap_or_default();
             Some(ParsedType::Co(Box::new(return_type), ops))
         }
-        "named_type" => Some(ParsedType::Named(node.text().to_string(), vec![])),
+        "named_type" => {
+            let name = node
+                .required_child("name", errors)
+                .map(|n| n.text().to_string());
+            let params = node
+                .optional_child("type_params", errors)
+                .map(|node| parse_type_list(node, errors))
+                .unwrap_or_default();
+            name.map(|name| ParsedType::Named(name, params))
+        }
         _ => {
             errors.push(ParseError::UnexpectedNodeType {
                 expected: "type",

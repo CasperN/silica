@@ -120,7 +120,10 @@ module.exports = grammar({
       ">"
     ),
 
-    named_type: $ => $.identifier, // Simple identifier for now
+    named_type: $ => seq(
+      field("name", $.identifier),
+      optional(field("type_params", $.type_list)),
+    ),
 
     // --- Statements ---
     _statement: $ => choice(
@@ -319,9 +322,11 @@ module.exports = grammar({
 
     // TODO: Constraining params, e.g. T: MyTrait.
     generic_parameter_list: $ => delimited("<", field("parameter_name", $.identifier), ",", ">"),
+    type_list: $ => delimited("<", field("types", $._type), ",", ">"),
 
     _effect_type: $ => choice(
       $.anonymous_op_type,
+      $.declared_effect,
     ),
     anonymous_op_type: $ => seq(
       field("name", $.identifier),
@@ -330,6 +335,14 @@ module.exports = grammar({
       "->",
       field("resume_type", $._type),
       ")"
+    ),
+    declared_effect: $ => seq(
+      // If a name isn't specified, we default to the effect_type decl name.
+      optional(seq(field("effect_name", $.identifier), ":")),
+      field("effect_type", $.identifier),
+      optional(field("type_params", $.type_list)),
+      // If op_name isn't specified, we assume all ops under the effect_type are included.
+      optional(seq(".", field("op_name", $.identifier))),
     ),
 
     effects: $ => seq(
