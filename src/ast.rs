@@ -3043,6 +3043,19 @@ mod tests {
             Err(Error::InvalidLValue(10.into()))
         );
     }
+    #[test]
+    fn assign_to_field_of_field() {
+        let source = r#"
+        struct Pair<L, R> { left: L, right: R }
+        fn main() -> i64 {
+            let mut p = Pair { left: Pair { left: 3, right: 2.0 }, right: 3.0 };
+            p.left.left = 4;
+            p.left.right = 3.2;
+            p.left.left
+        }
+        "#;
+        assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
+    }
 
     // TODO: Test that structs must have concrete types.
     // TODO: Recursive types? Mutually recursive types? Forward declarations?
