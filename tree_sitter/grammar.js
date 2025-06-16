@@ -128,10 +128,9 @@ module.exports = grammar({
     // --- Statements ---
     _statement: $ => choice(
       $.let_statement,
-      $.assignment_statement,
+      $.assignment_or_expression_statement,
       $.return_statement,
       $.resume_statement,
-      $.expression_statement
       // Add perform, handle statements later
     ),
 
@@ -143,10 +142,12 @@ module.exports = grammar({
       ';'
     ),
 
-    assignment_statement: $ => seq(
-      field('left', $._l_value),
-      '=',
-      field('right', $._expression),
+    assignment_or_expression_statement: $ => seq(
+      field('left', $._expression),
+      optional(seq(
+        '=',
+        field('right', $._expression),
+      )),
       ';'
     ),
 
@@ -158,11 +159,6 @@ module.exports = grammar({
     resume_statement: $ => seq(
       'resume',
       field('value', $._expression),
-      ';'
-    ),
-
-    expression_statement: $ => seq(
-      $._expression,
       ';'
     ),
 

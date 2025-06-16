@@ -743,10 +743,21 @@ fn parse_statement<'s>(
 ) -> Option<Statement> {
     match node.kind() {
         "let_statement" => parse_let_statement(node, errors),
-        "assignment_statement" => parse_assignment_statement(node, errors),
         "return_statement" => parse_return_statement(node, errors),
         "resume_statement" => parse_resume_statement(node, errors),
-        "expression_statement" => parse_expression_statement(node, errors),
+        "assignment_or_expression_statement" => {
+            let left = node
+                .required_child("left", errors)
+                .and_then(|node| parse_expr(node, errors));
+            let right = node
+                .optional_child("right", errors)
+                .and_then(|node| parse_expr(node, errors));
+            match (left, right) {
+                (None, _) => None,
+                (Some(left), None) => Some(Statement::Expression(left)),
+                (Some(left), Some(right)) => Some(Statement::Assign(left, right)),
+            }
+        }
         found => {
             errors.push(ParseError::UnexpectedNodeType {
                 expected: "statement",
@@ -1080,20 +1091,6 @@ fn parse_l_value<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>)
     }
 }
 
-fn parse_assignment_statement<'s>(
-    node: SourceNode<'s, '_>,
-    errors: &mut Vec<ParseError<'s>>,
-) -> Option<Statement> {
-    let left = node
-        .required_child("left", errors)
-        .and_then(|n| parse_l_value(n, errors));
-    let right = node
-        .required_child("right", errors)
-        .and_then(|n| parse_expr(n, errors));
-
-    Some(Statement::Assign(left?, right?))
-}
-
 fn parse_return_statement<'s>(
     node: SourceNode<'s, '_>,
     errors: &mut Vec<ParseError<'s>>,
@@ -1110,15 +1107,6 @@ fn parse_resume_statement<'s>(
     node.required_child("value", errors)
         .and_then(|n| parse_expr(n, errors))
         .map(Statement::Resume)
-}
-
-fn parse_expression_statement<'s>(
-    node: SourceNode<'s, '_>,
-    errors: &mut Vec<ParseError<'s>>,
-) -> Option<Statement> {
-    node.required_child_by_id(0, errors)
-        .and_then(|n| parse_expr(n, errors))
-        .map(Statement::Expression)
 }
 
 fn parse_if_expr<'s>(

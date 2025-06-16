@@ -963,7 +963,7 @@ impl Expression {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Statement {
-    Assign(LValue, Expression),
+    Assign(Expression, Expression),
     Let { binding: Binding, value: Expression },
     Expression(Expression),
     Return(Expression),
@@ -1315,13 +1315,41 @@ enum Error {
     ExpectedNamedType(String, Option<NamedItem>),
     ExpectedNamedEffect(String),
     DuplicateNamedEffect(String),
+    InvalidLValue(Expression),
 }
 
 // *************************************************************************************************
 //  Inference
 // *************************************************************************************************
-
+// TODO: Move resolution over here.
 // TODO: Break up type checking and type inference, i.e. bidirectional type checking?
+
+/// Checks if an expression is a valid L-value (a "place").
+/// If it is, and if it's mutable, returns the type of the place.
+/// Otherwise, returns an appropriate error.
+fn check_lvalue(context: &TypeContext, expr: &Expression) -> Result<Type, Error> {
+    match expr {
+        Expression::L(LValue::Variable(name), ty) => {
+            let var_info = context
+                .variable_info(name)
+                .ok_or_else(|| Error::UnknownName(name.clone()))?;
+
+            if !var_info.mutable {
+                return Err(Error::AssignToImmutableBinding(name.clone()));
+            }
+            Ok(ty.clone())
+        }
+        Expression::L(LValue::Field(obj_expr, _field_name), ty) => {
+            check_lvalue(context, obj_expr)?;
+            Ok(ty.clone())
+        }
+        _ => {
+            // Any other kind of expression (a literal, a function call, an arithmetic operation, etc.)
+            // is an R-value and cannot be assigned to.
+            Err(Error::InvalidLValue(expr.clone()))
+        }
+    }
+}
 
 // Infers the type of the given expression in the given context.
 // Mutates the expression to set the type.
@@ -1561,24 +1589,12 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                         );
                         last_statement_type = Type::unit();
                     }
-                    Statement::Assign(LValue::Variable(name), expr) => {
-                        let context = shadow.context();
-                        infer(context, expr)?;
-
-                        // Check whether the expession can be assigned to the variable.
-                        let variable_info = context.variable_info(name);
-                        if variable_info.is_none() {
-                            return Err(Error::UnknownName(name.to_string()));
-                        }
-                        let variable_info = variable_info.unwrap();
-                        if !variable_info.mutable {
-                            return Err(Error::AssignToImmutableBinding(name.to_string()));
-                        }
-                        unify(&expr.get_type(), &variable_info.ty)?;
-                        last_statement_type = Type::unit();
-                    }
-                    Statement::Assign(LValue::Field(_, _), _) => {
-                        todo!()
+                    Statement::Assign(left, right) => {
+                        infer(shadow.context(), left)?;
+                        infer(shadow.context(), right)?;
+                        let lvalue_type = check_lvalue(shadow.context(), left)?;
+                        unify(&lvalue_type, &right.get_type())?;
+                        last_statement_type = Type::unit()
                     }
                     Statement::Return(expr) => {
                         infer(shadow.context(), expr)?;
@@ -1679,8 +1695,9 @@ fn check_expression_concrete(expression: &Expression) -> Result<(), Error> {
 }
 fn check_statement_concrete(statement: &Statement) -> Result<(), Error> {
     match statement {
-        Statement::Assign(_, expr) => {
-            check_expression_concrete(expr)?;
+        Statement::Assign(left, right) => {
+            check_expression_concrete(left)?;
+            check_expression_concrete(right)?;
         }
         Statement::Expression(expr) => {
             check_expression_concrete(expr)?;
@@ -1959,7 +1976,7 @@ pub mod test_helpers {
             return_type: Type::unknown(),
         }
     }
-    pub fn assign_stmt(left: impl Into<LValue>, right: impl Into<Expression>) -> Statement {
+    pub fn assign_stmt(left: impl Into<Expression>, right: impl Into<Expression>) -> Statement {
         Statement::Assign(left.into(), right.into())
     }
     pub fn if_expr(
@@ -2016,8 +2033,6 @@ pub mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-
-    use super::test_helpers::*;
     use super::*;
     use crate::parse::parse_program_or_die;
 
@@ -2125,7 +2140,7 @@ mod tests {
         );
         assert_eq!(
             typecheck_program(program),
-            Err(Error::NotUnifiable(Type::unit(), Type::int()))
+            Err(Error::NotUnifiable(Type::int(), Type::unit()))
         );
     }
     #[test]
@@ -2984,6 +2999,48 @@ mod tests {
             result,
             Err(Error::EffectDeclMustHaveConcreteTypes(_))
         ));
+    }
+    #[test]
+    fn field_assignment() {
+        let source = r#"
+        struct Point { x: i64, y: i64 }
+
+        fn main() -> i64 {
+            let mut p = Point { x: 1, y: 2 };
+            p.x = 10;
+            p.x
+        }
+        "#;
+        assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
+    }
+    #[test]
+    fn field_assignment_type_error() {
+        let source = r#"
+        struct Point { x: i64, y: i64 }
+
+        fn main() -> i64 {
+            let mut p = Point { x: 1, y: 2 };
+            p.x = 10.1;
+            0
+        }
+        "#;
+        assert_eq!(
+            typecheck_program(&mut parse_program_or_die(source)),
+            Err(Error::NotUnifiable(Type::int(), Type::float()))
+        );
+    }
+    #[test]
+    fn assign_to_invalid_lvalue() {
+        let source = r#"
+        fn main() -> i64 {
+            10 = 20;
+            1
+        }
+        "#;
+        assert_eq!(
+            typecheck_program(&mut parse_program_or_die(source)),
+            Err(Error::InvalidLValue(10.into()))
+        );
     }
 
     // TODO: Test that structs must have concrete types.
