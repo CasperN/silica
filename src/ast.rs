@@ -2970,16 +2970,17 @@ mod tests {
             fn main() -> bool {
                 let performs_foo = co perform foo(53.42);
                 let performs_bar = co perform bar(53);
-                let calls_something = co something(performs_foo?, performs_bar?);
+                let calls_something = co something(performs_bar?, performs_foo?);
                 calls_something handle {
-                    foo(x) => { resume(x) },  // x is a f64, something's first arg is i64.
-                    bar(x) => { resume(42.32) },
+                    return r => (),
+                    foo(x) => { resume(x) },
+                    bar(x) => { resume(42) },
                 }
             }
             ",
         );
         let result = typecheck_program(&mut program);
-        assert_eq!(result, Err(Error::NotUnifiable(Type::float(), Type::int())));
+        assert_eq!(result, Err(Error::NotUnifiable(Type::bool_(), Type::unit())));
     }
     #[test]
     fn unspecified_type_in_struct() {
