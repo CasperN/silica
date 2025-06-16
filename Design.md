@@ -517,10 +517,11 @@ Silica will adopt structured concurrency as its primary model for managing concu
 * **Onboarding Instructions:** Follow these instructions step by step to familiarize yourself with the Silica project.
   1. Review this design document.
      1. List the important features and consider the interactions between pairs of features.
-     2. List points where the design is light on details
-     3. For each of those points, think through a resolution based on the existing document.
-     4. Enumerate the source of potential complexity and think through potential resolution strategies. Note that Silica is still in development and while issues need to be surfaced, they need not be immediately solved.
-     5. Compare and contrast Silica against other languages, such as C++, Rust, Python, Koka, Ocaml, and Haskell.
+     2. Compare and contrast Silica against other languages, such as C++, Rust, Python, Koka, Ocaml, and Haskell.
+     3. List the points where the design is light on details
+     4. For each of those points, how would an experienced language designer flesh out the details? What are the potential options and how do they compare when considering Silica's values and goals.
+     5. Enumerate the source of potential complexity, then think through potential resolution strategies. Note that Silica is still in development and while issues need to be surfaced, they need not be immediately solved.
+     6. Enumerate the sources of potential ergonomic friction or missing features in Silica. What can it learn from other languages. For each potential feature consider whether it is compatible with Silica's design and values.
   2. Review the langauge's implementation files
      1. See `grammar.js` for the tree-sitter grammar. 
         1. Think through what features are missing. The grammar will only be expanded as and when the type system is capable of modeling the associated complexity.
@@ -530,15 +531,29 @@ Silica will adopt structured concurrency as its primary model for managing concu
         2. Compare the implementation state to the overall design.
            1. How should the type system be augmented to bring it closer to the design.
            2. For each potential direction, what is the smallest incremental steps be
-     4. Review the TODOs in the three files.
+     4. Review the tests
+        1. Are there tests that are redundant with each other?
+        2. Are there tests that are not testing what their name suggests?
+        3. Are there test programs that are too complex and unfocused for the test?
+        4. Are there errors or features that are untested?
+        5. Is there both a success and failure case for each tested feature?
+     5. Review the TODOs in the three files.
         1. For each TODO, describe what changes need to resolve the TODO.
         2. For each TODO, decide whether it is stale, blocked by other features, blocked by refactoring, or if its readily fixable.
-  3. Propose a roadmap to bring the implementation closer to the intended design
+     6. Review the major logical pieces and enumerate the places where the implementation diverges from best practices, or established theory, or just differ from mature compilers. 
+        1. Is this divergence justified by Silica's design or goals?
+        2. If not, what changes should be made to improve the Silica design or compiler implementation?
+  3. Having thought through the implementation detials, step back and review the design again.
+     1. Based on your above analysis of the design and review of the implementation state, consider how this design document should be updated.
+     2. Enumerate the ways where the implementation has diverged from the design.
+     3. For each divergence, propose whether the design or implementation should be updated, based on the values of the language.
+     4. Apply the design review checklist, step by step, and note what changes need to be made.
+  4. Propose a roadmap to bring the implementation closer to the intended design
      1. Based on the gaps and TODOs identified, enumerate the major work items that should be in a roadmap
      2. Identify dependencies and interactions between items in the roadmap, if two items are interdependent, they should be broken into smaller work items.
      3. Ensure work items form a directed acyclic graph (a DAG) and then identify which items are unblocked and may be worked on first.
      4. Of the unblocked work items, decide which should come first, consider ease of implementation and important to the long term goals. Prioritize progress and momentum.
-  4. Having followed these steps, reflect on these onboarding instructions and your thinking
+  5. Having followed these steps, reflect on these onboarding instructions and your thinking
      1. Check your previous thinking. Enumerate corrections.
      2. Critique these onboarding instructions. What steps should be expanded or added to better explore the language?
      3. List out your changes to the onboarding instructions
