@@ -514,20 +514,22 @@ Silica will adopt structured concurrency as its primary model for managing concu
   *  Remember `handle` *consumes* its argument via a trait mechanism (specific trait TBD)
   *  Avoid re-introducing rejected ideas unless explicitly asked to reconsider.
 
-* **Onboarding Instructions:** Follow these instructions step by step to familiarize yourself with the Silica project.
+* **Onboarding Instructions:** Follow these instructions to familiarize yourself with the Silica project. Proceed step by step and show your work: Quote every single instruction and respond to them individually.
   1. Review this design document.
      1. List the important features and consider the interactions between pairs of features.
      2. Compare and contrast Silica against other languages, such as C++, Rust, Python, Koka, Ocaml, and Haskell.
-     3. List the points where the design is light on details
-     4. For each of those points, how would an experienced language designer flesh out the details? What are the potential options and how do they compare when considering Silica's values and goals.
-     5. Enumerate the source of potential complexity, then think through potential resolution strategies. Note that Silica is still in development and while issues need to be surfaced, they need not be immediately solved.
-     6. Enumerate the sources of potential ergonomic friction or missing features in Silica. What can it learn from other languages. For each potential feature consider whether it is compatible with Silica's design and values.
+     3. Identify and rank Silica's core values, contributions, and priorities.
+     4. Enumerate the key features and challenges with the design.
+     5. For each pair of features, what interactions between them are _not_ mentioned in the design? Think through potential resolution strategies. Note that Silica is still in development and while issues need to be surfaced, they need not be immediately solved.
+     6. Enumerate the sources of potential friction or missing features in Silica. What can it learn from other languages?
   2. Review the langauge's implementation files
      1. See `grammar.js` for the tree-sitter grammar. 
         1. Think through what features are missing. The grammar will only be expanded as and when the type system is capable of modeling the associated complexity.
-     2. See `parse.rs` for Rust code that uses the generated tree-sitter parser and converts it to datastructures in Rust
+     2. See `parse.rs` for Rust code that uses the generated tree-sitter parser and converts it to datastructures in Rust.
+        1. Review what features are present.
+        2. Review what features are mentioned in the design but are absent. Note that the parser (like the grammar) will only be expanded when the rest of the type system is ready to handle the features.
      3. See `ast.rs` to see the type system, inference, and a long list of tests.
-        1. Describe the current implementation state of the type system. Compare it to the implemented features in the parser/grammar. Are there gaps?
+        1. Describe the current implementation state of the type system. Compare it to the implemented features in the parser/grammar.
         2. Compare the implementation state to the overall design.
            1. How should the type system be augmented to bring it closer to the design.
            2. For each potential direction, what is the smallest incremental steps be
@@ -543,16 +545,18 @@ Silica will adopt structured concurrency as its primary model for managing concu
      6. Review the major logical pieces and enumerate the places where the implementation diverges from best practices, or established theory, or just differ from mature compilers. 
         1. Is this divergence justified by Silica's design or goals?
         2. If not, what changes should be made to improve the Silica design or compiler implementation?
-  3. Having thought through the implementation detials, step back and review the design again.
+  3. Having thought through the implementation details, step back and review the design again.
      1. Based on your above analysis of the design and review of the implementation state, consider how this design document should be updated.
      2. Enumerate the ways where the implementation has diverged from the design.
      3. For each divergence, propose whether the design or implementation should be updated, based on the values of the language.
      4. Apply the design review checklist, step by step, and note what changes need to be made.
-  4. Propose a roadmap to bring the implementation closer to the intended design
-     1. Based on the gaps and TODOs identified, enumerate the major work items that should be in a roadmap
-     2. Identify dependencies and interactions between items in the roadmap, if two items are interdependent, they should be broken into smaller work items.
-     3. Ensure work items form a directed acyclic graph (a DAG) and then identify which items are unblocked and may be worked on first.
-     4. Of the unblocked work items, decide which should come first, consider ease of implementation and important to the long term goals. Prioritize progress and momentum.
+  4. Begin a roadmap to bring the implementation closer to the intended design
+     1. Enumerate the work items, both large and small, that should be in a roadmap
+     2. Identify dependencies and interactions between work items. If two items are interdependent, they should be broken into smaller work items.
+     3. Ensure work item dependencies form a directed acyclic graph (DAG) and then identify which items are unblocked and may be worked on first. If there are cycles, break up the work items into smaller pieces.
+     4. Of the unblocked work items, decide which should come first, consider ease of implementation and importance to the long term goals. Prioritize progress and momentum. Delay non-essential features.
+     5. For the items to be worked on first, break them up into small commit-sized work items, following TDD best practices. Each commit should introduce just 1-3 unit tests, (see ast.rs for examples) and the associated tested feature.
+     6. Organize the above into a roadmap and proposal for next steps
   5. Having followed these steps, reflect on these onboarding instructions and your thinking
      1. Check your previous thinking. Enumerate corrections.
      2. Critique these onboarding instructions. What steps should be expanded or added to better explore the language?
