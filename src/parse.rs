@@ -238,7 +238,7 @@ impl ParsedOp {
         Self::Anonymous(name.to_string(), p, r)
     }
     // Does not contain ParsedType::Unspecified.
-    fn is_specified(&self) -> bool {
+    pub fn is_specified(&self) -> bool {
         match self {
             Self::Anonymous(_name, p_ty, r_ty) => p_ty.is_specified() && r_ty.is_specified(),
             Self::NamedEffect { .. } => true,

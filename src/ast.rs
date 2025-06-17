@@ -1735,6 +1735,9 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                         return Err(Error::FnDeclMustHaveConcreteTypes(fn_decl.clone()));
                     }
                 }
+                if !resolve_type(local_shadow.context(), &fn_decl.return_type)?.is_concrete() {
+                    return Err(Error::FnDeclMustHaveConcreteTypes(fn_decl.clone()));
+                }
                 local_shadow.finish();
                 if shadow.context_contains(&fn_decl.name) {
                     return Err(Error::DuplicateTopLevelName(fn_decl.name.clone()));
@@ -1756,6 +1759,14 @@ fn typecheck_program(program: &mut Program) -> Result<(), Error> {
                     if !binding.ty.is_concrete() {
                         return Err(Error::CoDeclMustHaveConcreteTypes(co_decl.clone()));
                     }
+                }
+                for op in co_decl.ops.iter() {
+                    if !op.is_specified() {
+                        return Err(Error::CoDeclMustHaveConcreteTypes(co_decl.clone()));
+                    }
+                }
+                if !resolve_type(local_shadow.context(), &co_decl.return_type)?.is_concrete() {
+                    return Err(Error::CoDeclMustHaveConcreteTypes(co_decl.clone()));
                 }
                 local_shadow.finish();
                 if shadow.context_contains(&co_decl.name) {
@@ -2980,7 +2991,10 @@ mod tests {
             ",
         );
         let result = typecheck_program(&mut program);
-        assert_eq!(result, Err(Error::NotUnifiable(Type::bool_(), Type::unit())));
+        assert_eq!(
+            result,
+            Err(Error::NotUnifiable(Type::bool_(), Type::unit()))
+        );
     }
     #[test]
     fn unspecified_type_in_struct() {
@@ -3000,6 +3014,57 @@ mod tests {
             result,
             Err(Error::EffectDeclMustHaveConcreteTypes(_))
         ));
+    }
+    #[test]
+    fn unspecified_type_in_fn_arg() {
+        let result = typecheck_program(&mut parse_program_or_die(r" fn foo(x: _); "));
+        assert!(matches!(result, Err(Error::FnDeclMustHaveConcreteTypes(_))));
+    }
+    #[test]
+    fn unspecified_type_in_fn_return() {
+        let result = typecheck_program(&mut parse_program_or_die(r" fn foo(x: f64) -> _; "));
+        assert!(
+            matches!(result, Err(Error::FnDeclMustHaveConcreteTypes(_))),
+            "{:?}",
+            result
+        );
+    }
+    #[test]
+    fn unspecified_type_in_fn_return_parameter() {
+        let result = typecheck_program(&mut parse_program_or_die(
+            r" 
+            struct Foo<T> { foo: T }
+            fn foo(x: f64) -> Foo<_>;
+            ",
+        ));
+        assert!(
+            matches!(result, Err(Error::FnDeclMustHaveConcreteTypes(_))),
+            "{:?}",
+            result
+        );
+    }
+    #[test]
+    fn unspecified_type_in_co_arg() {
+        let result = typecheck_program(&mut parse_program_or_die(r" co foo(x: _); "));
+        assert!(matches!(result, Err(Error::CoDeclMustHaveConcreteTypes(_))));
+    }
+    #[test]
+    fn unspecified_type_in_co_anon_op() {
+        let result = typecheck_program(&mut parse_program_or_die(r" co foo() ! foo(unit -> _); "));
+        assert!(
+            matches!(result, Err(Error::CoDeclMustHaveConcreteTypes(_))),
+            "{:?}",
+            result
+        );
+    }
+    #[test]
+    fn unspecified_type_in_co_return() {
+        let result = typecheck_program(&mut parse_program_or_die(r" co foo(x: f64) -> _; "));
+        assert!(
+            matches!(result, Err(Error::CoDeclMustHaveConcreteTypes(_))),
+            "{:?}",
+            result
+        );
     }
     #[test]
     fn field_assignment() {
@@ -3057,9 +3122,7 @@ mod tests {
         assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
     }
 
-    // TODO: Test that structs must have concrete types.
     // TODO: Recursive types? Mutually recursive types? Forward declarations?
     // TODO: Need to represent Co<T ! E1, E2, E3> in parser.
-    // TODO: Disallow top level unspecified, lol
     // TODO: Top level comments in parse?
 }
