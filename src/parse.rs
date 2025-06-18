@@ -880,9 +880,9 @@ fn parse_handle_expression<'s>(
             }
             "op_arm" => {
                 // TODO: Use effect name once handled in AST.
-                // let effect_name = node
-                //     .optional_child("effect_name", errors)
-                //     .map(|node| node.text());
+                let effect_name = node
+                    .optional_child("effect_name", errors)
+                    .map(|node| node.text().to_string());
                 let op_name = arm
                     .required_child("op_name", errors)
                     .map(|node| node.text().to_string());
@@ -894,6 +894,7 @@ fn parse_handle_expression<'s>(
                     .and_then(|node| parse_expr(node, errors));
                 if let (Some(op_name), Some(binding), Some(expr)) = (op_name, binding, expr) {
                     op_arms.push(HandleOpArm {
+                        effect_name: effect_name,
                         op_name: op_name.to_string(),
                         performed_variable: binding,
                         body: expr,
@@ -964,8 +965,8 @@ fn parse_perform_expression<'s>(
         .unwrap_or(Expression::LiteralUnit);
 
     Some(Expression::Perform {
-        name: qualifier.map(|n| n.text().to_string()),
-        op: op_name.text().to_string(),
+        effect_name: qualifier.map(|n| n.text().to_string()),
+        op_name: op_name.text().to_string(),
         arg: Box::new(arg),
         resume_type: Type::unknown(),
     })
@@ -1727,6 +1728,7 @@ mod tests {
                 )),
                 op_arms: vec![
                     HandleOpArm {
+                        effect_name: None,
                         op_name: "foo".to_string(),
                         performed_variable: Binding {
                             name: "y".into(),
@@ -1737,6 +1739,7 @@ mod tests {
                         body: call_expr("baz", vec!["y".into()]),
                     },
                     HandleOpArm {
+                        effect_name: None,
                         op_name: "bar".to_string(),
                         performed_variable: Binding::new("z"),
                         body: block_expr(vec![resume_stmt(call_expr("z", vec![1.into()]))]),

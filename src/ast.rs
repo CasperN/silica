@@ -903,8 +903,8 @@ pub enum Expression {
     },
     Co(Box<Expression>, Type, OpSet),
     Perform {
-        name: Option<String>,
-        op: String,
+        effect_name: Option<String>,
+        op_name: String,
         arg: Box<Expression>,
         resume_type: Type,
     },
@@ -920,6 +920,7 @@ pub enum Expression {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HandleOpArm {
+    pub effect_name: Option<String>,
     pub op_name: String,
     // TODO: This only handles anonymous effects. What about named effects?
     pub performed_variable: Binding,
@@ -949,8 +950,8 @@ impl Expression {
                 ty,
             }
             | Self::Perform {
-                name: _,
-                op: _,
+                effect_name: _,
+                op_name: _,
                 arg: _,
                 resume_type: ty,
             }
@@ -1466,38 +1467,35 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             Ok(())
         }
         Expression::Perform {
-            name,
-            op,
+            effect_name,
+            op_name,
             arg,
             resume_type: expr_ty,
         } => {
             infer(context, arg)?;
 
             if let Some((perform_ty, resume_ty)) =
-                context.ops.clone_inner().get(name.as_deref(), op)
+                context.ops.clone_inner().get(effect_name.as_deref(), op_name)
             {
                 unify(&arg.get_type(), &perform_ty)?;
                 unify(expr_ty, &resume_ty)?;
                 Ok(())
             } else if !context.ops.is_extendable() {
                 Err(Error::PerformedEffectsNotallowedInContext {
-                    effect_or_instance: name.clone(),
-                    op_name: op.clone(),
+                    effect_or_instance: effect_name.clone(),
+                    op_name: op_name.clone(),
                 })
-            } else if name.is_none() {
+            } else if effect_name.is_none() {
                 // Perform an anonymous effect.
                 context
                     .ops
                     .mut_inner()
-                    .unify_add_anonymous_effect(op, &arg.get_type(), expr_ty)?;
+                    .unify_add_anonymous_effect(op_name, &arg.get_type(), expr_ty)?;
                 Ok(())
             } else {
-                // TODO: Perform named effect. Need to constrain the unknown effect.
-                // Similar to constraining unknown types with fields.
-                Err(Error::NoMatchingOpInContext {
-                    effect_or_instance: name.clone(),
-                    op_name: op.clone(),
-                })
+                todo!("No idea how to perform named effects apparently.");
+                // Need to structurally constrain an effect instance. Also is_concrete should
+                // ensure the structural named effect actually resolves to a real declaration.
             }
         }
         Expression::Propagate(expr, ty) => {
@@ -1548,9 +1546,13 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             for arm in op_arms.iter_mut() {
                 let mut shadow = context.shadow();
                 let p_var_ty = shadow.insert_binding(arm.performed_variable.clone());
-                let (p_ty, r_ty) = co_ops.inner().get_anonymous_op(&arm.op_name).unwrap();
-                unify(&p_ty, &p_var_ty)?;
-                shadow.set_resume_type(&r_ty);
+                if let Some(_) = arm.effect_name {
+                    todo!("Inference for declared effect ops.");
+                } else {
+                    let (p_ty, r_ty) = co_ops.inner().get_anonymous_op(&arm.op_name).unwrap();
+                    unify(&p_ty, &p_var_ty)?;
+                    shadow.set_resume_type(&r_ty);
+                }
                 infer(shadow.context(), &mut arm.body)?;
                 // TODO: If the arm ends in a resume, then it does not need to unify here.
                 unify(&arm.body.get_type(), handle_expr_ty)?;
@@ -2020,16 +2022,16 @@ pub mod test_helpers {
     }
     pub fn perform_anon(op: &str, arg: impl Into<Expression>) -> Expression {
         Expression::Perform {
-            name: None,
-            op: op.to_string(),
+            effect_name: None,
+            op_name: op.to_string(),
             arg: Box::new(arg.into()),
             resume_type: Type::unknown(),
         }
     }
     pub fn perform(name: &str, op: &str, arg: impl Into<Expression>) -> Expression {
         Expression::Perform {
-            name: Some(name.to_string()),
-            op: op.to_string(),
+            effect_name: Some(name.to_string()),
+            op_name: op.to_string(),
             arg: Box::new(arg.into()),
             resume_type: Type::unknown(),
         }
