@@ -254,6 +254,7 @@ pub struct OpSet(UnionFindRef<OpSetI>);
 #[derive(Debug, Clone, PartialEq)]
 enum DeclaredOps {
     Known(EffectInstance, HashSet<String>),
+    Unknown(HashMap<String, (Type, Type)>),
 }
 
 // A set of ops that are being performed.
@@ -330,6 +331,11 @@ impl OpSet {
                         self_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
                     }
                 }
+                DeclaredOps::Unknown(ops) => {
+                    for (op, (p, r)) in ops.iter() {
+                        self_inner.unify_add_unknown_declared_op(effect_name, op, p, r)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -361,7 +367,15 @@ impl OpSetI {
     // An Opset is concrete if all the types therein are concrete.
     // Note that we consider extendable OpSets to be concrete.
     fn is_concrete(&self) -> bool {
-        self.iter_types().all(|ty| ty.is_concrete())
+        if !self.iter_types().all(|ty| ty.is_concrete()) {
+            return false;
+        }
+        for e in self.named_effects.values() {
+            if let DeclaredOps::Unknown(_) = e {
+                return false;
+            }
+        }
+        true
     }
     fn get(&self, name_or_effect: Option<&str>, op_name: &str) -> Option<(Type, Type)> {
         if name_or_effect.is_none() {
@@ -377,6 +391,7 @@ impl OpSetI {
                     None
                 }
             }
+            Some(DeclaredOps::Unknown(ops)) => ops.get(op_name).cloned(),
             None => None,
         }
     }
@@ -390,6 +405,12 @@ impl OpSetI {
             match effect {
                 DeclaredOps::Known(instance, _) => {
                     types.extend(instance.params.values().cloned());
+                }
+                DeclaredOps::Unknown(ops) => {
+                    for (p, r) in ops.values() {
+                        types.push(p.clone());
+                        types.push(r.clone());
+                    }
                 }
             }
         }
@@ -406,22 +427,34 @@ impl OpSetI {
                 DeclaredOps::Known(instance, _) => {
                     types.extend(instance.params.values_mut());
                 }
+                DeclaredOps::Unknown(ops) => {
+                    for (p, r) in ops.values_mut() {
+                        types.push(p);
+                        types.push(r);
+                    }
+                }
             }
         }
         types.into_iter()
     }
     fn remove_anonymous_effect_or_die(&mut self, name: &str) {
-        self.anonymous_ops
-            .remove(name)
-            .unwrap_or_else(|| panic!("Expected {name} in {self:?}"));
+        if self.anonymous_ops.remove(name).is_none() {
+            panic!("Expected {name} in {self:?}");
+        }
     }
     fn remove_named_effect_or_die(&mut self, effect_name: &str, op_name: &str) {
-        if let Some(DeclaredOps::Known(_, ops)) = self.named_effects.get_mut(effect_name) {
-            if !ops.remove(op_name) {
-                panic!("Expected {effect_name}.{op_name} in {self:?}");
+        match self.named_effects.get_mut(effect_name) {
+            None => panic!("Expected {effect_name} effect in {self:?}"),
+            Some(DeclaredOps::Known(_, ops)) => {
+                if !ops.remove(op_name) {
+                    panic!("Expected {effect_name}.{op_name} in {self:?}");
+                }
             }
-        } else {
-            panic!("Expected {effect_name} effect in {self:?}");
+            Some(DeclaredOps::Unknown(ops)) => {
+                if ops.remove(op_name).is_none() {
+                    panic!("Expected {effect_name}.{op_name} in {self:?}");
+                }
+            }
         }
     }
 
@@ -463,6 +496,61 @@ impl OpSetI {
         }
         Ok(self)
     }
+
+    fn unify_add_unknown_declared_op(
+        &mut self,
+        effect_name: &str,
+        op_name: &str,
+        perform_type: &Type,
+        resume_type: &Type,
+    ) -> Result<&mut Self, Error> {
+        match self.named_effects.entry(effect_name.to_string()) {
+            Entry::Vacant(entry) => {
+                if self.done_extending {
+                    return Err(Error::OpSetNotExtendable(self.clone()));
+                }
+                let mut ops = HashMap::new();
+                ops.insert(
+                    op_name.to_string(),
+                    (perform_type.clone(), resume_type.clone()),
+                );
+                entry.insert(DeclaredOps::Unknown(ops));
+                Ok(self)
+            }
+            Entry::Occupied(mut entry) => match entry.get_mut() {
+                DeclaredOps::Unknown(ops) => match ops.entry(op_name.to_string()) {
+                    Entry::Vacant(entry) => {
+                        if self.done_extending {
+                            return Err(Error::OpSetNotExtendable(self.clone()));
+                        }
+                        entry.insert((perform_type.clone(), resume_type.clone()));
+                        Ok(self)
+                    }
+                    Entry::Occupied(entry) => {
+                        let (p, r) = entry.get();
+                        unify(perform_type, p)?;
+                        unify(resume_type, r)?;
+                        Ok(self)
+                    }
+                },
+                DeclaredOps::Known(instance, ops) => {
+                    if !instance.decl.ops.contains_key(op_name) {
+                        return Err(Error::NoMatchingOpInEffectDecl(
+                            op_name.to_string(),
+                            (*instance.decl).clone(),
+                        ));
+                    }
+                    if !ops.contains(op_name) && self.done_extending {
+                        return Err(Error::OpSetNotExtendable(self.clone()));
+                    }
+                    let (p, r) = instance.unwrap_op_type(op_name);
+                    unify(perform_type, &p)?;
+                    unify(resume_type, &r)?;
+                    Ok(self)
+                }
+            },
+        }
+    }
     fn unify_add_declared_op(
         &mut self,
         name: Option<&str>,
@@ -479,7 +567,9 @@ impl OpSetI {
         let name_str = name.unwrap_or(&instance.decl.name).to_string();
         match self.named_effects.entry(name_str) {
             Entry::Occupied(mut entry) => {
-                match entry.get_mut() {
+                let effect_entry = entry.get_mut();
+                let mut new_effect_entry = None;
+                match effect_entry {
                     DeclaredOps::Known(existing_instance, existing_ops) => {
                         if existing_instance.decl != instance.decl {
                             return Err(Error::EffectDeclMismatch(
@@ -497,6 +587,29 @@ impl OpSetI {
                         })?;
                         existing_ops.insert(op_name.to_string());
                     }
+                    DeclaredOps::Unknown(existing_ops) => {
+                        if !existing_ops.contains_key(op_name) && self.done_extending {
+                            return Err(Error::OpSetNotExtendable(self.clone()));
+                        }
+                        let mut new_ops = HashSet::new();
+                        new_ops.insert(op_name.to_string());
+                        for (op, (p, r)) in existing_ops.iter() {
+                            if !instance.decl.ops.contains_key(op) {
+                                return Err(Error::NoMatchingOpInEffectDecl(
+                                    op_name.to_string(),
+                                    (*instance.decl).clone(),
+                                ));
+                            }
+                            let (p2, r2) = instance.unwrap_op_type(op);
+                            unify(p, &p2)?;
+                            unify(r, &r2)?;
+                            new_ops.insert(op.to_string());
+                        }
+                        new_effect_entry = Some(DeclaredOps::Known(instance.clone(), new_ops));
+                    }
+                }
+                if let Some(e) = new_effect_entry {
+                    *effect_entry = e;
                 }
             }
             Entry::Vacant(entry) => {
@@ -519,6 +632,18 @@ impl OpSetI {
     }
     fn get_anonymous_op(&self, name: &str) -> Option<(Type, Type)> {
         self.anonymous_ops.get(name).cloned()
+    }
+    fn get_declared_op(&self, effect: &str, op: &str) -> Option<(Type, Type)> {
+        self.named_effects.get(effect).and_then(|e| match e {
+            DeclaredOps::Known(decl, ops) => {
+                if ops.contains(op) {
+                    Some(decl.unwrap_op_type(op))
+                } else {
+                    None
+                }
+            }
+            DeclaredOps::Unknown(ops) => ops.get(op).cloned(),
+        })
     }
     fn contains_opset(&self, other: &OpSet) -> bool {
         self.super_sets.iter().any(|s| s.contains_opset(other))
@@ -717,19 +842,20 @@ fn resolve_ops(context: &TypeContext, ops: &[ParsedOp]) -> Result<OpSet, Error> 
                             };
                             entry.insert(DeclaredOps::Known(instance, ops));
                         }
-                        Entry::Occupied(mut entry) => {
-                            match entry.get_mut() {
-                                DeclaredOps::Known(_decl, ops) => {
-                                    if let Some(op_name) = op_name {
-                                        if ops.insert(op_name.clone()) {
-                                            return Err(Error::DuplicateOpName(op_name.clone()));
-                                        }
-                                    } else {
-                                        return Err(Error::DuplicateNamedEffect(effect.clone()));
+                        Entry::Occupied(mut entry) => match entry.get_mut() {
+                            DeclaredOps::Known(_decl, ops) => {
+                                if let Some(op_name) = op_name {
+                                    if ops.insert(op_name.clone()) {
+                                        return Err(Error::DuplicateOpName(op_name.clone()));
                                     }
+                                } else {
+                                    return Err(Error::DuplicateNamedEffect(effect.clone()));
                                 }
                             }
-                        }
+                            DeclaredOps::Unknown(_) => {
+                                panic!("Resolving opset with unknown ops?! {op:?}")
+                            }
+                        },
                     }
                 } else {
                     return Err(Error::ExpectedNamedEffect(effect.clone()));
@@ -1524,9 +1650,14 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                 )?;
                 Ok(())
             } else {
-                todo!("No idea how to perform named effects apparently.");
-                // Need to structurally constrain an effect instance. Also is_concrete should
-                // ensure the structural named effect actually resolves to a real declaration.
+                // Structurally constrain a declared effect.
+                context.ops.mut_inner().unify_add_unknown_declared_op(
+                    effect_name.as_ref().unwrap(),
+                    op_name,
+                    &arg.get_type(),
+                    expr_ty,
+                )?;
+                Ok(())
             }
         }
         Expression::Propagate(expr, ty) => {
@@ -1548,17 +1679,25 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             let co_return_ty = Type::unknown();
             let mut co_ops = OpSet::empty_extensible();
             for arm in op_arms.iter() {
-                co_ops.mut_inner().unify_add_anonymous_effect(
-                    &arm.op_name,
-                    &Type::unknown(),
-                    &Type::unknown(),
-                )?;
+                if let Some(effect_name) = &arm.effect_name {
+                    co_ops.mut_inner().unify_add_unknown_declared_op(
+                        effect_name,
+                        &arm.op_name,
+                        &Type::unknown(),
+                        &Type::unknown(),
+                    )?;
+                } else {
+                    co_ops.mut_inner().unify_add_anonymous_effect(
+                        &arm.op_name,
+                        &Type::unknown(),
+                        &Type::unknown(),
+                    )?;
+                }
             }
             unify(
                 &co.get_type(),
                 &Type::co(co_return_ty.clone(), co_ops.clone()),
             )?;
-
             // Infer the return arm.
             if let Some((binding, expr)) = return_arm {
                 let mut shadow = context.shadow();
@@ -1577,13 +1716,16 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             for arm in op_arms.iter_mut() {
                 let mut shadow = context.shadow();
                 let p_var_ty = shadow.insert_binding(arm.performed_variable.clone());
-                if let Some(_) = arm.effect_name {
-                    todo!("Inference for declared effect ops.");
+                let (p_ty, r_ty) = if let Some(effect_name) = &arm.effect_name {
+                    co_ops
+                        .inner()
+                        .get_declared_op(effect_name, &arm.op_name)
+                        .unwrap()
                 } else {
-                    let (p_ty, r_ty) = co_ops.inner().get_anonymous_op(&arm.op_name).unwrap();
-                    unify(&p_ty, &p_var_ty)?;
-                    shadow.set_resume_type(&r_ty);
-                }
+                    co_ops.inner().get_anonymous_op(&arm.op_name).unwrap()
+                };
+                unify(&p_ty, &p_var_ty)?;
+                shadow.set_resume_type(&r_ty);
                 infer(shadow.context(), &mut arm.body)?;
                 // TODO: If the arm ends in a resume, then it does not need to unify here.
                 unify(&arm.body.get_type(), handle_expr_ty)?;
@@ -1592,7 +1734,11 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
             // Guaranteed not to die because they were just added.
             let mut remaining_ops = co_ops.mut_inner().clone();
             for arm in op_arms.iter() {
-                remaining_ops.remove_anonymous_effect_or_die(&arm.op_name);
+                if let Some(effect_name) = &arm.effect_name {
+                    remaining_ops.remove_named_effect_or_die(effect_name, &arm.op_name);
+                } else {
+                    remaining_ops.remove_anonymous_effect_or_die(&arm.op_name);
+                }
             }
             context.ops.subsume(&remaining_ops)?;
             co_ops.when_extended_update(&context.ops);
@@ -3155,7 +3301,116 @@ mod tests {
         assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
     }
 
+    #[test]
+    fn perform_declared_effect() {
+        let source = r#"
+        effect State<T> { get: unit -> T, set: T -> unit }
+        co foo() -> i64 ! s: State<i64> {
+            perform s.get(())
+        }
+        "#;
+        assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
+    }
+    #[test]
+    fn handle_declared_effect() {
+        let source = r#"
+        effect State<T> { get: unit -> T, set: T -> unit }
+        co run_state(x: i64) -> i64 ! State<i64>;
+        fn main() -> i64 {
+            run_state(42) handle {
+                State.get(x) => { resume(44) },
+                State.set(s) => { resume(()) },
+            }
+        }
+        "#;
+        assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
+    }
+    #[test]
+    fn error_handle_structural_named_effect_not_bound_to_decl() {
+        let source = r#"
+        effect State<T> { get: unit -> T, set: T -> unit }
+        fn main() -> i64 {
+            let c = co {
+                let s = perform State.get(());
+                perform State.set(s);
+                42
+            };
+            c handle {
+                State.get(x) => { resume(44) },
+                State.set(s) => { resume(()) },
+            }
+        }
+        "#;
+        let result = typecheck_program(&mut parse_program_or_die(source));
+        // The co expression type is not concrete because we don't know that it binds to the State
+        // effect: It could be some _other_ effect, locally named "State", with get and set.
+        assert!(
+            matches!(result, Err(Error::ExpressisonTypeNotInferred(_))),
+            "{result:?}"
+        );
+    }
+    #[test]
+    fn bind_structural_effect_to_declaration_via_variable_binding() {
+        let source = r#"
+        effect State<T> { get: unit -> T, set: T -> unit }
+        fn main() -> i64 {
+            let c: Co< _ ! State<_>> = co {
+                let s = perform State.get(());
+                perform State.set(s);
+                42
+            };
+            c handle {
+                State.get(x) => { resume(44) },
+                State.set(s) => { resume(()) },
+            }
+        }
+        "#;
+        // The type annotation on `c` is required for this to pass, as it binds the named effect
+        // `State` to the actual declared `State` effect.
+        assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
+    }
+    #[test]
+    fn error_perform_effect_with_inconsistent_parameterized_type() {
+        let source = r#"
+        effect State<T> { get: unit -> T, set: T -> unit }
+        fn main() {
+            let c: Co< _ ! State<_>> = co {
+                let s = perform State.get(());
+                perform State.set(100);
+            };
+            c handle {
+                State.get(x) => { resume(3.14) },
+                State.set(s) => { resume(()) },
+            }
+        }
+        "#;
+        let result = typecheck_program(&mut parse_program_or_die(source));
+        assert_eq!(result, Err(Error::NotUnifiable(Type::float(), Type::int())));
+    }
+    #[test]
+    fn perform_multiple_named_effects() {
+        let source = r#"
+        effect State<T> { get: unit -> T, set: T -> unit }
+        co do_stuff() ! b: State<bool>, i: State<i64> {
+            if perform b.get(()) then {
+                perform i.set(42);
+            } else {
+                perform i.set(300);
+            }
+        }
+        fn main() {
+            let mut i_state = 0;
+            do_stuff() handle {
+                b.get(x) => { resume(true) },
+                b.set(s) => { resume(()) },
+                i.get(x) => { resume(i_state) },
+                i.set(x) => { i_state = x; resume(()) },
+            }
+        }
+        "#;
+        assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
+    }
+
     // TODO: Recursive types? Mutually recursive types? Forward declarations?
-    // TODO: Need to represent Co<T ! E1, E2, E3> in parser.
     // TODO: Top level comments in parse?
 }

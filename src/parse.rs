@@ -880,7 +880,7 @@ fn parse_handle_expression<'s>(
             }
             "op_arm" => {
                 // TODO: Use effect name once handled in AST.
-                let effect_name = node
+                let effect_name = arm
                     .optional_child("effect_name", errors)
                     .map(|node| node.text().to_string());
                 let op_name = arm
@@ -894,7 +894,7 @@ fn parse_handle_expression<'s>(
                     .and_then(|node| parse_expr(node, errors));
                 if let (Some(op_name), Some(binding), Some(expr)) = (op_name, binding, expr) {
                     op_arms.push(HandleOpArm {
-                        effect_name: effect_name,
+                        effect_name,
                         op_name: op_name.to_string(),
                         performed_variable: binding,
                         body: expr,
@@ -1147,7 +1147,6 @@ fn parse_lambda_expr<'s>(
 ) -> Option<Expression> {
     let mut bindings = Vec::new();
     for child in node.children_by_field_name("lambda_args", errors) {
-        dbg!(child.kind());
         if let Some(b) = parse_binding(child, errors) {
             bindings.push(b);
         }
@@ -1707,6 +1706,7 @@ mod tests {
                 bar(z) => {
                     resume z(1);
                 },
+                buz.buz(y) => y,
             }
         }
         "#;
@@ -1743,6 +1743,12 @@ mod tests {
                         op_name: "bar".to_string(),
                         performed_variable: Binding::new("z"),
                         body: block_expr(vec![resume_stmt(call_expr("z", vec![1.into()]))]),
+                    },
+                    HandleOpArm {
+                        effect_name: Some("buz".to_string()),
+                        op_name: "buz".to_string(),
+                        performed_variable: Binding::new("y"),
+                        body: "y".into(),
                     },
                 ],
                 ty: Type::unknown(),
