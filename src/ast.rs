@@ -251,11 +251,16 @@ impl Type {
 #[derive(Debug, Clone, PartialEq)]
 pub struct OpSet(UnionFindRef<OpSetI>);
 
+#[derive(Debug, Clone, PartialEq)]
+enum DeclaredOps {
+    Known(EffectInstance, HashSet<String>),
+}
+
 // A set of ops that are being performed.
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct OpSetI {
     anonymous_ops: HashMap<String, (Type, Type)>,
-    named_effects: HashMap<String, (EffectInstance, HashSet<String>)>,
+    named_effects: HashMap<String, DeclaredOps>,
     super_sets: Vec<OpSet>,
     done_extending: bool,
 }
@@ -318,9 +323,13 @@ impl OpSet {
         for (op_name, (perform_type, resume_type)) in other.anonymous_ops.iter() {
             self_inner.unify_add_anonymous_effect(op_name, perform_type, resume_type)?;
         }
-        for (effect_name, (instance, ops)) in other.named_effects.iter() {
-            for op_name in ops {
-                self_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
+        for (effect_name, effect) in other.named_effects.iter() {
+            match effect {
+                DeclaredOps::Known(instance, ops) => {
+                    for op_name in ops {
+                        self_inner.unify_add_declared_op(Some(effect_name), instance, op_name)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -360,14 +369,16 @@ impl OpSetI {
             return self.anonymous_ops.get(op_name).cloned();
         }
         let name_or_effect = name_or_effect.unwrap();
-        if let Some((instance, ops)) = self.named_effects.get(name_or_effect) {
-            if ops.contains(op_name) {
-                return Some(instance.unwrap_op_type(op_name));
-            } else {
-                return None;
+        match self.named_effects.get(name_or_effect) {
+            Some(DeclaredOps::Known(instance, ops)) => {
+                if ops.contains(op_name) {
+                    Some(instance.unwrap_op_type(op_name))
+                } else {
+                    None
+                }
             }
+            None => None,
         }
-        None
     }
     fn iter_types(&self) -> impl Iterator<Item = Type> + '_ {
         let mut types = Vec::new();
@@ -375,8 +386,12 @@ impl OpSetI {
             types.push(p.clone());
             types.push(r.clone());
         }
-        for (instance, _) in self.named_effects.values() {
-            types.extend(instance.params.values().cloned());
+        for effect in self.named_effects.values() {
+            match effect {
+                DeclaredOps::Known(instance, _) => {
+                    types.extend(instance.params.values().cloned());
+                }
+            }
         }
         types.into_iter()
     }
@@ -386,8 +401,12 @@ impl OpSetI {
             types.push(p);
             types.push(r);
         }
-        for (instance, _) in self.named_effects.values_mut() {
-            types.extend(instance.params.values_mut());
+        for effect in self.named_effects.values_mut() {
+            match effect {
+                DeclaredOps::Known(instance, _) => {
+                    types.extend(instance.params.values_mut());
+                }
+            }
         }
         types.into_iter()
     }
@@ -397,7 +416,7 @@ impl OpSetI {
             .unwrap_or_else(|| panic!("Expected {name} in {self:?}"));
     }
     fn remove_named_effect_or_die(&mut self, effect_name: &str, op_name: &str) {
-        if let Some((_, ops)) = self.named_effects.get_mut(effect_name) {
+        if let Some(DeclaredOps::Known(_, ops)) = self.named_effects.get_mut(effect_name) {
             if !ops.remove(op_name) {
                 panic!("Expected {effect_name}.{op_name} in {self:?}");
             }
@@ -460,28 +479,34 @@ impl OpSetI {
         let name_str = name.unwrap_or(&instance.decl.name).to_string();
         match self.named_effects.entry(name_str) {
             Entry::Occupied(mut entry) => {
-                let (existing_instance, existing_ops) = entry.get_mut();
-                if existing_instance.decl != instance.decl {
-                    return Err(Error::EffectDeclMismatch(
-                        instance.decl.as_ref().clone(),
-                        existing_instance.decl.as_ref().clone(),
-                    ));
+                match entry.get_mut() {
+                    DeclaredOps::Known(existing_instance, existing_ops) => {
+                        if existing_instance.decl != instance.decl {
+                            return Err(Error::EffectDeclMismatch(
+                                instance.decl.as_ref().clone(),
+                                existing_instance.decl.as_ref().clone(),
+                            ));
+                        }
+                        // Unify the params map.
+                        unify_params(&existing_instance.params, &instance.params, || {
+                            panic!(
+                                "Two instances of the same effect should \
+                                have the same type param ids. \
+                                Left:{existing_instance:?}, 15:{instance:?}"
+                            )
+                        })?;
+                        existing_ops.insert(op_name.to_string());
+                    }
                 }
-                // Unify the params map.
-                unify_params(&existing_instance.params, &instance.params, || {
-                    panic!(
-                        "Two instances of the same effect should \
-                        have the same type param ids. \
-                        Left:{existing_instance:?}, 15:{instance:?}"
-                    )
-                })?;
-                existing_ops.insert(op_name.to_string());
             }
             Entry::Vacant(entry) => {
                 if self.done_extending {
                     return Err(Error::OpSetNotExtendable(self.clone()));
                 }
-                entry.insert((instance.clone(), HashSet::from_iter([op_name.to_string()])));
+                entry.insert(DeclaredOps::Known(
+                    instance.clone(),
+                    HashSet::from_iter([op_name.to_string()]),
+                ));
                 for super_set in self.super_sets.iter() {
                     super_set
                         .clone()
@@ -690,16 +715,19 @@ fn resolve_ops(context: &TypeContext, ops: &[ParsedOp]) -> Result<OpSet, Error> 
                                 params: resolved_params,
                                 decl: decl.clone(),
                             };
-                            entry.insert((instance, ops));
+                            entry.insert(DeclaredOps::Known(instance, ops));
                         }
                         Entry::Occupied(mut entry) => {
-                            let (_decl, ops) = entry.get_mut();
-                            if let Some(op_name) = op_name {
-                                if ops.insert(op_name.clone()) {
-                                    return Err(Error::DuplicateOpName(op_name.clone()));
+                            match entry.get_mut() {
+                                DeclaredOps::Known(_decl, ops) => {
+                                    if let Some(op_name) = op_name {
+                                        if ops.insert(op_name.clone()) {
+                                            return Err(Error::DuplicateOpName(op_name.clone()));
+                                        }
+                                    } else {
+                                        return Err(Error::DuplicateNamedEffect(effect.clone()));
+                                    }
                                 }
-                            } else {
-                                return Err(Error::DuplicateNamedEffect(effect.clone()));
                             }
                         }
                     }
@@ -1474,8 +1502,10 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
         } => {
             infer(context, arg)?;
 
-            if let Some((perform_ty, resume_ty)) =
-                context.ops.clone_inner().get(effect_name.as_deref(), op_name)
+            if let Some((perform_ty, resume_ty)) = context
+                .ops
+                .clone_inner()
+                .get(effect_name.as_deref(), op_name)
             {
                 unify(&arg.get_type(), &perform_ty)?;
                 unify(expr_ty, &resume_ty)?;
@@ -1487,10 +1517,11 @@ fn infer(context: &mut TypeContext, expression: &mut Expression) -> Result<(), E
                 })
             } else if effect_name.is_none() {
                 // Perform an anonymous effect.
-                context
-                    .ops
-                    .mut_inner()
-                    .unify_add_anonymous_effect(op_name, &arg.get_type(), expr_ty)?;
+                context.ops.mut_inner().unify_add_anonymous_effect(
+                    op_name,
+                    &arg.get_type(),
+                    expr_ty,
+                )?;
                 Ok(())
             } else {
                 todo!("No idea how to perform named effects apparently.");
