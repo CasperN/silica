@@ -3410,6 +3410,32 @@ mod tests {
         "#;
         assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
     }
+    #[test]
+    fn handle_named_effects_in_parts() {
+        let source = r#"
+        effect State<T> { get: unit -> T, set: T -> unit }
+        co do_stuff() ! b: State<bool>, i: State<i64> {
+            if perform b.get(()) then {
+                perform i.set(42);
+            } else {
+                perform i.set(300);
+            }
+        }
+        fn main() {
+            let mut i_state = 0;
+            // `d` is a coroutine that only handled some of do_stuff();
+            let d = co do_stuff() handle {
+                b.get(x) => { resume(true) },
+                i.set(x) => { i_state = x; resume(()) },
+            };
+            d handle {
+                b.set(s) => { resume(()) },
+                i.get(x) => { resume(i_state) },
+            }
+        }
+        "#;
+        assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
+    }
 
     // TODO: Recursive types? Mutually recursive types? Forward declarations?
     // TODO: Top level comments in parse?
