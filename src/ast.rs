@@ -3436,6 +3436,52 @@ mod tests {
         "#;
         assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
     }
+    #[test]
+    fn error_unconstrained_inferred_effect_signature() {
+        let mut program = parse_program_or_die(
+            r#"
+            fn default<T>() -> T;
+            fn main() -> unit {
+                let c = co {
+                    perform foo(default()); // The perform type is inferred as Unknown
+                };
+                // 'c' is never used, so the effect { foo(_ -> unit) } is not
+                // constrained further. This should be an error.
+            }
+            "#,
+        );
+        assert!(matches!(
+            typecheck_program(&mut program),
+            Err(Error::ExpressisonTypeNotInferred(_))
+        ));
+    }
+    #[test]
+    fn error_unconstrained_type_in_handled_effect() {
+        let mut program = parse_program_or_die(
+            r#"
+            fn default<T>() -> T;
+            fn main() -> i64 { // The function signature itself is concrete.
+                let c = co {
+                    perform get_state(());
+                };
+
+                c handle {
+                    // The 'get_state' effect is handled and does not escape.
+                    get_state(p) => { resume(default()) }, // The resume type is Unknown!
+
+                    // The handle expression has a concrete return type.
+                    return v => 42,
+                }
+            }
+            "#,
+        );
+        // The resume type for 'get_state' is inferred to be an unconstrained
+        // polymorphic type `T`, which should be an error.
+        assert!(matches!(
+            typecheck_program(&mut program),
+            Err(Error::ExpressisonTypeNotInferred(_))
+        ));
+    }
 
     // TODO: Recursive types? Mutually recursive types? Forward declarations?
     // TODO: Top level comments in parse?
