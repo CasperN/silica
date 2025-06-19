@@ -533,12 +533,12 @@ Silica will adopt structured concurrency as its primary model for managing concu
         2. Compare the implementation state to the overall design.
            1. How should the type system be augmented to bring it closer to the design.
            2. For each potential direction, what is the smallest incremental steps be
-     4. Review the tests
-        1. Are there tests that are redundant with each other?
-        2. Are there tests that are not testing what their name suggests?
-        3. Are there test programs that are too complex and unfocused for the test?
-        4. Are there errors or features that are untested?
-        5. Is there both a success and failure case for each tested feature?
+     4. Examine the test foundation of the compiler.
+        1. What features are tested? Organize the tests into groups of related tests.
+        2. List any tests that are redundant with each other.
+        3. List any tests that are confusing or are not testing what their name suggests.
+        4. Each feature under test should have a success and failure case. List any tests without a corresponding partner.
+        5. List other gaps, what features are implemented but not tested? Propose test cases for those.
      5. Review the TODOs in the three files.
         1. For each TODO, describe what changes need to resolve the TODO.
         2. For each TODO, decide whether it is stale, blocked by other features, blocked by refactoring, or if its readily fixable.
@@ -550,17 +550,21 @@ Silica will adopt structured concurrency as its primary model for managing concu
      2. Enumerate the ways where the implementation has diverged from the design.
      3. For each divergence, propose whether the design or implementation should be updated, based on the values of the language.
      4. Apply the design review checklist, step by step, and note what changes need to be made.
-  4. Begin a roadmap to bring the implementation closer to the intended design
-     1. Enumerate the work items, both large and small, that should be in a roadmap
-     2. Identify dependencies and interactions between work items. If two items are interdependent, they should be broken into smaller work items.
-     3. Ensure work item dependencies form a directed acyclic graph (DAG) and then identify which items are unblocked and may be worked on first. If there are cycles, break up the work items into smaller pieces.
-     4. Of the unblocked work items, decide which should come first, consider ease of implementation and importance to the long term goals. Prioritize progress and momentum. Delay non-essential features.
-     5. For the items to be worked on first, break them up into small commit-sized work items, following TDD best practices. Each commit should introduce just 1-3 unit tests, (see ast.rs for examples) and the associated tested feature.
-     6. Organize the above into a roadmap and proposal for next steps
+  4. Think through implementatino steps to bring the implementation closer to the intended design.
+     1. Enumerate the outstanding work items that should be in a roadmap. Each work item should be an independent but end-to-end-testable language feature, such as "anonymous effects", "structs", or "last use analysis".
+     2. For each work item, think through what changes are required to implement them.
+        1. Identify dependencies and interactions between work items.
+        2. If implementation will reveal that two items are interdependent, they should be broken into smaller work items.
+        3. Ensure work item dependencies form a directed acyclic graph (DAG). If there are cycles, break up the work items into smaller pieces.
+        4. Repeat this subsection as needed to get a verified DAG of implementable work items.
+     3. Of the unblocked work items, decide which should come first, consider ease of implementation and importance to the long term goals. Prioritize progress and momentum. Delay non-essential features.
+     4. For the items to be worked on first, break them up into small commit-sized work items, following TDD best practices. Each commit should introduce just 1-3 unit tests, (see ast.rs for examples) and the associated tested feature.
+     5. Organize the above into a roadmap and proposal for next steps
   5. Having followed these steps, reflect on these onboarding instructions and your thinking
      1. Check your previous thinking. Enumerate corrections.
      2. Critique these onboarding instructions. What steps should be expanded or added to better explore the language?
      3. List out your changes to the onboarding instructions
      4. Follow your new instructions.
+  6. Organize your thoughts, apply any corrections, gather your questions, and present your work to the user.
 
 **Useful Search Terms:** "algebraic effects existential types", "linear types lifetimes", "affine types resource management", "scoped effect handlers", "effect tunneling", "SSA for coroutines", "definite assignment analysis", "immovable types language design", "continuation passing style compilation", "LLVM coroutine intrinsics", "Rust MIR borrow checking", "output reference types", "guaranteed copy elision semantics", "effect handlers driving computation", "asynchronous algebraic effects", "flow sensitive type systems owned types", "typestate analysis implementation", "Hindley-Milner overloading".
