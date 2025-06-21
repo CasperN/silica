@@ -1,5 +1,3 @@
-#![allow(dead_code)] // TODO.
-
 /*
 TODO:
 - High priority
@@ -17,7 +15,21 @@ TODO:
 
 mod ast;
 mod parse;
+#[allow(dead_code)]
 mod ssa;
 mod union_find;
 
-pub use parse::parse;
+pub fn compile(source: &str) {
+    let mut errors = vec![];
+    let program = parse::parse_ast_program(source, &mut errors);
+    if !errors.is_empty() {
+        for e in errors {
+            println!("ParseError: {e:?}");
+        }
+        return;
+    }
+    match ast::typecheck_program(&mut program.unwrap()) {
+        Ok(()) => println!("it typechecks!"),
+        Err(e) => println!("Type error: {e:?}"),
+    }
+}

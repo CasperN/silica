@@ -50,7 +50,7 @@ enum TypeI {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Constraint {
+pub(crate) enum Constraint {
     // Field name and field type constraint.
     HasField(String, Type),
 }
@@ -234,13 +234,6 @@ impl Type {
             TypeI::Co(ty, ops) => ty.is_concrete() && ops.clone().inner().is_concrete(),
         }
     }
-
-    fn unwrap_ops(&self) -> OpSet {
-        if let TypeI::Co(_, ops) = &*self.clone().inner() {
-            return ops.clone();
-        }
-        panic!("unwrap_ops called on a non-coroutine.");
-    }
 }
 
 // *************************************************************************************************
@@ -286,9 +279,6 @@ impl OpSet {
     }
     pub fn empty_extensible() -> Self {
         Self::new(OpSetI::empty())
-    }
-    fn is_empty(&self) -> bool {
-        self.0.clone().inner().is_empty()
     }
     fn is_extendable(&self) -> bool {
         !self.0.clone().inner().done_extending
@@ -360,10 +350,6 @@ impl OpSetI {
         self.done_extending = true;
         self
     }
-    fn is_empty(&self) -> bool {
-        self.anonymous_ops.is_empty() && self.named_effects.is_empty()
-    }
-
     // An Opset is concrete if all the types therein are concrete.
     // Note that we consider extendable OpSets to be concrete.
     fn is_concrete(&self) -> bool {
@@ -457,17 +443,6 @@ impl OpSetI {
             }
         }
     }
-
-    fn unify_add_anonymous_effect_or_die(
-        &mut self,
-        name: &str,
-        perform_type: &Type,
-        resume_type: &Type,
-    ) -> &mut Self {
-        self.unify_add_anonymous_effect(name, perform_type, resume_type)
-            .unwrap()
-    }
-
     fn unify_add_anonymous_effect(
         &mut self,
         name: &str,
@@ -1133,6 +1108,7 @@ pub struct Binding {
     pub ty: Type,
     pub mutable: bool,
 }
+#[allow(dead_code)]
 impl Binding {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -1176,20 +1152,6 @@ pub struct StructType {
     pub name: String,
     pub params: Vec<String>,
     pub fields: HashMap<String, Type>,
-}
-impl StructType {
-    fn new(name: &str, fields: &[(&str, Type)], params: &[&str]) -> Self {
-        let fields: HashMap<String, Type> = fields
-            .iter()
-            .map(|(name, ty)| (name.to_string(), ty.clone()))
-            .collect();
-        let params = params.iter().map(|p| p.to_string()).collect();
-        StructType {
-            name: name.to_string(),
-            params,
-            fields,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1240,7 +1202,7 @@ impl EffectInstance {
 }
 
 #[derive(PartialEq, Debug, Clone)]
-enum NamedItem {
+pub(crate) enum NamedItem {
     Variable(VariableInfo),
     Struct(Rc<StructType>),
     Effect(Rc<EffectType>),
@@ -1248,7 +1210,7 @@ enum NamedItem {
 }
 
 #[derive(PartialEq, Debug, Clone)]
-struct VariableInfo {
+pub(crate) struct VariableInfo {
     ty: Type,
     mutable: bool,
 }
@@ -1297,7 +1259,6 @@ impl TypeContext {
         ShadowTypeContext {
             type_context: self,
             shadowed_variables: HashMap::new(),
-            finished: false,
             shadowed_return_type: None,
             shadowed_ops: None,
             shadowed_resume_type: None,
@@ -1319,7 +1280,6 @@ impl TypeContext {
             shadowed_return_type: Some(return_type),
             shadowed_ops: Some(ops),
             shadowed_resume_type: Some(resume_type),
-            finished: false,
         }
     }
 }
@@ -1331,7 +1291,6 @@ struct ShadowTypeContext<'a> {
     shadowed_return_type: Option<Type>,
     shadowed_resume_type: Option<Option<Type>>,
     shadowed_ops: Option<OpSet>,
-    finished: bool,
 }
 impl<'a> ShadowTypeContext<'a> {
     fn insert_named_item(&mut self, name: String, item: NamedItem) {
@@ -1433,7 +1392,7 @@ impl<'a> Drop for ShadowTypeContext<'a> {
 }
 
 #[derive(PartialEq, Debug)]
-enum Error {
+pub(crate) enum Error {
     UnknownName(String),
     NoSuchStruct(String),
     NotUnifiable(Type, Type),
@@ -1441,27 +1400,18 @@ enum Error {
     DuplicateArgNames(Expression),
     DuplicateTopLevelName(String),
     AssignToImmutableBinding(String),
-    TopLevelFnArgsMustBeTyped(String),
     UnrecognizedField(String),
-    FieldAccessToNonStruct(Expression, String),
-    NoMatchingOpInContext {
-        effect_or_instance: Option<String>,
-        op_name: String,
-    },
     PerformedEffectsNotallowedInContext {
         effect_or_instance: Option<String>,
         op_name: String,
     },
     DuplicateOpName(String),
     NoMatchingOpInEffectDecl(String, EffectType),
-    NamedEffectInstanceMismatch(EffectInstance, EffectInstance),
-    DeclMustHaveConcreteTypes(String),
     FnDeclMustHaveConcreteTypes(FnDecl),
     CoDeclMustHaveConcreteTypes(CoDecl),
     StructDeclMustHaveConcreteTypes(StructType),
     EffectDeclMustHaveConcreteTypes(EffectType),
     EffectDeclMismatch(EffectType, EffectType),
-    OpSetNotUnifiable(OpSetI, OpSetI),
     OpSetNotExtendable(OpSetI),
     InapplicableConstraint(Type, Constraint),
     ExpressisonTypeNotInferred(Expression),
@@ -1892,7 +1842,7 @@ fn check_statement_concrete(statement: &Statement) -> Result<(), Error> {
     Ok(())
 }
 
-fn typecheck_program(program: &mut Program) -> Result<(), Error> {
+pub fn typecheck_program(program: &mut Program) -> Result<(), Error> {
     // First, load declarations into typing context.
     // TODO: Allow for circular dependencies between types at the top level.
     let mut context = TypeContext::new();
@@ -2123,28 +2073,13 @@ impl From<LValue> for Statement {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub mod test_helpers {
     use super::*;
 
     pub fn let_stmt(name: &str, value: impl Into<Expression>) -> Statement {
         Statement::Let {
             binding: Binding::new(name),
-            value: value.into(),
-        }
-    }
-    pub fn full_let_stmt(
-        name: &str,
-        type_: Type,
-        mutable: bool,
-        value: impl Into<Expression>,
-    ) -> Statement {
-        Statement::Let {
-            binding: Binding {
-                name: name.to_string(),
-                parsed_type: ParsedType::Unspecified,
-                ty: type_,
-                mutable,
-            },
             value: value.into(),
         }
     }

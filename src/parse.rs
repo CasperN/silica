@@ -200,9 +200,6 @@ pub enum ParseError<'source> {
     UnknownPrimitiveType(&'source str),
 }
 
-// Helper type alias for results
-type ParseResult<'source, T> = Result<T, ParseError<'source>>;
-
 // *************************************************************************************************
 //  Parsed Types
 // *************************************************************************************************
@@ -248,6 +245,8 @@ impl ParsedOp {
     }
 }
 
+// Nice to have helpers for testing.
+#[allow(dead_code)]
 impl ParsedType {
     pub fn func(args: impl AsRef<[Self]>, ret: Self) -> Self {
         Self::Fn(args.as_ref().to_vec(), Box::new(ret))
@@ -261,7 +260,8 @@ impl ParsedType {
     pub fn parameterized(name: &str, params: &[ParsedType]) -> Self {
         Self::Named(name.to_string(), params.to_vec())
     }
-
+}
+impl ParsedType {
     pub fn is_specified(&self) -> bool {
         match self {
             Self::Unspecified => false,
@@ -276,11 +276,13 @@ impl ParsedType {
 
 // TODO: str instead of string?
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct StructDecl {
-    pub(crate) name: String,
-    pub(crate) params: Vec<String>,
-    pub(crate) fields: Vec<(String, ParsedType)>,
+pub struct StructDecl {
+    pub name: String,
+    pub params: Vec<String>,
+    pub fields: Vec<(String, ParsedType)>,
 }
+
+#[cfg(test)]
 impl StructDecl {
     pub fn new(name: impl Into<String>, fields: &[(&str, ParsedType)]) -> Self {
         Self::parameterized(name, &[], fields)
@@ -1091,20 +1093,6 @@ fn parse_binding<'s>(
     })
 }
 
-fn parse_l_value<'s>(node: SourceNode<'s, '_>, errors: &mut Vec<ParseError<'s>>) -> Option<LValue> {
-    match node.kind() {
-        "identifier" => Some(LValue::Variable(node.text().to_string())),
-        found => {
-            errors.push(ParseError::UnexpectedNodeType {
-                expected: "lvalue",
-                found,
-                node_text: node.text(),
-            });
-            None
-        }
-    }
-}
-
 fn parse_return_statement<'s>(
     node: SourceNode<'s, '_>,
     errors: &mut Vec<ParseError<'s>>,
@@ -1198,6 +1186,7 @@ fn parse_call_expr<'s>(
 
 // Parses a program and panics if there were any errors.
 // Intended for use in testing.
+#[cfg(test)]
 pub fn parse_program_or_die(source: &str) -> Program {
     let mut errors = Vec::new();
     let p = parse_ast_program(source, &mut errors);
@@ -1326,14 +1315,10 @@ mod tests {
     #[test]
     fn declare_struct() {
         let source = r"struct FooBar { foo: i64, bar: f64 }";
-        let program = Program(vec![Declaration::Struct(StructDecl {
-            params: vec![],
-            name: "FooBar".to_string(),
-            fields: vec![
-                ("foo".to_string(), ParsedType::Int),
-                ("bar".to_string(), ParsedType::Float),
-            ],
-        })]);
+        let program = Program(vec![Declaration::Struct(StructDecl::new(
+            "FooBar",
+            &[("foo", ParsedType::Int), ("bar", ParsedType::Float)],
+        ))]);
         let mut errors = vec![];
         let parsed = parse_ast_program(source, &mut errors);
         assert_eq!(&errors, &[]);
@@ -1345,12 +1330,7 @@ mod tests {
         let program = Program(vec![Declaration::Fn(FnDecl {
             forall: ["T".to_string()].into_iter().collect(),
             name: "id".to_string(),
-            args: vec![Binding {
-                name: "x".to_string(),
-                parsed_type: ParsedType::Named("T".to_string(), vec![]),
-                ty: Type::unknown(),
-                mutable: false,
-            }],
+            args: vec![Binding::new_typed("x", ParsedType::named("T"))],
             return_type: ParsedType::named("T"),
             body: Some(block_expr(vec!["x".into()])),
         })]);
@@ -1459,14 +1439,10 @@ mod tests {
         }];
         assert_eq!(errors, expected_errors);
 
-        let expected_ast = Some(Program(vec![Declaration::Struct(StructDecl {
-            name: "Point".to_string(),
-            params: vec![],
-            fields: vec![
-                ("x".to_string(), ParsedType::Int),
-                ("y".to_string(), ParsedType::Unspecified),
-            ],
-        })]));
+        let expected_ast = Some(Program(vec![Declaration::Struct(StructDecl::new(
+            "Point",
+            &[("x", ParsedType::Int), ("y", ParsedType::Unspecified)],
+        ))]));
         assert_eq!(parsed, expected_ast);
     }
     #[test]
@@ -1743,12 +1719,7 @@ mod tests {
                     HandleOpArm {
                         effect_name: None,
                         op_name: "foo".to_string(),
-                        performed_variable: Binding {
-                            name: "y".into(),
-                            parsed_type: ParsedType::Unit,
-                            ty: Type::unknown(),
-                            mutable: true,
-                        },
+                        performed_variable: Binding::new_typed_mut("y", ParsedType::Unit),
                         body: call_expr("baz", vec!["y".into()]),
                     },
                     HandleOpArm {
@@ -1856,9 +1827,9 @@ mod tests {
             body: Some(block_expr(vec![Statement::Let {
                 binding: Binding::new_typed(
                     "x",
-                    ParsedType::Named(
-                        "Foo".to_string(),
-                        vec![
+                    ParsedType::parameterized(
+                        "Foo",
+                        &[
                             ParsedType::Unspecified,
                             ParsedType::Ops(vec![
                                 ParsedOp::anon("foo", ParsedType::Int, ParsedType::Float),
