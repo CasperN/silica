@@ -72,7 +72,7 @@ module.exports = grammar({
       field('parameters', optional($.generic_parameter_list)),
       delimited('(', field("args", $.typed_binding), ',', ')'),
       optional(seq('->', field('return_type', $._type))),
-      optional(field('effects', $.effects)),
+      optional(seq("!", field('effects', $.effects))),
       field('body', choice($.block_expression, ';'))
     ),
 
@@ -116,13 +116,13 @@ module.exports = grammar({
     coroutine_type: $ => seq(
       "Co", "<", 
       field("return_type", $._type),
-      optional(field("effects", $.effects)),
+      optional(seq("!", field("effects", $.effects))),
       ">"
     ),
 
     named_type: $ => seq(
       field("name", $.identifier),
-      optional(field("type_params", $.type_list)),
+      optional(field("type_params", $.instantiation_list)),
     ),
 
     // --- Statements ---
@@ -193,6 +193,7 @@ module.exports = grammar({
       $.identifier
     ),
 
+    // TODO: Call with type parameters, e.g., foo<i64>()
     call_expression: $ => prec.left(2, seq(
       field('function', $._expression),
       delimited("(", field("call_args", $._expression), ",", ")")
@@ -319,7 +320,12 @@ module.exports = grammar({
 
     // TODO: Constraining params, e.g. T: MyTrait.
     generic_parameter_list: $ => delimited("<", field("parameter_name", $.identifier), ",", ">"),
-    type_list: $ => delimited("<", field("types", $._type), ",", ">"),
+    instantiation_list: $ => delimited(
+      "<",
+      field("params", choice($._type, $.braced_effects)),
+      ",",
+      ">",
+    ),
 
     _effect_type: $ => choice(
       $.anonymous_op_type,
@@ -337,14 +343,16 @@ module.exports = grammar({
       // If a name isn't specified, we default to the effect_type decl name.
       optional(seq(field("effect_name", $.identifier), ":")),
       field("effect_type", $.identifier),
-      optional(field("type_params", $.type_list)),
+      optional(field("type_params", $.instantiation_list)),
       // If op_name isn't specified, we assume all ops under the effect_type are included.
       optional(seq(".", field("op_name", $.identifier))),
     ),
 
-    effects: $ => seq(
-      "!",
-      sepBy(",", field("effects", $._effect_type)),
-    ),
+    // Effect lists are comma separated and may need to be braced if they're 
+    // in a comma separated list.
+    effects: $ => choice($._braced_effects, $._unbraced_effects),
+    braced_effects: $ => $._braced_effects,
+    _unbraced_effects: $ => sepBy1(",", field("effects", $._effect_type)),
+    _braced_effects: $ => delimited("{", field("effects", $._effect_type), ",", "}"),
   }
 });

@@ -221,6 +221,8 @@ pub enum ParsedType {
     Fn(Vec<ParsedType>, Box<ParsedType>),
     Co(Box<ParsedType>, Vec<ParsedOp>),
     Named(String, Vec<ParsedType>),
+    // This is only a valid "type" when in an instantiation list.
+    Ops(Vec<ParsedOp>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -267,6 +269,7 @@ impl ParsedType {
             Self::Fn(args, ret) => ret.is_specified() && args.iter().all(|a| a.is_specified()),
             Self::Named(_name, params) => params.iter().all(|p| p.is_specified()),
             Self::Co(ret, ops) => ret.is_specified() && ops.iter().all(|op| op.is_specified()),
+            Self::Ops(ops) => ops.iter().all(|op| op.is_specified()),
         }
     }
 }
@@ -552,7 +555,7 @@ fn parse_effects<'s>(
                     .map(|n| n.text().to_string());
                 let params = e
                     .optional_child("type_params", errors)
-                    .map(|node| parse_type_list(node, errors))
+                    .map(|node| parse_instantiation_list(node, errors))
                     .unwrap_or_default();
                 let op_name = e
                     .optional_child("op_name", errors)
@@ -578,12 +581,18 @@ fn parse_effects<'s>(
     Some(parsed_ops)
 }
 
-fn parse_type_list<'s>(
+fn parse_instantiation_list<'s>(
     node: SourceNode<'s, '_>,
     errors: &mut Vec<ParseError<'s>>,
 ) -> Vec<ParsedType> {
     let mut types = Vec::new();
-    for n in node.children_by_field_name("types", errors) {
+    for n in node.children_by_field_name("params", errors) {
+        if n.kind() == "braced_effects" {
+            if let Some(ops) = parse_effects(n, errors) {
+                types.push(ParsedType::Ops(ops));
+            }
+            continue;
+        }
         if let Some(ty) = parse_type(n, errors) {
             types.push(ty);
         }
@@ -721,9 +730,13 @@ fn parse_type<'s>(
                 .map(|n| n.text().to_string());
             let params = node
                 .optional_child("type_params", errors)
-                .map(|node| parse_type_list(node, errors))
+                .map(|node| parse_instantiation_list(node, errors))
                 .unwrap_or_default();
             name.map(|name| ParsedType::Named(name, params))
+        }
+        "braced_effects" => {
+            let effects = parse_effects(node, errors);
+            effects.map(ParsedType::Ops)
         }
         _ => {
             errors.push(ParseError::UnexpectedNodeType {
@@ -1819,6 +1832,54 @@ mod tests {
             ops: vec![ParsedOp::anon("foo", ParsedType::Int, ParsedType::Float)],
             return_type: ParsedType::Unit,
             body: None,
+        })]));
+        assert_eq!(parsed, expected_ast);
+    }
+    #[test]
+    fn instantiation_list() {
+        let source_code = r#"
+        co main() {
+            let x: Foo<_, {foo(i64 -> f64), State<_>}, {bar(_ -> _)}, {}> = 1;
+        }
+        "#;
+        let mut errors = Vec::new();
+        let parsed = parse_ast_program(source_code, &mut errors);
+
+        let expected_errors = vec![];
+        assert_eq!(errors, expected_errors);
+        let expected_ast = Some(Program(vec![Declaration::Co(CoDecl {
+            name: "main".to_string(),
+            forall: Default::default(),
+            args: vec![],
+            ops: vec![],
+            return_type: ParsedType::Unit,
+            body: Some(block_expr(vec![Statement::Let {
+                binding: Binding::new_typed(
+                    "x",
+                    ParsedType::Named(
+                        "Foo".to_string(),
+                        vec![
+                            ParsedType::Unspecified,
+                            ParsedType::Ops(vec![
+                                ParsedOp::anon("foo", ParsedType::Int, ParsedType::Float),
+                                ParsedOp::NamedEffect {
+                                    name: None,
+                                    effect: "State".to_string(),
+                                    params: vec![ParsedType::Unspecified],
+                                    op_name: None,
+                                },
+                            ]),
+                            ParsedType::Ops(vec![ParsedOp::anon(
+                                "bar",
+                                ParsedType::Unspecified,
+                                ParsedType::Unspecified,
+                            )]),
+                            ParsedType::Ops(vec![]),
+                        ],
+                    ),
+                ),
+                value: 1.into(),
+            }])),
         })]));
         assert_eq!(parsed, expected_ast);
     }

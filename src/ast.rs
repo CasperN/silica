@@ -745,6 +745,7 @@ fn resolve_type(context: &TypeContext, ty: &ParsedType) -> Result<Type, Error> {
         ParsedType::Bool => Ok(Type::bool_()),
         ParsedType::Float => Ok(Type::float()),
         ParsedType::Never => Ok(Type::never()),
+        ParsedType::Ops(_) => panic!(),
         ParsedType::Fn(args, ret) => {
             let mut resolved_args = Vec::new();
             for arg in args {
@@ -2938,7 +2939,7 @@ mod tests {
     #[test]
     fn perform_in_co_error() {
         let source = r#"
-        fn main() -> Co<unit !> {
+        fn main() -> Co<unit> {
             co { perform foo(42) }
         }
         "#;
