@@ -2661,84 +2661,37 @@ mod tests {
         assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
     }
     #[test]
-    fn conflicting_parametric_effects_both_unnamed() {
-        let state_effect = EffectType {
-            name: "State".to_string(),
-            params: vec!["T".to_string()],
-            ops: HashMap::from_iter([
-                ("get".into(), (Type::unit(), Type::param("T"))),
-                ("set".into(), (Type::param("T"), Type::unit())),
-            ]),
-        };
-        let int_state_instance = EffectInstance {
-            decl: Rc::new(state_effect.clone()),
-            params: BTreeMap::from_iter([("T".to_string(), Type::int())]),
-        };
-        let bool_state_instance = EffectInstance {
-            decl: Rc::new(state_effect.clone()),
-            params: BTreeMap::from_iter([("T".to_string(), Type::bool_())]),
-        };
-        let mut ops = OpSetI::empty();
-        ops.unify_add_declared_op(None, &int_state_instance, "get")
-            .unwrap();
-        // TODO: This probably could use a more informative error.
+    fn run_coroutine_with_no_effects_in_regular_function() {
+        // This is okay as no effects are being propagated into the `main` function.
+        let source = r"
+            co returns_one() -> i64 {
+                1
+            }
+            fn main() -> i64 {
+                returns_one()?
+            }
+            ";
+        assert_eq!(typecheck_program(&mut parse_program_or_die(source)), Ok(()));
+    }
+    #[test]
+    fn conflicting_parametric_effects_named() {
+        let source = r#"
+        effect State<T> {
+            get: unit -> T,
+            set: T -> unit,
+        }
+        fn main() {
+            let c : Co<i64 ! State<_>> = co {
+                perform State.set(true); // implies Bool state
+                perform State.get(()) // Implies int state
+            };
+        }
+        "#;
         assert_eq!(
-            dbg!(ops.unify_add_declared_op(None, &bool_state_instance, "set")),
+            typecheck_program(&mut parse_program_or_die(source)),
             Err(Error::NotUnifiable(Type::int(), Type::bool_()))
         );
     }
-    #[test]
-    fn empty_opset_is_identity_under_unification() {
-        let state_effect = EffectType {
-            name: "State".to_string(),
-            params: vec!["T".to_string()],
-            ops: HashMap::from_iter([
-                ("get".into(), (Type::unit(), Type::param("T"))),
-                ("set".into(), (Type::param("T"), Type::unit())),
-            ]),
-        };
-        let int_state_instance = EffectInstance {
-            decl: Rc::new(state_effect.clone()),
-            params: BTreeMap::from_iter([("T".to_string(), Type::int())]),
-        };
-        let bool_state_instance = EffectInstance {
-            decl: Rc::new(state_effect.clone()),
-            params: BTreeMap::from_iter([("T".to_string(), Type::bool_())]),
-        };
-        let mut ops = OpSetI::empty();
-        ops.unify_add_declared_op(Some("int_state"), &int_state_instance, "get")
-            .unwrap();
-        ops.unify_add_declared_op(Some("bool_state"), &bool_state_instance, "set")
-            .unwrap();
-        ops.unify_add_anonymous_effect("foo", &Type::unit(), &Type::float())
-            .unwrap();
-        ops.mark_done_extending();
-        let original_ops = ops.clone();
-        let ops = OpSet::new(ops);
-        let was_empty = OpSet::new(OpSetI::empty());
-        unify_opsets(ops.clone(), was_empty.clone()).unwrap();
-        assert_eq!(ops.clone_inner(), original_ops);
-        assert_eq!(was_empty.clone_inner(), original_ops);
-    }
-    // TODO Replace above test with this one. Requires support for performing named effects.
-    // #[test]
-    // fn conflicting_parametric_effects_both_unnamed2() {
-    //     let source = r#"
-    //     effect State<T> {
-    //         get: unit -> T,
-    //         set: T -> unit,
-    //     }
-    //     fn main() {
-    //         let impossible = co {
-    //             perform State.get(()); // First usage infers T=i64 for the 'State' effect
-    //             perform State.set(true); // Second usage infers T=bool
-    //         };
-    //     }
-    //     "#;
-    //     // TODO: This probably could use a more informative error.
-    //     assert_eq!(typecheck_program(&mut parse_program_or_die(source)),
-    //                 Err(Error::NotUnifiable(Type::int(), Type::bool_())));
-    // }
     #[test]
     fn test_propagate_subset_of_effects() {
         let result = typecheck_program(&mut parse_program_or_die(
