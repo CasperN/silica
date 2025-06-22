@@ -191,8 +191,25 @@ impl Type {
             }
             TypeI::Co(ty, ops) => {
                 ty.instantiate_with(subs);
-                for ty in ops.mut_inner().iter_types_mut() {
-                    ty.instantiate_with(subs);
+                let mut opset_inner = ops.mut_inner();
+                for (p, r) in opset_inner.anonymous_ops.values_mut() {
+                    p.instantiate_with(subs);
+                    r.instantiate_with(subs);
+                }
+                for effect in opset_inner.named_effects.values_mut() {
+                    match effect {
+                        DeclaredOps::Known(instance, _ops) => {
+                            for ty in instance.params.values_mut() {
+                                ty.instantiate_with(subs);
+                            }
+                        }
+                        DeclaredOps::Unknown(ops) => {
+                            for (p, r) in ops.values_mut() {
+                                p.instantiate_with(subs);
+                                r.instantiate_with(subs);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -396,27 +413,6 @@ impl OpSetI {
                     for (p, r) in ops.values() {
                         types.push(p.clone());
                         types.push(r.clone());
-                    }
-                }
-            }
-        }
-        types.into_iter()
-    }
-    fn iter_types_mut(&mut self) -> impl Iterator<Item = &'_ mut Type> {
-        let mut types = Vec::new();
-        for (p, r) in self.anonymous_ops.values_mut() {
-            types.push(p);
-            types.push(r);
-        }
-        for effect in self.named_effects.values_mut() {
-            match effect {
-                DeclaredOps::Known(instance, _) => {
-                    types.extend(instance.params.values_mut());
-                }
-                DeclaredOps::Unknown(ops) => {
-                    for (p, r) in ops.values_mut() {
-                        types.push(p);
-                        types.push(r);
                     }
                 }
             }
@@ -2612,6 +2608,20 @@ mod tests {
             r"
             co main() -> bool ! foo(i64 -> bool) {
                 perform foo(1)
+            }
+            ",
+        ));
+        assert_eq!(result, Ok(()));
+    }
+    #[test]
+    fn perform_anonymous_effect_parameterized() {
+        let result = typecheck_program(&mut parse_program_or_die(
+            r"
+            co run_foo<T, U>(x: T) -> U ! foo(T -> U) {
+                perform foo(x)
+            }
+            fn main() -> i64 {
+                run_foo(1.2) handle { foo(x: f64) => { resume 42 } }
             }
             ",
         ));
