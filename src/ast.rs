@@ -3382,6 +3382,39 @@ mod tests {
         ));
     }
 
+     #[test]
+    fn error_unconstrained_polymorphic_call_type_inferred() {
+        let mut program = parse_program_or_die(
+            r"
+            fn produce_unconstrained_t<T>() -> T;
+            fn consume_i64(val: i64);
+
+            fn main() {
+                let x = produce_unconstrained_t();
+                consume_i64(x);
+            }
+            ",
+        );
+        assert_eq!(typecheck_program(&mut program), Ok(()));
+    }
+    #[test]
+    fn polymorphic_function_wrapped() {
+        let mut program = parse_program_or_die(
+            r#"
+            struct Wrapper<T> { value: T }
+            fn produce_wrapped_t<T>() -> Wrapper<T>;
+
+            fn consume_i64(val: i64);
+
+            fn main() {
+                let x = produce_wrapped_t();
+                consume_i64(x.value);
+            }
+            "#,
+        );
+        assert_eq!(typecheck_program(&mut program), Ok(()));
+    }
+
     // TODO: Recursive types? Mutually recursive types? Forward declarations?
     // TODO: Top level comments in parse?
 }
